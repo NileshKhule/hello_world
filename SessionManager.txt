@@ -1,0 +1,458 @@
+from dt_django_summit.core.session_manager import SessionManager
+
+
+# -*- coding: utf-8 -*-
+"""
+This module contains common functions of the site.
+"""
+
+import copy
+import logging
+import os
+import sys
+
+import pytz
+import simplejson as json
+import six
+
+from platform_utils.utils.dict_utils import whitelist_dict
+
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.constants import CMN
+from dtplatform.common.fusion.dealer_subscription_manager import DealerSubscriptionManager
+from dtplatform.common.hook import tenant_hookable
+from dtplatform.core.constants import (
+    DEALER_USER_TYPE,
+    DTC_USER_TYPE,
+    LENDER_USER_TYPE,
+)
+from dtplatform.core.dealer_partner_manager import get_dlr_code_from_partner_dlr_id
+from dtplatform.core.dealermanager import get_dealer_by_dealer_code
+from dtplatform.core.usermanager import UserManager
+
+from .middleware.context_middleware import set_request_dealer_code
+
+
+log = logging.getLogger(__name__)
+
+
+SESSION_HYGIENE_FEATURE_CODES = [
+    'CA',  # credit app
+    'CB',  # credit bureau
+    'CON',  # contract
+    # Make DJ go through hygiene since, DJ data is sometimes outdated with CA
+    # data, which causes issues for Edit pages.
+    'DJ',  # dealjacket
+]
+
+
+class SessionManager(object):
+    """
+    Session Manager class implements DT custom session.
+    It initializes the Session with the common request variables,
+    sets up CMN dict and implements dealerswitch
+    """
+
+    @tenant_hookable
+    def _append_common_request_variables(self, request, dealer_code=None):
+        """
+        Internal function that sets up the common dictionary and adds it to
+        the request.
+        """
+        common = {}
+
+        user = request.user
+        prod_code = request.context_data['fusion_prod_code']
+        user_manager = getManager(UserManager, request.context_data)
+        # When siteminder integration is ready, request.user will be none
+        # so in that case, get the user object by reading request headers
+        if user is None:
+            user_code = request.META.get('HTTP_USERCODE',
+                                         request.context_data['user_code'])
+            if user_code is None:
+                raise ValueError("user_code is invalid!")
+            user = user_manager.get_user_by_usercode(user_code)
+
+        # Read SSO fields from context
+        common['sso_code'] = request.context_data.get('sso_code', None)
+        common['user_firstname'] = request.context_data.get('sso_user_first_name', user.first_name)
+        common['user_lastname'] = request.context_data.get('sso_user_last_name', user.last_name)
+        common['user_code'] = user.user_code
+        common['user_type'] = user.user_type
+
+        # TODO: Add SSO last logon when it is added to headers from SM
+        # common['user_lastlogindate'] = request.context_data.get('sso_user_last_logon', user.last_logon_timestamp)
+        utc = pytz.UTC
+        if user.last_logon_timestamp is not None:
+            common['user_lastlogindate'] = utc.localize(user.last_logon_timestamp). \
+                astimezone(pytz.timezone(request.user.timezone))
+
+        common['permissions'] = user_manager.get_user_permission(user.user_code,
+                                                                 prod_code)
+        common['user_dealers_list'] = dict()
+        # if dealer code is not passed set it to the primary dealer code
+        common['dealer_code'] = dealer_code or request.context_data['dealer_code']
+
+        # retain the dealer impersonation status in session
+        common['dealer_impersonation_mode'] = request.context_data.get('dealer_impersonation_mode', False)
+
+        common['subscriptions'] = getManager(DealerSubscriptionManager, request.context_data).\
+            get_list_of_product_subscriptions(common['dealer_code'])
+
+        if common['sso_code'] is None:
+            # set dealer name and dealer id for non sso users
+            # set the current dealer code to be the first dealership match on the list
+            # this seems to be a hard way to achieve it.
+            # TODO: simplify this by making ordered dict or similar
+            if user.user_type == DEALER_USER_TYPE:
+                dlist = user_manager.get_user_dealership_codes_and_names(user.user_code)
+                common['user_dealers_list'] = {d[0]: d for d in dlist}
+            elif user.user_type == DTC_USER_TYPE:
+                # TODO switch to using getManager however that might require regression tests
+                dlrname = get_dealer_by_dealer_code(common['dealer_code']).dealername
+                common['user_dealers_list'] = {common['dealer_code']: (common['dealer_code'], dlrname)}
+            elif user.user_type == LENDER_USER_TYPE:
+                query = user_manager.get_lender_user_dealership_codes(request.context_data['partner_code'])
+                common['user_dealers_list'] = {T[1]: T[1:3] for T in query}
+
+            dlr = common['user_dealers_list'].get(common['dealer_code'], None)
+            if dlr:
+                common['dealer_name'] = dlr[1]
+            else:
+                common['dealer_name'] = "No name"
+                log.error("User %d has no access to dealer %d" % (user.user_code, common['dealer_code']),
+                          extra=request.context_data)
+
+            common['display_dealer_name'] = common['dealer_name']
+            common['display_dealer_id'] = common['dealer_code']
+
+        else:
+            # set dealer name and dealer id for sso users
+            if not dealer_code:
+                # if first time session created
+                # TODO switch to using getManager however that might require regression tests
+                set_request_dealer_code(request, get_dlr_code_from_partner_dlr_id(
+                    request.tenant.partner_id,
+                    request.context_data['sso_dealer_id']
+                ))
+                common['sso_dealer_id'] = request.context_data['sso_dealer_id']
+                common['dealer_code'] = request.context_data['dealer_code']
+                common['display_dealer_name'] = request.context_data.get('sso_dealer_name')
+                common['display_dealer_id'] = request.context_data.get('sso_dealer_id')
+            else:
+                # if dealerswitch performed
+                common['display_dealer_name'] = None
+                common['sso_dealer_id'] = request.context_data['sso_dealer_id']
+
+        return common
+
+    def initialize_session(self, request, dealer_code=None, reset=False):
+        """
+        Initialize session current dictionary by feature code.
+        Conditionally initialize common and dtsession
+        If reset is True destroy all dicts in the session and recreate
+        """
+        context = request.context_data.copy()
+        context['short_event_name'] = 'SESSION_INIT'
+
+        common_session = request.session.get(CMN, {})
+
+        reset = self._should_reset_during_initialize_session(request, common_session, dealer_code, reset)
+        self._initialize_or_reset_session_by_feature_code(request, context, reset)
+        self._initialize_common_session(request, context, common_session, dealer_code, reset)
+        self._initialize_dt_session(request)
+        self._session_hygiene(request)
+
+    def _should_reset_during_initialize_session(self, request, common_session, dealer_code, reset):
+        if dealer_code is None and not reset:
+            # compare if user code has changed from  previous request
+            # this is a fail-safe to make sure the session reinitialized if
+            # user has changed but SM session stayed the same
+            # or dealer code is different from the one that is passed in SSO headers
+            if common_session:
+                different_user_code = common_session['user_code'] != request.context_data['user_code']
+                different_dealer_id = all([
+                    request.context_data.get('sso_code'),
+                    common_session.get('sso_dealer_id') != request.context_data.get('sso_dealer_id'),
+                ])
+                if different_user_code or different_dealer_id:
+                    reset = True
+                set_request_dealer_code(request, common_session.get('dealer_code'))
+
+            else:
+                reset = True
+                if not request.context_data.get('sso_code'):
+                    set_request_dealer_code(request, request.user.default_dealer_code)
+
+        return reset
+
+    def _initialize_or_reset_session_by_feature_code(self, request, context, reset):
+        # initialize the current session based on feature code
+        # get the feature code based on current request
+        # if this is the first time, initialize with empty dict
+        feature_code = request.context_data['feature_code']
+
+        request.session.setdefault(feature_code, {})
+
+        if reset:
+            request.session[feature_code] = {}
+
+            # Clean up all other feature code dicts if reset
+            for k in request.session.keys():
+                if isinstance(request.session[k], dict):
+                    request.session[k] = {}
+
+            log.info('Session Reset.', extra=context)
+
+    def _initialize_common_session(self, request, context, common_session, dealer_code, reset):
+        # if session[CMN] is empty then initialize it
+        # or if dealer_ code or reset flag was passed in
+        if not common_session or dealer_code or reset:
+            self.context = request.context_data
+            self.tenant = getattr(request, 'tenant', None)
+            common_session = self._append_common_request_variables(request, dealer_code)
+            common_session['environment_name'] = os.environ.get(
+                'ENVIRONMENT_NAME')
+            request.session[CMN] = common_session
+            context['feature_code'] = CMN
+
+    def _initialize_dt_session(self, request):
+        request.dtsession = request.session[request.context_data['feature_code']]
+
+    def _session_hygiene(self, request):
+        """
+        Hygiene session by clearing it from unneeded data
+
+        Currently we only clean session data by feature codes.
+        This is useful in cases when multiple features session data
+        can conflict with each other. In the case of credit app
+        and credit bureau session data, one can interfere with each other
+        when populating form data since one feature code can change
+        data in DB however different feature code will not detect
+        the change and can load form data from session which will
+        result in displaying stale data to the user.
+
+        Args:
+            request (HttpRequest): Django request object
+                with already set session
+        """
+        current_feature_code = request.context_data.get('feature_code')
+
+        if not current_feature_code:
+            return
+
+        for feature_code in SESSION_HYGIENE_FEATURE_CODES:
+            # this is generic code which is executed on every request
+            # and so we do not want to clear feature code session
+            # data when any of following conditions are true:
+            # * we are on the page from that same feature code
+            #   as we are trying to clear
+            # * as per route config we should not be clearing session
+            if any([feature_code == current_feature_code,
+                    not request.route.clear_session_indicator]):
+                continue
+
+            # note that we cant use request.dtsession
+            # or DTSessionHelper because they directly
+            # use data within a feature code however
+            # we need to remove feature code session data
+            # itself hence accessing Django's session itself
+            request.session.pop(feature_code, None)
+
+    def dealer_switch(self, request, dealer_code=None):
+        """
+        Perform a dealer switch based on the dealer_codethat was passed in.
+        If current user does not have access to the dealer_code,
+        raise the ValueError.
+        """
+        if request.user.user_type == DEALER_USER_TYPE and dealer_code and \
+                (dealer_code in dict(request.session[CMN]['user_dealers_list']).keys()):
+            pass
+
+        elif request.user.user_type == DTC_USER_TYPE:
+            pass
+
+        elif request.user.user_type == LENDER_USER_TYPE and dealer_code and \
+                (dealer_code in dict(request.session[CMN]['user_dealers_list']).keys()):
+            pass
+        else:
+            log.error('Current User has no access to Dealer: ' + str(dealer_code),
+                      extra=request.context_data)
+            raise ValueError('Current User has no access to Dealer: %s' % str(dealer_code))
+
+        set_request_dealer_code(request, dealer_code)
+        self.initialize_session(request, dealer_code, reset=True)
+        log.info('DealerSwitch executed for User: %s to Dealer: %s' %
+                 (str(request.user.user_code),
+                  str(dealer_code)),
+                 extra=request.context_data)
+
+    def set_dealer_impersonation(self, request, enable):
+        """
+        Set the user type flag to "D" to impersonate dealer
+        for the lender user
+        alternatively sets the user back to lender view
+        Args:
+            enable: True to enable dealer impersonation.  False otherwise.
+        """
+        current_flag = self.get_from_common_session(request, 'dealer_impersonation_mode', default=False)
+        new_flag = bool(enable)
+
+        if current_flag != new_flag:
+            self.initialize_session(request, dealer_code=request.context_data['dealer_code'], reset=True)
+            self.set_to_common_session(request, 'dealer_impersonation_mode', new_flag)
+            # this is needed explicitly otherwise session is not reflected immediately/until the next route
+            self.set_to_common_session(request, 'user_type', 'D' if new_flag else 'L')
+            log.info('Setting dealer impersonation flag to {} for lender user {}'.format(
+                     new_flag, request.user.user_code),
+                     extra=request.context_data)
+
+    def mask_session(self, session_dict):
+        """Returns all data in the session while scrubbing PII.
+        Args:
+            session_dict (dict): credit app wizard session data
+        Returns:
+            A copy of session_dict with all of the PII data masked.
+        """
+        masked_session_data = copy.deepcopy(session_dict)
+
+        def mask_applicant_form(applicant_form):
+            allowed_fields = ['_continue_', 'alternate_phone_type', 'app_marital_status_code', 'bank_contact_name',
+                              'bank_name', 'business_applicant', 'business_established_date', 'business_name',
+                              'business_tax_id_number', 'cc_id', 'city', 'city_state_dropdown', 'coapplicant_disabled',
+                              'current_address_months', 'current_address_total_months', 'current_address_years',
+                              'current_bank_phone', 'current_business_phone', 'current_employed_months',
+                              'current_employed_total_months', 'current_employed_years', 'drivers_license_us_state_code',
+                              'employee_count', 'employment_status_code', 'financial_statement_code', 'has_coapplicant',
+                              'housing_status_code', 'id_verification', 'incorporation_us_state_code', 'is_business',
+                              'line_1_address', 'line_2_address', 'marital_status_code', 'middle_name',
+                              'mortgage_payment_or_rent', 'occupation_name', 'old_customer',
+                              'other_income_source', 'other_monthly_income', 'party_relationship_code',
+                              'previous_address_months', 'previous_address_years', 'previous_business_name',
+                              'previous_city', 'previous_city_state_dropdown', 'previous_employed_months',
+                              'previous_employed_years', 'previous_employment_status_code', 'previous_line_1_address',
+                              'previous_line_2_address', 'previous_occupation_name',
+                              'previous_school', 'previous_us_state_code', 'primary_phone_type', 'salary',
+                              'salary_type_code', 'same_address', 'school', 'spot_con_in', 'suffix_code', 'us_state_code']
+
+            whitelist_dict(applicant_form, allowed_fields, False)
+
+        def mask_wisconsin_spouse_form(wisconsin_spouse_form):
+            allowed_fields = ['app_spouse_salary', 'app_spouse_other_income_source', 'app_spouse_salary_type_code',
+                              'coapp_spouse_us_state_code', 'app_spouse_city', 'app_spouse_city_state_dropdown',
+                              'app_spouse_line_2_address', 'coapp_spouse_line_1_address', 'coapp_spouse_other_income_source',
+                              'coapp_spouse_suffix_code', 'coapp_spouse_middle_name', 'app_spouse_us_state_code',
+                              'coapp_spouse_city_state_dropdown', 'coapp_spouse_salary_type_code', 'coapp_spouse_other_monthly_income',
+                              'app_spouse_flag', 'app_spouse_suffix_code', 'same_as_coapplicant',
+                              '_continue_', 'coapp_spouse_city', 'coapp_spouse_salary', 'coapp_spouse_line_2_address',
+                              'same_as_applicant', 'app_spouse_other_monthly_income', 'coapp_spouse_flag',
+                              'app_spouse_line_1_address', 'app_spouse_middle_name']
+
+            whitelist_dict(wisconsin_spouse_form, allowed_fields, False)
+
+        def mask_ca_param_dict(ca_param_dict):
+            allowed_fields = ['deal_id', 'dealer_code', 'credit_type', 'cash_down_amount', 'trade_in_value_amount',
+                              'year', 'loan_type', 'make', 'wholesale_amount', 'other_monthly_income', 'estimated_financed_amount',
+                              'invoice_amount', 'salary_type_code', 'salary', 'mileage', 'app_type', 'paymentcallsupported',
+                              'condition', 'cap_cost', 'term', 'product_type', 'certified_indicator', 'applicant_state_key',
+                              'unpaid_balance_amount', 'model']
+
+            whitelist_dict(ca_param_dict, allowed_fields, False)
+
+        if masked_session_data.get('applicant_form'):
+            mask_applicant_form(masked_session_data['applicant_form'])
+
+        if masked_session_data.get('co_applicant_form'):
+            mask_applicant_form(masked_session_data['co_applicant_form'])
+
+        if masked_session_data.get('ca_param_dict'):
+            mask_ca_param_dict(masked_session_data['ca_param_dict'])
+
+        if masked_session_data.get('wisconsin_spouse_form'):
+            mask_wisconsin_spouse_form(masked_session_data['wisconsin_spouse_form'])
+
+        return masked_session_data
+
+    def get_from_common_session(self, request, key, default=None):
+        """
+        Returns the given key from the common ('CMN') session section, or
+        default value if it is not present
+        """
+        common_session = request.session.get(CMN, {})
+        return common_session.get(key, default)
+
+    def set_to_common_session(self, request, key, value, only_if_absent=False):
+        """ Sets a value to the given key in the common session section.
+
+        Args
+            value: The value to set the common session key to.
+            only_if_absent: If True, the value will only be set if the key is
+                not already present.  Otherwise the current value will be
+                maintained.
+
+        Returns:
+            The value stores in the session at the end of the operation - even
+            if the operation was a no-op.
+        """
+        try:
+            common_session = request.session[CMN]
+        except KeyError:
+            request.session[CMN] = {}
+            common_session = request.session[CMN]
+
+        key_exists = key in common_session
+        do_set_val = not (only_if_absent and key_exists)
+        if do_set_val:
+            try:
+                # sanity check: do not attempt to store complex types in Redis.
+                json.dumps(value)
+            except TypeError as e:
+                extra_err_info = ("Value {val} cannot be stored in the session.  "
+                                  "Values should be simple serializable values.").format(val=value)
+                six.reraise(type(e), type(e)(e.message + extra_err_info), sys.exc_info()[2])
+
+            common_session[key] = value
+
+        return self.get_from_common_session(request, key)
+
+    def is_in_common_session(self, request, key):
+        common_session = request.session.get(CMN, {})
+        return key in common_session
+
+
+def session_cache(key):
+    """
+    Decorator that provided caching in the request.session
+
+    This function
+            * returns the value cached in the session under the given key.
+              Falls back to the value returned by the decorated function if
+              nothing was cached.
+            * Retrieves the value from its authoritative data store using
+              the decorated function and stores it in the session if it was not
+              already there.
+
+    Use this decorator like
+    @session_cache("cmn_session_cache_key")
+    def some_db_lookup_func(self, param1, param2):
+        # runs a DB query or similar expensive lookup operation.
+        # Func internals will only run if "cmn_session_cache_key"
+        # Is not already cached in the session.
+
+    Decorated function must have a self.request object.
+    """
+    def session_cache_dec(internal_func):
+        def wrapper(self, *args, **kwargs):
+            session_manager = SessionManager()
+            if session_manager.is_in_common_session(self.request, key):
+                value = session_manager.get_from_common_session(self.request, key)
+            else:
+                # if not in the session, look up from the authoritative datastore
+                value = internal_func(self, *args, **kwargs)
+                value = session_manager.set_to_common_session(
+                    self.request, key, value, only_if_absent=True)
+
+            return value
+
+        return wrapper
+    return session_cache_dec

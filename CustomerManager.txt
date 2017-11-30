@@ -1,0 +1,2751 @@
+from dtplatform.common.fusion.customermanager import CustomerManager
+
+
+# -*- coding: utf-8 -*-
+"""
+custmermanager module provides business logic service for common customer
+"""
+from __future__ import absolute_import, print_function, unicode_literals
+import logging
+import re
+from collections import OrderedDict, namedtuple
+from datetime import date, datetime
+from operator import attrgetter
+
+import fuzzy
+import six
+from sqlalchemy.orm import joinedload_all
+from sqlalchemy.orm.attributes import get_history
+from sqlalchemy.orm.exc import MultipleResultsFound, NoResultFound
+from sqlalchemy.sql.expression import and_, cast, func, or_
+from sqlalchemy.types import String
+
+from dt_database_utils.db_wrapper import gensequence
+from dt_database_utils.search import model_search, related_model_search
+from platform_utils.utils.dt_datetime import get_month_count, is_date_instance
+from platform_utils.utils.dt_model import ModelClass
+from platform_utils.utils.mapper import property_mapper
+from platform_utils.utils.string_functions import (
+    field_should_be_versioned,
+    n_char_compare,
+)
+
+from dtplatform.common.base_manager import BaseManager, getManager
+from dtplatform.common.credit_app import constants
+from dtplatform.common.transaction import commit_or_rollback
+from dtplatform.conf import settings
+from dtplatform.core.constants import (
+    ALL_EMPLOYMENT_STATUS,
+    APPLICATION_FIELDS,
+    BUSINESS_APPLICATION_FIELDS,
+    CO_APPLICANT,
+    CP_STATES,
+    CP_STATES_REQUIRE_SPOUSE,
+    CREDIT_BUREAU_CODE,
+    CUSTOMER_ALLOW_CONTACT_DEFAULT,
+    HOME_EMAIL_TYPE,
+    NO,
+    PHONE_TYPE_BANK,
+    PHONE_TYPE_BUSINESS,
+    PHONE_TYPE_PREVIOUS_EMPLOYEE,
+    PREVIOUS,
+    VERSIONED_ADDRESS_FIELDS,
+    VERSIONED_CUSTOMER_FIELDS,
+    VERSIONED_EMAIL_FIELD,
+    VERSIONED_EMPLOYMENT_FIELDS,
+    VERSIONED_MODIFIED_ON_FIELD,
+    AddressVersioning,
+    CustomerVersioning,
+    EmailVersioning,
+    EmploymentVersioning,
+    PhoneVersioning,
+)
+from dtplatform.core.dealjacket_manager import DealJacketManager
+from dtplatform.core.models import Dealer
+from dtplatform.core.models.ca.credit_app import CreditApp
+from dtplatform.core.models.cc3 import (
+    Address,
+    CreditScore,
+    CurrentEmail,
+    CurrentPhone,
+    Customer,
+    CustomerSensitive,
+    Email,
+    Employment,
+    Identity,
+    Phone,
+)
+from dtplatform.core.models.cc3.customer import CustHub
+from dtplatform.core.models.cc3.customer_master import CustomerMaster
+from dtplatform.core.models.dj import (
+    BuyVehicle,
+    Deal,
+    DealJacket,
+    DealJacketCustomer,
+    Vehicle,
+)
+from dtplatform.core.models.dj.dealjacket_current_email import DealJacketCurrentEmail
+from dtplatform.core.models.dj.dealjacket_current_phone import DealJacketCurrentPhone
+from dtplatform.utils.dt_address_parser import DTAddressParserFacade
+
+
+LOG = logging.getLogger(__name__)
+LOG_EXTRA = settings.LOGGING_EXTRA_DATA.copy()
+
+
+class CustomerManager(BaseManager):
+
+    """
+    Manager for a common customer model
+    """
+
+    phone_template = namedtuple('phone_template', ['phone_number', 'phone_type_code'])
+    employment_template = namedtuple('employment_template', ['occupation_name', 'employment_status_code',
+                                                             'organization_name', 'month_employed_count'])
+    email_template = namedtuple('email_template', ['email_address', 'email_type_code'])
+
+    def CustomerMaster(self, cc_id=None, create=True, **kwargs):
+        """
+        Proxy for creating CustomerMaster models instance.
+
+        :returns: CustomerMaster instance
+        """
+        master = self._search_model_by_id(CustomerMaster, cc_id=cc_id)
+        if master:
+            return master
+
+        if not create:
+            return
+
+        return CustomerMaster(dealer_code=self.context['dealer_code'], cc_id=cc_id, **kwargs)
+
+    def Customer(self, cc_id=None, with_cust_hub=False, create=True, create_new_version=False, **kwargs):
+        """
+        Proxy for creating Customer model instance.
+
+        :returns: Customer instance
+        """
+        if cc_id is not None and not create_new_version:
+            customer = self.get_latest_customer(cc_id=cc_id)
+            if customer:
+                return customer
+
+        if not create:
+            return
+
+        master = self.CustomerMaster(cc_id=cc_id)
+
+        if create_new_version:
+            customer_id = gensequence()
+        else:
+            customer_id = None
+
+        customer = Customer(dealer_code=self.context['dealer_code'],
+                            cc_id=master.cc_id,
+                            customer_id=customer_id,
+                            **kwargs)
+
+        customer.master = master
+
+        if with_cust_hub:
+            self._get_cust_hub_for_customer(customer)
+        return customer
+
+    def CustHub(self, cc_id=None, create=True, **kwargs):
+        """
+        Proxy for creating Customer model instance.
+
+        :returns: CustHub instance
+        """
+        cust_hub = self._search_model_by_id(CustHub, cc_id=cc_id)
+        if cust_hub:
+            return cust_hub
+
+        if not create:
+            return
+
+        customer = self.Customer(cc_id)
+        cust_hub = self._get_cust_hub_for_customer(customer, **kwargs)
+
+        return cust_hub
+
+    def _get_cust_hub_for_customer(self, customer, **kwargs):
+        """
+        Search for the existing cust hub for given customer,
+        if not found then create a new cust hub and attach to customer
+        """
+
+        cust_hub = self._search_model_by_id(CustHub, cc_id=customer.cc_id)
+
+        if cust_hub:
+            cust_hub.customer_id = customer.customer_id
+        else:
+            cust_hub = CustHub(dealer_code=self.context['dealer_code'],
+                               cc_id=customer.cc_id, customer_id=customer.customer_id,
+                               **kwargs)
+
+        cust_hub.current_customer = customer
+        cust_hub.master = customer.master
+        customer.hub = cust_hub
+        cust_hub.master.hub = cust_hub
+
+        return cust_hub
+
+    def get_big_change_validators(self):
+        """Get which validators and what validation methods
+        should be used to determine if the name or tax ID
+        have changes.
+        """
+
+        return {'business': (ValidateBusinessNameChangeV3,),
+                'user': (ValidateCustomerNameChangeV3,)}
+
+    def get_versioning_rules_class(self):
+        """
+        Get common customer versioning rules.
+        """
+        return CustomerVersioningRules
+
+    def is_big_name_change(self, new_name, old_name, algo='nysiis'):
+        """
+        Compares two names to perform a fuzzy match for similarity
+        """
+        if algo == 'nysiis':
+            return fuzzy.nysiis(new_name) != fuzzy.nysiis(old_name)
+        else:
+            msg = 'Cant handle the {} matching algo yet'
+            raise NotImplementedError(msg.format(algo))
+
+    def _search_model_by_id(self, model, cc_id):
+        """
+        Search the db for specified model with cc_id
+        """
+        if not cc_id:
+            return
+
+        assert model in [CustomerMaster, CustHub], 'You cannot use this function to get a %s model instance' % model
+
+        return self.session.query(model).get((self.context['dealer_code'], cc_id))
+
+    def search_by_name(self,
+                       first_name=None,
+                       last_name=None,
+                       business_name=None,
+                       search_spec=None):
+        """
+        Search customers by name.
+        """
+        if first_name and last_name:
+            criteria = {
+                'first_name': first_name,
+                'last_name': last_name,
+            }
+
+            if not search_spec:
+                search_spec = [
+                    'first_name',
+                    'last_name',
+                    'middle_name',
+                    'updated_timestamp',
+                    'suffix_code',
+                    'master.phones',
+                    'master.addresses',
+                ]
+        elif business_name:
+            criteria = {
+                'business_name': business_name,
+            }
+
+            if not search_spec:
+                search_spec = [
+                    'business_name',
+                    'updated_timestamp',
+                    'suffix_code',
+                    'master.phones',
+                    'master.addresses',
+                ]
+        else:
+            raise TypeError('Either first name AND last name or business name must'
+                            ' be provided.')
+
+        results = model_search(Customer,
+                               self.context['dealer_code'],
+                               criteria,
+                               search_spec,
+                               initial=True)
+
+        if first_name and last_name:
+            # Sort alphabetically
+            results = sorted(results, key=attrgetter('first_name', 'last_name'))
+
+            # Sort by whether the beginning of the name parts match
+            results = sorted(
+                results, key=lambda c:
+                c.first_name.lower().startswith(first_name.lower()) and c.last_name.lower().startswith(last_name.lower()),
+                reverse=True
+            )
+
+        if business_name:
+            results = sorted(results, key=attrgetter('business_name'))
+            results = sorted(
+                results, key=lambda c:
+                c.business_name.lower().startswith(business_name.lower()),
+                reverse=True
+            )
+
+        return results
+
+    def get_new_cc_id_for_old_cc_id(self, cc_id):
+        """
+        Returns the new ccid from cc3 for the given old ccid
+
+        Returns:
+            new_cc_id (int)
+        """
+        return (
+            self.session
+                .query(CustHub.cc_id)
+                .filter(CustHub.old_cc_id == cc_id, CustHub.dealer_code == self.context['dealer_code'])
+                .order_by(CustHub.updated_timestamp.desc())
+                .first()
+        )
+
+    def get_latest_customer(self, cc_id, customer_id=None, special_options=None):
+        """ CustHub maintains the latest version of Customer"""
+        dealer_code = self.context['dealer_code']
+        try:
+            if customer_id is None:
+                query = self.session.query(Customer)\
+                    .join(CustHub).filter(and_(CustHub.dealer_code == dealer_code,
+                                               CustHub.cc_id == cc_id,
+                                               CustHub.dealer_code == Customer.dealer_code,
+                                               CustHub.cc_id == Customer.cc_id,
+                                               CustHub.customer_id == Customer.customer_id))
+                if special_options is not None:
+                    query = query.options(special_options)
+
+                return query.one()
+
+            else:
+                customer = (self.session.query(Customer)
+                            .filter(Customer.dealer_code == self.context['dealer_code'],
+                                    Customer.cc_id == cc_id,
+                                    Customer.customer_id == customer_id)).one()
+                return customer
+        except NoResultFound:
+            msg = 'No customer was found for dealer_code={} cc_id={}'
+            self.log.info(msg.format(dealer_code, cc_id))
+            return
+
+    def save_customer_country_citizen(self, deal, form_data):
+        applicant_customer_sensitive = deal.applicant.dealjacket_customer.customer.customer_sensitive
+        applicant_citizenship_code = form_data.get('applicant_form', {}).get('citizenship_country_code')
+        if applicant_customer_sensitive and applicant_citizenship_code:
+            applicant_customer_sensitive.citizenship_country_code = applicant_citizenship_code
+
+        if deal.has_coapplicant:
+            coapplicant_customer_sensitive = deal.coapplicant.dealjacket_customer.customer.customer_sensitive
+            coapplicant_citizenship_code = form_data.get('co_applicant_form', {}).get('citizenship_country_code')
+            if coapplicant_customer_sensitive and coapplicant_citizenship_code:
+                coapplicant_customer_sensitive.citizenship_country_code = coapplicant_citizenship_code
+
+    def search_by_id(self, cc_id, search_spec=None):
+        """
+        Search customers by id.
+        """
+        criteria = {'cc_id': cc_id}
+        if not search_spec:
+            search_spec = [
+                'first_name',
+                'last_name',
+            ]
+
+        latest_customer_filters = list(
+            and_(CustHub.dealer_code == self.context['dealer_code'],
+                 CustHub.cc_id == cc_id,
+                 CustHub.dealer_code == Customer.dealer_code,
+                 CustHub.cc_id == Customer.cc_id,
+                 CustHub.customer_id == Customer.customer_id)
+        )
+
+        model_list = [Customer, CustHub]
+        return related_model_search(self.session,
+                                    model_list,
+                                    criteria,
+                                    search_spec,
+                                    latest_customer_filters)
+
+    def search_by_id_joinedload(self, cc_id):
+        """
+        Search for a customer by cc_id and and join the
+        customer model with all customer related models.
+
+        If customer cannot be found, ``None`` is returned.
+        """
+        dealer_code = self.context['dealer_code']
+        try:
+            customer = (
+                self.session.query(Customer)
+                .join(CustHub)
+                .options([joinedload_all('master.addresses'),
+                          joinedload_all('master.phones'),
+                          joinedload_all('master.emails'),
+                          joinedload_all('master.identity'),
+                          joinedload_all('master.employments'),
+                          joinedload_all('master.customer_sensitive'),
+                          joinedload_all('master.credit_scores')])
+                .filter(and_(CustHub.dealer_code == dealer_code,
+                             CustHub.cc_id == cc_id,
+                             CustHub.dealer_code == Customer.dealer_code,
+                             CustHub.cc_id == Customer.cc_id,
+                             CustHub.customer_id == Customer.customer_id)).one())
+            return customer
+
+        except NoResultFound:
+            msg = 'No customer was found for dealer_code={} cc_id={}'
+            LOG.warn(msg.format(dealer_code, cc_id),
+                     extra=LOG_EXTRA)
+            return
+
+    def search_by_full_name(self, name):
+        """
+        Search customers with the full name in one string.
+        """
+        search_spec = [
+            'first_name',
+            'last_name',
+        ]
+
+        parts = name.split(' ')
+
+        # For each part, search either in first or last name
+        criteria = [[{'first_name': part}, {'last_name': part}] for part in parts]
+
+        # Join each part with an AND, which is represented by a tuple
+        criteria = tuple(criteria)
+
+        results = model_search(Customer,
+                               self.context['dealer_code'],
+                               criteria,
+                               search_spec)
+
+        # Sort by name
+        results = sorted(results, key=lambda c: c.first_name + ' ' + c.last_name)
+
+        # Sort by whether the name parameter matches the first part of the name
+        results = sorted(results, key=lambda c:
+                         (c.first_name + ' ' + c.last_name)
+                         .lower().startswith(name.lower()),
+                         reverse=True)
+        return results
+
+    def get_query_object_for_search(self):
+        """
+        Returns basic query object (without filters) for search, also factor impersonated user
+        """
+        # if impersonated user then get base query/data from deal jacket manager
+        if self.context.get('dealer_impersonation_mode', False):
+            deal_jacket_manager = getManager(DealJacketManager, self.context)
+            query = deal_jacket_manager.get_deal_jacket_list_query_object([self.context['dealer_code']])
+        else:
+            query = self.session.query(DealJacket)
+        return query
+
+    def get_name_or_vehicle_search_query_object(self, search_string, dealer_code=None):
+
+        query_object = self.get_query_object_for_search()
+        name_or_vehicle_filter = self.get_filters_for_name_or_vehicle_search_query(search_string,
+                                                                                   dealer_code)
+        return query_object.filter(name_or_vehicle_filter).distinct().order_by(DealJacket.modified_timestamp.desc())
+
+    def get_filters_for_name_or_vehicle_search_query(self, search_query, dealer_codes=None):
+        """
+        Returns a filter object which can be applied to any query
+        within a `.filter()` call.
+        """
+        if dealer_codes is None:
+            dealer_codes = self.context['dealer_code']
+
+        parts = filter(None, search_query.split(' '))
+        customer_filters = []
+        for part in parts:
+            customer_filters.append(or_(
+                func.upper(Customer.first_name).like('%' + part.upper() + '%'),
+                func.upper(Customer.last_name).like('%' + part.upper() + '%'),
+                func.upper(Customer.business_name).like('%' + part.upper() + '%'),
+            ))
+
+        vehicle_filters = []
+        for part in parts:
+            vehicle_filters.append(or_(
+                cast(Vehicle.year_name, String(length=4)).ilike('%' + part + '%'),
+                Vehicle.make_name.ilike('%' + part + '%'),
+                Vehicle.model_name.ilike('%' + part + '%'),
+                Vehicle.trim_name.ilike('%' + part + '%'),
+            ))
+
+        # DealJacket
+        # if we want to use "in_" (dubious need??) we need a tuple not an int
+        if isinstance(dealer_codes, (list, tuple)):
+            dealer_codes_op = 'in_'
+        else:
+            dealer_codes_op = '__eq__'
+
+        dealjacket_filters = and_(
+            or_(DealJacket.customers.any((DealJacketCustomer.customer
+                                          .has(and_(*customer_filters)))),
+                DealJacket.deals.any((Deal.buy_vehicle
+                                      .has((BuyVehicle.vehicle
+                                            .has(and_(*vehicle_filters))))))),
+            getattr(DealJacket.dealer_code, dealer_codes_op)(dealer_codes)
+        )
+
+        return dealjacket_filters
+
+    def get_email_search_query_object(self, search_string, dealer_code=None):
+
+        query_object = self.get_query_object_for_search()
+        email_filter = self.get_filters_for_email_search_query(search_string, dealer_code)
+        return query_object.filter(email_filter).distinct().order_by(DealJacket.modified_timestamp.desc())
+
+    def get_filters_for_email_search_query(self, search_string, dealer_code=None):
+
+        if dealer_code is None:
+            dealer_code = self.context['dealer_code']
+
+        email_filter = and_(
+            DealJacket.customers.any((DealJacketCustomer.current_emails
+                                      .any((DealJacketCurrentEmail.email
+                                            .has(and_(Email.email_address.ilike('%' + search_string + '%'))))))),
+            DealJacket.dealer_code == dealer_code
+        )
+
+        return email_filter
+
+    def get_phone_search_query_object(self, search_string, dealer_code=None):
+
+        query_object = self.get_query_object_for_search()
+        phone_filter = self.get_filters_for_phone_search_query(search_string, dealer_code)
+        return query_object.filter(phone_filter).distinct().order_by(DealJacket.modified_timestamp.desc())
+
+    def get_filters_for_phone_search_query(self, search_string, dealer_code=None):
+
+        if dealer_code is None:
+            dealer_code = self.context['dealer_code']
+
+        phone_filter = and_(
+            DealJacket.customers.any((DealJacketCustomer.current_phones
+                                     .any((DealJacketCurrentPhone.phone
+                                           .has(and_(Phone.phone_number == search_string)))))),
+            DealJacket.dealer_code == dealer_code
+        )
+
+        return phone_filter
+
+    def get_query_object_for_lender_search(self):
+        """
+        Returns basic query object (without filters) for a lender user search
+        """
+        return self.session.query(CreditApp, Dealer.dealername, DealJacket)
+
+    def get_lender_search_query_object(self, search_query, dealer_code, cp_id):
+
+        query_object = self.get_query_object_for_lender_search()
+        lender_filter = self.get_filters_for_lender_search_query(search_query, dealer_code, cp_id)
+        return query_object.filter(lender_filter).distinct().order_by(DealJacket.modified_timestamp.desc())
+
+    def get_filters_for_lender_search_query(self, search_query, dealer_code, cp_id):
+        """
+        Returns a filter object for lender search which can be
+        applied to any query within a `.filter()` call.
+        """
+
+        parts = search_query.split(' ')
+
+        customer_filters = []
+        for part in parts:
+            customer_filters.append(or_(
+                func.upper(Customer.first_name).like('%{}%'.format(part.upper())),
+                func.upper(Customer.last_name).like('%{}%'.format(part.upper())),
+                func.upper(Customer.business_name).like('%{}%'.format(part.upper())),
+            ))
+
+        vehicle_filters = []
+        for part in parts:
+            vehicle_filters.append(or_(
+                cast(Vehicle.year_name, String(length=4)).ilike('%{}%'.format(part)),
+                Vehicle.make_name.ilike('%{}%'.format(part)),
+                Vehicle.model_name.ilike('%{}%'.format(part)),
+                Vehicle.trim_name.ilike('%{}%'.format(part)),
+            ))
+
+        misc_filters = [
+            CreditApp.dealer_cd == dealer_code,
+            CreditApp.deal_jacket_id == DealJacket.deal_jacket_id,
+            CreditApp.cp_id == cp_id,
+            Dealer.dealercode == CreditApp.dealer_cd,
+            DealJacket.dealer_code == CreditApp.dealer_cd,
+        ]
+
+        all_filters = and_(
+            or_(
+                DealJacket.customers.any((DealJacketCustomer.customer
+                                          .has(and_(*customer_filters)))),
+                DealJacket.deals.any((Deal.buy_vehicle
+                                      .has((BuyVehicle.vehicle
+                                            .has(and_(*vehicle_filters)))))),
+            ),
+            *misc_filters
+        )
+        return all_filters
+
+    def get_external_deals_query_object(self, query_object):
+        """
+        To extend queryset filter to apply for internet apps
+        i.e to exclude inactive deals if deal source code is set to DRS/AHFC
+        Args:
+            query_object: query object
+        Returns:
+            Extended query object for internet apps
+        """
+        # Append internet apps filter
+        query_object = query_object.filter(
+            DealJacket.deals.any(or_(
+                Deal.deal_source_code == None,  # noqa
+                and_(Deal.deal_source_code.in_(
+                    (constants.InternetAppSource.DRS_SOURCE, constants.InternetAppSource.HONDA_SOURCE)),
+                     DealJacket.is_hidden_indicator == NO
+                )
+            ))
+        )
+        return query_object
+
+    def sort_search_results(self, results, search_query):
+        """
+        Returns results, sorted by:
+            - alphabetical order
+            - starting with search query
+            - created timestamp
+
+        :returns: list of sorted results
+        """
+
+        def alphabetical_key(data):
+            """
+            Return a list of strings to use for alphabetical sorting.
+            """
+            if data.result_type == 'DealJacket' and data.customers:
+                return [(c.customer.first_name or '') + ' ' +
+                        (c.customer.last_name or '')
+                        for c in data.customers if c.customer]
+
+        def match_key(data):
+            """
+            Returns a list of strings that start with the search query.
+            """
+            words = alphabetical_key(data)
+            matches = [word for word in words
+                       if word.lower().startswith(search_query.lower())]
+
+            return matches
+
+        # Make sure the search template can differentiate between types
+        # TODO (serkan): this is immutable data, why are we modifying it like this?, will need to be removed
+        for result in results:
+            result.result_type = result.__class__.__name__
+
+        # Sort by whether the match was exact
+        results = sorted(results, key=match_key, reverse=True)
+
+        # Sort alphabetically
+        results = sorted(results, key=alphabetical_key)
+
+        # sort by timestamp
+        results = sorted(
+            results, key=lambda x: x.created_timestamp, reverse=True
+        )
+
+        return results
+
+    def sort_lender_search_results(self, results, search_query):
+        """
+        Returns LENDER results, sorted by:
+            - alphabetical order
+            - starting with search query
+
+        Yes its different from the other sort search results.
+
+        :returns: list of sorted results
+        """
+        def alphabetical_key(data):
+            """Returns a list of customer names to use for alphabetical sorting.
+            Args:
+                data (KeyedTuple): KeyedTuple of (CreditApp, dealername, DealJacket)
+            Returns:
+                List of customer names.
+            """
+            if data.result_type == 'CreditApp':
+                return ["{0} {1}".format((dj_cust.customer.first_name or ''), (dj_cust.customer.last_name or ''))
+                        if dj_cust.customer.is_business == 'N'
+                        else "{0}".format(dj_cust.customer.business_name)
+                        for dj_cust in data.DealJacket.customers]
+
+        def match_key(data):
+            """
+            Returns a list of strings that start with the search query.
+            """
+            words = alphabetical_key(data)
+            matches = [word for word in words
+                       if word.lower().startswith(search_query.lower())]
+
+            return matches
+
+        # Make sure the search template can differentiate between types
+        for result in results:
+            result.result_type = result[0].__class__.__name__
+
+        # Sort alphabetically
+        results = sorted(results, key=alphabetical_key)
+
+        # Sort by whether the match was exact
+        results = sorted(results, key=match_key, reverse=True)
+
+        return results
+
+    def search_dealjacket_customers(self,
+                                    app_tax_id,
+                                    app_birth_date,
+                                    app_is_business="N",
+                                    coapp_tax_id=None,
+                                    coapp_birth_date=None):
+        """
+        Search for DealJackets with the customer data provided.
+
+        :param app_tax_id: String representation of the
+            primary applicant's tax id. "###-##-####"
+        :param app_birth_date: String representation of the
+            primary applicant's birth date / date of origin. "MM/DD/YYYY"
+        :param app_is_business: "Y" for Yes, "N" for No.
+        :param coapp_tax_id: String representation of the
+            co-applicant's tax id.  "###-##-####"
+        :param coapp_birth_date: String representation of the
+            co-applicant's birth date / date of origin. "MM/DD/YYYY"
+        :return: a list of matching dealjackets
+        """
+
+        # verify that the user isn't sending garbage data
+        if (app_tax_id == coapp_tax_id) and (app_birth_date == coapp_birth_date):
+            return []
+
+        # prepare for run
+        db_date = (datetime
+                   .strptime(app_birth_date, "%m/%d/%Y"))
+
+        # primary applicant customer information
+        if app_is_business == 'N':
+
+            # get the DealJackets for primary applicants.
+            identity_filters = [
+                and_(
+                    Identity.tax_id == app_tax_id,
+                    Identity.birth_date == db_date,
+                    Identity.dealer_code == self.context['dealer_code'],
+                )
+            ]
+            app_filter = and_(
+                DealJacket.customers.any(
+                    DealJacketCustomer.customer.has(
+                        Customer.identity.has(and_(*identity_filters)))),
+
+                # ... and DealJackets with the provided dealer code.
+                DealJacket.dealer_code == self.context['dealer_code']
+            )
+
+        else:
+            # search for business applicant
+            customer_filters = [
+                and_(
+                    Customer.business_tax_id_number == app_tax_id,
+                    Customer.business_established_date == db_date,
+                    Customer.dealer_code == self.context['dealer_code'],
+                )
+            ]
+            app_filter = and_(
+                DealJacket.customers.any(
+                    DealJacketCustomer.customer.has(*customer_filters)),
+                DealJacket.dealer_code == self.context['dealer_code']
+            )
+
+        # if we have parameters for co-applicant, get co-applicant results
+        coapp_filter = None
+        if coapp_tax_id and coapp_birth_date:
+            co_db_date = (datetime
+                          .strptime(coapp_birth_date, "%m/%d/%Y"))
+            coapp_identity_filters = [
+                and_(
+                    Identity.tax_id == coapp_tax_id,
+                    Identity.birth_date == co_db_date,
+                    Identity.dealer_code == self.context['dealer_code'],
+                )
+            ]
+
+            # the coapplicant filter will be relying on the applicant
+            # search results, we're only specifically looking to ensure
+            # that the 'customers' field contains coapplicant information
+            coapp_filter = and_(
+                DealJacket.customers.any(
+                    DealJacketCustomer.customer.has(
+                        Customer.identity.has(and_(*coapp_identity_filters)))),
+                DealJacket.dealer_code == self.context['dealer_code'],
+            )
+
+        # execute query for applicants
+        app_dealjacket_query_results = (
+            self.session
+            .query(DealJacket)
+            .filter(app_filter,
+                    DealJacket.is_hidden_indicator != "Y")
+        )
+
+        # execute query for coapplicants
+        # NOTE: Explicitly checking that its not None because SQLAlchemy's
+        # and_(...) can't be evaluated as boolean
+        if coapp_filter is not None:
+            coapp_dealjacket_results = (app_dealjacket_query_results
+                                        .filter(coapp_filter)
+                                        .order_by(DealJacket.modified_timestamp.desc())
+                                        .distinct()
+                                        .all())
+        else:
+            coapp_dealjacket_results = []
+
+        # retrieve results from applicant query
+        app_dealjacket_results = (
+            app_dealjacket_query_results
+            .order_by(DealJacket.modified_timestamp.desc())
+            .distinct()
+            .all()
+        )
+        app_dealjacket_results = [
+            result for result in app_dealjacket_results
+            if len(result.customers) == 1
+        ]
+
+        results = coapp_dealjacket_results + app_dealjacket_results
+
+        unique_results = list(set(results))
+        return unique_results
+
+    def get_app_coapp_dob(self, deal_jacket_id, deal_id, app_type='A'):
+        """
+        Returns Applicant / Co-Applicant birth date if Co-Applicant exists from DB
+        Applicant / Co-applicant are derived on passed app_type
+        :param deal_jacket_id: Deal Jacket Id
+        :param deal_id: Deal Id
+        :param app_type: Applicant type 'A' or 'C'
+        :return: returns Applicant/Co-applicant birth_date
+        """
+        dealer_code = self.context['dealer_code']
+        deal = (self.session
+                .query(Deal)
+                .filter_by(deal_jacket_id=deal_jacket_id,
+                           deal_id=deal_id,
+                           dealer_code=dealer_code)
+                .one())
+        dob = None
+        if app_type.upper() == 'C' and deal.has_coapplicant:
+            coapp_identity = (self.session
+                              .query(Identity)
+                              .filter(Identity.cc_id == deal.coapplicant.cc_id,
+                                      Identity.dealer_code == dealer_code))
+            identity = coapp_identity.first()
+            if identity:
+                dob = identity.birth_date
+
+        elif app_type.upper() == 'A':
+            app_identity = (self.session
+                            .query(Identity)
+                            .filter(Identity.cc_id == deal.applicant.cc_id,
+                                    Identity.dealer_code == dealer_code))
+            identity = app_identity.first()
+            if identity:
+                dob = identity.birth_date
+
+        return dob
+
+    def get_app_coapp_ssn(self,
+                          deal_jacket_id,
+                          deal_id,
+                          app_type='A'):
+        """
+        Returns Applicant / Co-Applicant SSN if Co-Applicant exists from DB
+        Applicant / Co-applicant are derived on passed app_type
+        :param deal_jacket_id: Deal Jacket Id
+        :param deal_id: Deal Id
+        :param app_type: Applicant type 'A' or 'C'
+        :return: returns Applicant/Co-applicant SSN or None
+        """
+        dealer_code = self.context['dealer_code']
+
+        deal = (self.session
+                .query(Deal)
+                .filter_by(deal_jacket_id=deal_jacket_id,
+                           deal_id=deal_id,
+                           dealer_code=dealer_code)
+                .one())
+
+        ssn = None
+        if app_type.upper() == 'C' and deal.has_coapplicant:
+            coapp_identity = (self.session
+                              .query(Identity)
+                              .filter(Identity.cc_id == deal.coapplicant.cc_id,
+                                      Identity.dealer_code == dealer_code))
+            if coapp_identity.first():
+                ssn = coapp_identity.first().tax_id
+
+        elif app_type.upper() == 'A':
+            app_identity = (self.session
+                            .query(Identity)
+                            .filter(Identity.cc_id == deal.applicant.cc_id,
+                                    Identity.dealer_code == dealer_code))
+            if app_identity.first():
+                ssn = app_identity.first().tax_id
+
+        return ssn
+
+    def create_blank_customer(self, first_name, last_name):
+        """
+        Create blank customer with just first and last name
+        """
+        cust_master = self.CustomerMaster()
+        cust = Customer(cc_id=cust_master.cc_id,
+                        dealer_code=cust_master.dealer_code,
+                        first_name=first_name,
+                        last_name=last_name)
+        cust.master = cust_master
+        self.session.add_all([cust, cust.master])
+        return cust
+
+    @commit_or_rollback
+    def create_or_update_customer(self,
+                                  data,
+                                  cc_id=None,
+                                  applicant_type='A',
+                                  existing_deal=None):
+        """Used to create, version or update a customer
+
+        This method will parse a data dictionary and generate business rules on how to create
+        or update the customer. This method is called in the following three ways:
+              1.)credit app manager in their save customer method.
+              2.)when new DealJacket is created.
+              3.)Credit Bureau will use DealJacket code to call this method.
+
+        Note:
+            cc_id is mainly generated in getBusinessRules but customer is not created.
+
+        Args:
+            data (dict): input data
+            cc_id (int): defaults to None
+            applicant_type (str): defaults to 'A'
+            existing_deal (Deal): defaults to None
+
+        Returns:
+            object: customer
+
+        """
+        data['cc_id'] = cc_id
+        customer_versioning_rules = self.get_versioning_rules_class()(self).generate(data)
+        cc_id = customer_versioning_rules.get('cc_id')
+        customer_db_action = customer_versioning_rules.get('customer_db_action')
+        data = customer_versioning_rules.get('input_data')
+        data['old_customer'] = customer_versioning_rules.get('old_customer')
+
+        if customer_db_action == CustomerVersioning.NewCustomer or \
+           customer_db_action == CustomerVersioning.NewCustomerBigChange:
+            customer = self.Customer(cc_id=cc_id, with_cust_hub=True)
+        elif customer_db_action == CustomerVersioning.UpdateInPlace:
+            customer = self.search_by_id_joinedload(cc_id)
+        elif customer_db_action == CustomerVersioning.NewVersion:
+            customer = self.Customer(cc_id=cc_id, create_new_version=True, with_cust_hub=True)
+        else:
+            raise ValueError(('customer_db_action provided is {}, '
+                             'this is not valid action').format(customer_db_action))
+
+        customer = self.update_customer_fields(data, customer)
+
+        if customer and data.get('is_business') != 'Y':
+            self.update_minimum_customer_identity_fields(data, customer)
+
+        customer.master.identity = \
+            self.create_or_update_customer_identity(data, customer)
+
+        # phones need to be create/updated first
+        # because they reference ``customer._initialize_phones``
+        # which requires clean sqlalchemy model state
+        # if something is changed on the model before that point
+        # FlushError might occur
+        self.create_or_update_customer_phones(data, customer)
+        self.create_or_update_customer_sensitive(data, customer)
+        self.create_or_update_customer_addresses(data, customer)
+        self.create_or_update_customer_employments(data, customer)
+        self.create_or_update_customer_emails(data, customer)
+        self.create_or_update_customer_credit_score(data, customer)
+
+        new_dealjacket = None
+        if customer_db_action == CustomerVersioning.NewCustomerBigChange:
+            new_dealjacket = self.create_new_dealjacket(customer,
+                                                        applicant_type,
+                                                        existing_deal)
+        elif existing_deal:
+            dealjacket = existing_deal.dealjacket
+            self.update_latest_customer_in_dealjacket(dealjacket, customer)
+
+        return customer, new_dealjacket
+
+    def update_latest_customer_in_dealjacket(self, dealjacket, customer):
+        """ Updates latest customer information in dealjacket
+
+        Args:
+          dealjacket (DealJacket): the dealjacket to be updated
+          latest_customer (Customer): latest customer
+        """
+        latest_customer = customer.master.hub.current_customer
+
+        dj_manager = getManager(DealJacketManager, self.context)
+        dealjacket_customer = next(
+            iter(
+                filter(lambda djc: djc.customer.master == latest_customer.master, dealjacket.customers)
+            ), None
+        )
+
+        if latest_customer and dealjacket_customer:
+
+            # manually deleting dj current phones as these relations are wonky as hell
+            self.session.query(DealJacketCurrentPhone).filter(
+                DealJacketCurrentPhone.dealer_code == dealjacket_customer.dealer_code,
+                DealJacketCurrentPhone.deal_jacket_id == dealjacket_customer.deal_jacket_id,
+                DealJacketCurrentPhone.cc_id == dealjacket_customer.cc_id
+            ).delete()
+            # same as phones, manually deleting dj current emails as these relations are wonky as hell too
+            self.session.query(DealJacketCurrentEmail).filter(
+                DealJacketCurrentEmail.dealer_code == dealjacket_customer.dealer_code,
+                DealJacketCurrentEmail.deal_jacket_id == dealjacket_customer.deal_jacket_id,
+                DealJacketCurrentEmail.cc_id == dealjacket_customer.cc_id
+            ).delete()
+            # and refresing the dealjacket customer
+            self.session.refresh(dealjacket_customer)
+            dealjacket_customer.current_phones = []
+            dealjacket_customer.current_emails = []
+
+            # and now we can continue to update the dealjacket customer
+            dealjacket_customer.customer = latest_customer
+            dealjacket_customer.current_address = latest_customer.current_address
+            dealjacket_customer.previous_address = latest_customer.previous_address
+            dealjacket_customer.current_employment = latest_customer.current_employment
+            dealjacket_customer.previous_employment = latest_customer.previous_employment
+
+            for latest_phone in latest_customer.master.current_phones or []:
+                dealjacket_customer.current_phones.append(
+                    DealJacketCurrentPhone(
+                        phone=latest_phone.phone,
+                        phone_id=latest_phone.phone_id,
+                        phone_type_code=latest_phone.phone_type_code))
+
+            for latest_email in latest_customer.master.current_emails or []:
+                dealjacket_customer.current_emails.append(
+                    DealJacketCurrentEmail(
+                        email=latest_email.email,
+                        email_id=latest_email.email_id,
+                        email_type_code=latest_email.email_type_code,
+                    )
+                )
+
+            dj_manager.dealjacket_modified(dealjacket)
+
+    def create_new_dealjacket(self, customer, applicant_type, existing_deal):
+        """
+        Create new dealjacket if soundex triggered.
+        Otherwise return None.
+        """
+        new_dealjacket = None
+        dj_manager = getManager(DealJacketManager, self.context)
+
+        if applicant_type == 'A':
+            new_dealjacket = dj_manager.create_dealjacket([customer])
+            if existing_deal and existing_deal.has_coapplicant:
+                dj_manager.add_coapplicant(new_dealjacket.active_deal,
+                                           existing_deal.coapplicant.dealjacket_customer.customer)
+        elif applicant_type == 'C':
+            new_dealjacket = dj_manager.create_dealjacket([
+                existing_deal.applicant.dealjacket_customer.customer])
+            dj_manager.add_coapplicant(new_dealjacket.active_deal, customer)
+
+        return new_dealjacket
+
+    def update_minimum_customer_fields(self, data, customer):
+        """
+        Updates Customer model object from given data.
+        If Customer instance is not provided, new customer
+        is created. Please note that this function does not
+        commit anything to the db and just updates the instance
+        to have correct values
+        """
+        if not customer:
+            # create Customer with a hub
+            customer = self.Customer(with_cust_hub=True)
+
+        return self.update_customer_fields(data, customer)
+
+    def update_customer_fields(self, data, customer):
+        customer.is_business = data.get('is_business', u'N')
+        old_customer = data.get('old_customer', {})
+
+        tax_id = data.get('business_tax_id_number',
+                          data.get('tax_id', ''))
+
+        if tax_id:
+            customer.tax_id_last_four = tax_id[-4:]
+        else:
+            if hasattr(old_customer, 'tax_id_last_four'):
+                customer.tax_id_last_four = old_customer.tax_id_last_four
+            else:
+                customer.tax_id_last_four = None
+
+        if customer.is_business == 'Y':
+            customer.business_name = data.get('business_name', '')
+            customer.employee_count = self._get_current_or_old_field(data, old_customer, 'employee_count')
+            customer.incorporation_us_state_code = self._get_current_or_old_field(data, old_customer, 'incorporation_us_state_code')
+            customer.business_established_date = self._get_current_or_old_field(data, old_customer, 'business_established_date')
+
+            if re.match(r'\d', tax_id):
+                customer.business_tax_id_number = tax_id
+            elif old_customer:
+                if hasattr(old_customer, 'business_tax_id_number'):
+                    customer.business_tax_id_number = old_customer.business_tax_id_number
+
+            if data.get('business_established_date', ''):
+                established_date = data['business_established_date']
+                today = datetime.utcnow()
+                if is_date_instance(established_date):
+                    today = today.date()
+                    total_years = (today - established_date).days // 365
+                    customer.years_in_business_count = total_years
+            elif old_customer:
+                customer.years_in_business_count = old_customer.years_in_business_count
+
+            if customer.incorporation_us_state_code:
+                customer.incorporation_us_state_code = \
+                    customer.incorporation_us_state_code.upper()
+
+            # not being populated from DT2.0 gui but old records may have been created by Classic Gui
+            # so this is to carryover any values inputted from Classic to prevent us from wiping out any values
+            if hasattr(old_customer, 'business_type_code'):
+                customer.business_type_code = old_customer.business_type_code
+
+        else:
+            customer.first_name = data.get('first_name', '')
+            customer.last_name = data.get('last_name', '')
+            customer.middle_name = self._get_middle_name(old_customer, data.get('middle_name', ''))
+            customer.suffix_code = data.get('suffix_code', '')
+            customer.suffix_code = self._get_current_or_old_field(data, old_customer, 'suffix_code')
+
+            # not being populated from DT2.0 gui but old records may have been created by Classic Gui
+            # so this is to carryover any values inputted from Classic to prevent us from wiping out any values
+            customer.external_customer_id = self._get_previous_field(old_customer, 'external_customer_id')
+            customer.preferred_name = self._get_previous_field(old_customer, 'preferred_name')
+            customer.salutation_code = self._get_previous_field(old_customer, 'salutation_code')
+
+            current_customer_dob = data.get('birth_date')
+
+            if current_customer_dob and isinstance(current_customer_dob, date):
+                customer.birth_day_number = current_customer_dob.day
+                customer.birth_month_code = current_customer_dob.strftime('%m')
+            elif old_customer:
+                customer.birth_day_number = self._get_previous_field(old_customer, 'birth_day_number')
+                customer.birth_month_code = self._get_previous_field(old_customer, 'birth_month_code')
+
+        # not being populated from DT2.0 gui but old records may have been created by Classic Gui
+        # so this is to carryover any values inputted from Classic to prevent us from wiping out any values
+        customer.allow_contact_by_postal = self._get_previous_field(old_customer, 'allow_contact_by_postal', CUSTOMER_ALLOW_CONTACT_DEFAULT)
+        customer.allow_contact_by_phone = self._get_previous_field(old_customer, 'allow_contact_by_phone', CUSTOMER_ALLOW_CONTACT_DEFAULT)
+        customer.allow_contact_by_email = self._get_previous_field(old_customer, 'allow_contact_by_email', CUSTOMER_ALLOW_CONTACT_DEFAULT)
+
+        customer.preferred_language_code = self._get_previous_field(old_customer, 'preferred_language_code')
+        customer.preferred_contact_method_code = self._get_previous_field(old_customer, 'preferred_contact_method_code')
+
+        customer.drivers_license_us_state_code = self._get_current_or_old_field(data, old_customer, 'drivers_license_us_state_code')
+        customer.drivers_license_us_state_code = customer.drivers_license_us_state_code.upper() if customer.drivers_license_us_state_code else None
+
+        return customer
+
+    def _get_previous_field(self, old_customer, field_name, return_default=None):
+
+        if hasattr(old_customer, field_name):
+            return getattr(old_customer, field_name)
+        return return_default
+
+    def _get_current_or_old_field(self, data, old_customer, key_value):
+        """if field is None or doesnt exist then we carry over previous field
+
+        Note: old customer will only have an attribute if is a new version. All others
+              will not have attributes.
+
+        Args:
+            current_field (str): The current value found in customer field.
+            old_field (str): The previous value found in customer field
+
+        Returns: correct field
+
+        """
+        if data.get(key_value, ''):
+            return data.get(key_value)
+        elif hasattr(old_customer, key_value):
+            return getattr(old_customer, key_value)
+
+    def _get_middle_name(self, old_customer, middle_name):
+        """ get middle name
+
+        if a one-character middle name is submitted, and that character matches the
+        first letter of the existing value, retain the existing middle name in its
+        entirety for both new version and update
+
+        Args:
+            middle_name (str): current middle name
+            old_middle_name (str): previous middle name
+
+        Returns:
+            correct middle name
+        """
+
+        if not middle_name and not old_customer:
+            return
+
+        if middle_name == '':
+            if hasattr(old_customer, 'middle_name'):
+                return old_customer.middle_name
+        elif len(middle_name) == 2 and '.' in middle_name:
+            middle_name = middle_name.replace('.', '')
+
+        if not hasattr(old_customer, 'middle_name'):
+            return middle_name
+        else:
+            old_middle_name = old_customer.middle_name
+
+        if len(middle_name) == 1 and old_middle_name and len(old_middle_name) > 1 \
+                and old_middle_name[:1] == middle_name[:1]:
+            return old_middle_name
+        else:
+            return middle_name
+
+    def update_minimum_customer_identity_fields(self, data, customer):
+        """
+        Updates Customer Identity model object from given data.
+        If Customer Identity instance is not provided, new identity
+        is created. Please nose that this function does not
+        commit anything to the db and just updates the instance
+        to have correct values
+        """
+        customer_identity = customer.master.identity
+
+        if not customer_identity:
+            customer_identity = Identity()
+        else:
+            # get the history of current identity
+            # for some reason, if this step is not performed,
+            # later on, changes wont be detected
+            # when checking for soundex
+            get_history(customer_identity, 'tax_id')
+
+        if data.get('tax_id') and re.match('\d', data.get('tax_id', '')):
+            customer_identity.tax_id = data.get('tax_id')
+        # not being populated from DT2.0 gui but old records may have been created by Classic Gui
+        # so this is to carryover any values inputted from Classic to prevent us from wiping out any values
+        elif data.get('old_customer') and not data.get('tax_id', ''):
+            old_customer = data.get('old_customer')
+            if hasattr(old_customer, 'identity_tax_id'):
+                customer_identity.tax_id = old_customer.identity_tax_id
+
+        if not customer.master.identity:
+            customer.master.identity = customer_identity
+
+        return customer_identity
+
+    def create_or_update_customer_identity(self, data, customer):
+        """
+        Creates or Updates Identity model object from given data.
+        """
+        if not self.check_data_matches_model(data, Identity()):
+            return
+
+        customer_identity = self.update_minimum_customer_identity_fields(
+            data, customer
+        )
+
+        customer_identity.bank_account_1 = data.get('bank_account_1', '')
+
+        try:
+            customer_identity.drivers_license = data.get('drivers_license', {}).get('id') or data.get('driver_license_no') or None
+        except AttributeError:
+            #  in case drivers license exists as a string at the drivers_license key (the old way)
+            customer_identity.drivers_license = data.get('drivers_license') or None
+
+        birth_date = data.get('birth_date', '')
+        if birth_date != '**/**/****':
+            if birth_date != '':
+                customer_identity.birth_date = birth_date
+            elif data.get('old_customer'):
+                old_customer = data.get('old_customer', {})
+                if hasattr(old_customer, 'identity_date_of_birth'):
+                    customer_identity.birth_date = old_customer.identity_date_of_birth
+
+        return customer_identity
+
+    def create_or_update_customer_sensitive(self, data, customer):
+        """
+        Creates or Updates Customer Sensitive model object
+        from given data.
+        """
+        # Can we assume if housing status is on the form,
+        # rest of the below fields should be?
+        # for now, yes!
+        if not self.check_data_matches_model(data, CustomerSensitive()):
+            return
+
+        customer_sensitive = customer.master.customer_sensitive
+
+        if not customer_sensitive:
+            customer_sensitive = CustomerSensitive()
+
+        # Defaulting to empty string for legacy reasons.
+        customer_citizenship_code = data.get('citizenship_country_code', '')
+        if customer_citizenship_code:
+            customer_sensitive.citizenship_country_code = customer_citizenship_code
+        customer_sensitive.bank_name = data.get('bank_name', '')
+        customer_sensitive.bank_contact_name = \
+            data.get('bank_contact_name', '')
+        customer_sensitive.financial_statement_code = \
+            data.get('financial_statement_code', '')
+
+        customer_sensitive.housing_status_code = \
+            data.get('housing_status_code', '')
+        customer_sensitive.mortgage_payment_or_rent = \
+            data.get('mortgage_payment_or_rent', '')
+        customer_sensitive.other_income_source = \
+            data.get('other_income_source', '')
+        customer_sensitive.other_monthly_income = \
+            data.get('other_monthly_income', '')
+        if 'marital_status_code' in data:
+            customer_sensitive.marital_status_code = \
+                data.get('marital_status_code', '')
+
+        if data.get('salary', ''):
+            customer_sensitive.salary = data.get('salary', '')
+            customer_sensitive.salary_type_code = \
+                data.get('salary_type_code', '')
+        else:
+            customer_sensitive.salary = None
+            customer_sensitive.salary_type_code = None
+
+        customer.master.customer_sensitive = customer_sensitive
+
+        return customer_sensitive
+
+    def create_or_update_customer_credit_score(self, data, customer):
+        """
+        Creates or Updates Customer Credit Score assuming currently only Other
+        """
+        customer_credit_score = data.get('custom_credit_score', '')
+
+        if customer.master.credit_scores:
+            for score in customer.master.credit_scores:
+                if score.credit_bureau_code == CREDIT_BUREAU_CODE.get('Other'):
+                    if customer_credit_score:
+                        score.credit_score = customer_credit_score
+                        score.credit_inquiry_date = datetime.utcnow()
+                    else:
+                        customer.master.credit_scores.remove(score)
+
+        # in CCv3, customer_credit_score is required field
+        elif customer_credit_score:
+            credit_score = CreditScore()
+            credit_score.dealer_code = int(self.context['dealer_code'])
+            credit_score.cc_id = customer.cc_id
+            credit_score.credit_bureau_code = CREDIT_BUREAU_CODE.get('Other')
+            credit_score.credit_score = customer_credit_score
+            credit_score.credit_inquiry_date = datetime.utcnow()
+
+            customer.master.credit_scores.append(credit_score)
+
+    def create_or_update_customer_addresses(self, data, customer):
+        """
+        Create or update current and previous address, if existent
+        """
+        self.create_or_update_customer_address(data, customer, 'C')
+
+        # check if previous address is entered
+        if any((data.get("previous_line_1_address"),
+                data.get("previous_line_2_address"),
+                data.get("previous_city"),
+                data.get("previous_state"),
+                data.get("previous_us_state_code"))):
+            self.create_or_update_customer_address(data, customer, 'P')
+        else:
+            customer.hub.previous_address_id = None
+
+    def _create_address_model(self, data, c_or_p_prefix, address, address_category_code=None):
+        """ create address model
+
+        Args:
+            data(dict): dict values from gui inputs
+            c_or_p_prefix(char): Current or Previous Address
+            address(object): address of customer
+            address_category_code (str): Custom address category code to set if needed
+
+        Returns:
+            correct address
+        """
+
+        # for Address Versioning only
+        if address is None:
+            address = Address()
+
+        address.address_type_code = 'STD'
+        address.current_previous_code = c_or_p_prefix
+
+        if data.get('is_business', 'N') == 'Y':
+            address.address_category_code = 'EMP'
+        else:
+            address.address_category_code = 'HOME'
+
+        # allow an override of the address category code from an external caller if needed
+        address.address_category_code = address_category_code or address.address_category_code
+        return address
+
+    def create_or_update_customer_address(self, data, customer, c_or_p_prefix, address_category_code=None,
+                                          override_addr_parser='Y'):
+        """ Creates Address model object from given data
+
+        Args:
+            data(dict): input values from Gui
+            customer(object): customer object stored in database
+            c_or_p_prefix: current or previous customer address
+            address_category_code (str): A string to specifiy a custom address category via code
+
+        """
+        if c_or_p_prefix == 'P':
+            data_prefix = 'previous_'
+            customer_address = customer.previous_address
+        elif c_or_p_prefix == 'C':
+            data_prefix = ''
+            customer_address = customer.current_address
+        else:
+            raise ValueError('current previous prefix is invalid, it should be C or P but is {}').format(c_or_p_prefix)
+
+        temp_address = AddressData(customer_address) if customer_address is not None else None
+
+        # data to parse address
+        _address = temp_address or Address()
+        _address.line_1_address = data.get(data_prefix + 'line_1_address', '')
+        _address.line_2_address = data.get(data_prefix + 'line_2_address', '')
+        _address.city = data.get(data_prefix + 'city', '')
+        try:
+            _address.state_province_code = data.get(data_prefix + 'us_state_code').upper()
+        except AttributeError:
+            _address.state_province_code = None
+        _address.postal_code = data.get(data_prefix + 'zip_code', '')
+        _address.country_code = 'USA'
+
+        addr_parser_api = DTAddressParserFacade(self.context)
+        _address = addr_parser_api.parseAddress(_address)
+
+        address_db_action = self._address_versioning(_address, customer_address)
+        # decide whether we will generate a new address id or not.
+        if address_db_action == AddressVersioning.NewAddress:
+            customer_address = self._create_address_model(data, c_or_p_prefix, address=_address, address_category_code=address_category_code)
+        elif address_db_action == AddressVersioning.NewVersion:
+            # Classic may have populated previous version of county/country code,
+            # we are making sure we dont lose these values
+            zip_code = data.get(data_prefix + 'zip_code', '')
+            save_county = customer_address.county if zip_code == customer_address.zip_code else None
+            save_country_code = customer_address.country_code
+            customer_address = self._create_address_model(data, c_or_p_prefix, address=None, address_category_code=address_category_code)
+            customer_address.county = save_county
+            customer_address.country_code = save_country_code
+        customer_address.line_1_address = data.get(data_prefix + 'line_1_address', '')
+        customer_address.line_2_address = data.get(data_prefix + 'line_2_address', '')
+        customer_address.city = data.get(data_prefix + 'city', '')
+        if not customer_address.county:
+            customer_address.county = data.get(data_prefix + 'county', '')
+        try:
+            customer_address.state_province_code = data.get(data_prefix + 'us_state_code').upper()
+        except AttributeError:
+            customer_address.state_province_code = None
+        # We need to override postal_code and county with value coming from address parser
+        customer_address.postal_code = _address.postal_code if _address.postal_code \
+            else data.get(data_prefix + 'zip_code', '')
+        if override_addr_parser == 'Y':
+            customer_address.county = _address.county if _address.county else customer_address.county
+        else:
+            customer_address.county = data.get(data_prefix + 'county', '')
+
+        customer_address.street_number = _address.street_number
+        customer_address.prestreet_directional_code = _address.prestreet_directional_code
+        customer_address.street_name = _address.street_name
+        customer_address.poststreet_directional_code = _address.poststreet_directional_code
+        customer_address.street_type_code = _address.street_type_code
+        customer_address.apartment_number = _address.apartment_number
+        customer_address.suite_number = _address.suite_number
+        customer_address.po_box = _address.po_box
+        customer_address.rural_road_number = _address.rural_road_number
+        customer_address.box_number = _address.box_number
+        customer_address.mail_stop_code = _address.mail_stop_code
+
+        months_at_address_count = self._get_month_address_count(data, c_or_p_prefix)
+        if c_or_p_prefix == 'C':
+            if months_at_address_count is not None:
+                customer_address.months_at_address_count = months_at_address_count
+            # bureau data does not contain 'current_address_years' and we do
+            # not want to remove months_at_address_count from customer from
+            # db in case of bureau
+            elif 'current_address_years' in data:
+                customer_address.months_at_address_count = None
+        elif c_or_p_prefix == 'P':
+            customer_address.months_at_address_count = months_at_address_count
+
+        if address_db_action in (AddressVersioning.NewAddress, AddressVersioning.NewVersion):
+            # update cust hub with the customer address we just added to address table
+            self.append_address(customer, customer_address, c_or_p_prefix, address_category_code)
+
+    def append_address(self, customer, customer_address, c_or_p_prefix, address_category_code=None):
+        ''' add current or pervious address to hub
+
+        Args:
+            customer(object): customer objects
+            customer_address(object): customer address objects
+            c_or_p_prefix: current or previous address
+            address_category_code (str): string used to indicate a custome address category_code
+
+        Returns:
+            Nothing
+
+        Raises:
+            ValueError: if c or p prefix is neither c or p
+
+        '''
+        customer.master.addresses.append(customer_address)
+        # for custom address types, don't replace an existing pointer on the customer
+        if address_category_code:
+            return
+        if c_or_p_prefix == 'C':
+            customer.hub.current_address = customer_address
+        elif c_or_p_prefix == 'P':
+            customer.hub.previous_address = customer_address
+        else:
+            raise ValueError('Invalid current and previous address value. It should be C or P, not {}').format(c_or_p_prefix)
+
+    def create_or_update_customer_phones(self, data, customer):
+        """
+        Creates or Updates phones from given data
+        """
+        customer._initialize_phones()
+
+        # updates done for individuals
+        # We need to delete all the current phones for the particular customer
+        # before we create or update the primary, alternate or work phones.
+        # This way we will always get the correct latest phones in current
+        # phones table.
+        self._delete_current_phones(data, customer)
+        self.create_or_update_individual_primary_phone(data, customer)
+        self.create_or_update_individual_alternate_phone(data, customer)
+        self.create_or_update_individual_work_phone(data, customer)
+        self.create_or_update_individual_previous_work_phone(data, customer)
+
+        # updates done for business
+        if data.get('is_business', 'N') == 'Y':
+            self.create_or_update_business_phone(data, customer)
+            self.create_or_update_business_bank_phone(data, customer)
+
+    def _delete_current_phones(self, data, customer):
+        # Credit bureaus dont send any phone data besides primary phone so we
+        # wont delete current phones here if we reach here via bureaus page.
+        if not data.get('bureaus', ''):
+            customer.master.current_phones = []
+
+    def create_or_update_individual_primary_phone(self, data, customer):
+        """ Create or update both customer primary phones
+
+        The following updates will be done on database
+        1.)allow insert or update on phone table
+        2.)allow insert into curnt phone table
+        3.)allow delete from curnt phone table
+
+        Args:
+            data(dict): input data from gui
+            customer(object): customer object from database
+
+        """
+        if 'primary_phone_number' in data:
+            # If the primary phone gets update from the bureau page, we need to
+            # delete the particular primary phone so, we append the correct
+            # phone number below, and it appears correctly on the header page.
+            if all([data.get('primary_phone_number', ''), data.get('bureaus', '')]):
+                if customer.primary_phone:
+                    self.delete_current_phone(customer, customer.primary_phone)
+            if data.get('primary_phone_number', ''):
+                customer.primary_phone, phone_db_action = self.create_version_update_phone(
+                    data.get('primary_phone_number'),
+                    data.get('primary_phone_type'),
+                    customer,
+                    customer.primary_phone
+                )
+                self.append_current_phone(customer, customer.primary_phone)
+
+            elif customer.primary_phone:
+                # only un-mark the phone as current by removing current_phone_entry
+                customer.primary_phone = self.delete_current_phone(customer, customer.primary_phone)
+
+    def phone_types_do_not_match(self, data):
+        """ phone types do not match
+
+        If alternate phone type is different than primary phone type then we can replace the current phone
+        instance. If they are the same we can not because this would override the primary update.
+
+        Args:
+            data(dict): input values from gui.
+
+        Returns:
+            True if phone types are different, false if they are same.
+
+        """
+        primary_phone_type = data.get('primary_phone_type', None)
+        alternate_phone_type = data.get('alternate_phone_type', None)
+        return primary_phone_type != alternate_phone_type
+
+    def create_or_update_individual_alternate_phone(self, data, customer):
+        """ Create or update individual alternate phone
+
+        The following updates will be done to the database for alternate phone if key exists.
+        1.)if data exists then update alternate phone
+        2.)if data exists then add alternate phone to current phone table.
+        3.)if data doesnt exist and previous data has values then delete corresponding current phone row table
+
+        Args:
+            data(dict): input values from gui
+            customer(object): customer object from database
+        """
+
+        if 'alternate_phone_number' in data:
+            if data.get('alternate_phone_number', ''):
+                phone_types_do_not_match = self.phone_types_do_not_match(data)
+                customer.alternate_phone, phone_db_action = self.create_version_update_phone(
+                    data.get('alternate_phone_number'),
+                    data.get('alternate_phone_type'),
+                    customer,
+                    customer.alternate_phone,
+                    primary=False
+                )
+                self.append_current_phone(
+                    customer,
+                    customer.alternate_phone,
+                    remove_current_phone=phone_types_do_not_match
+                )
+
+            elif customer.alternate_phone:
+                # only un-mark the phone as current by removing current_phone_entry
+                if not data.get('bureaus', ''):
+                    if customer.primary_phone:
+                        if all([
+                            customer.primary_phone.phone_id != customer.alternate_phone.phone_id,
+                            len(customer.master.current_phones) > 1
+                        ]):
+                            self.delete_current_phone(customer, customer.alternate_phone)
+                    # Secondary phone id is used to get secondary phone from the
+                    # hub.
+                    # For cases like customers coming from classic where hub is not
+                    # guaranteed always to exists we set alternate_phone_number to
+                    # None as well, since we switch to alternate_phone_number when
+                    # custhub is not available.
+                    customer.hub.secondary_phone_id = customer.alternate_phone = None
+
+    def create_or_update_individual_work_phone(self, data, customer):
+        """ Create or update individual work phone in the database
+
+        if work_phone_number and employment status code keys exists and have the appropriate constant values
+        then update or insert phone and create a new current phone instance
+
+        if work phone number is not inputted and it is not a business then delete current phone instance
+
+        Args:
+            data(dict): input values from gui
+            customer(object): customer objects from database
+        """
+
+        if all([data.get('work_phone_number', ''),
+                data.get('employment_status_code', '')
+                in ALL_EMPLOYMENT_STATUS]):
+            customer.work_phone, phone_db_action = self.create_version_update_phone(data.get('work_phone_number'),
+                                                                                    PHONE_TYPE_BUSINESS,
+                                                                                    customer,
+                                                                                    customer.work_phone)
+            self.append_current_phone(customer, customer.work_phone)
+
+        # bureau form does not contain 'work_phone_number' and we do not want
+        # to remove work phone from customer from db in case of bureau
+        elif all([not data.get('work_phone_number', ''),
+                  not data.get('bureaus', '')]):
+            if customer.work_phone:
+                # only un-mark the phone as current
+                customer.work_phone = self.delete_current_phone(customer, customer.work_phone)
+
+    def create_or_update_individual_previous_work_phone(self, data, customer):
+        """
+        Create, update, or delete individual previous work phone
+        1. allow insert or update on phone table
+        2. disallow insert into curnt phone table
+        3. allow delete from curnt phone table
+        """
+
+        if all([data.get('previous_work_phone_number', ''),
+                data.get('previous_employment_status_code', '')
+                in ALL_EMPLOYMENT_STATUS]):
+            customer.previous_work_phone, phone_db_action = self.create_version_update_phone(
+                data.get('previous_work_phone_number'),
+                PHONE_TYPE_PREVIOUS_EMPLOYEE,
+                customer,
+                customer.previous_work_phone
+            )
+
+            self.append_current_phone(customer, customer.previous_work_phone)
+
+        # bureau form does not contain 'work_phone_number' and we do not want
+        # to remove work phone from customer from db in case of bureau
+        elif all([not data.get('previous_work_phone_number', ''),
+                  not data.get('bureaus', '')]):
+
+            # There are some cases where customer.previous_work_phone is `BIZ`
+            # instead of `PEMP`
+            if customer.previous_work_phone:
+                if customer.previous_work_phone.phone_type_code == PHONE_TYPE_PREVIOUS_EMPLOYEE:
+                    # only un-mark the phone as current
+                    self.delete_current_phone(customer, customer.previous_work_phone)
+                    customer.previous_work_phone = None
+
+    def create_or_update_business_phone(self, data, customer):
+        """
+        Create or update customer business phone
+        1. allow insert or update on phone table
+        2. allow insert into curnt phone table
+        3. disallow delete from curnt phone table
+        """
+        if data.get('current_business_phone', ''):
+            customer.work_phone, phone_db_action = self.create_version_update_phone(data.get('current_business_phone'),
+                                                                                    PHONE_TYPE_BUSINESS,
+                                                                                    customer,
+                                                                                    customer.work_phone)
+            self.append_current_phone(customer, customer.work_phone)
+
+    def create_or_update_business_bank_phone(self, data, customer):
+        """
+        Create or update customer bank phone
+        1.)allow insert or update on phone table
+        2.)allow insert into curnt phone table
+        3.)allow delete from curnt phone table
+        """
+        if data.get('current_bank_phone'):
+            customer.bank_phone, phone_db_action = self.create_version_update_phone(data.get('current_bank_phone'),
+                                                                                    PHONE_TYPE_BANK,
+                                                                                    customer,
+                                                                                    customer.bank_phone)
+            self.append_current_phone(customer, customer.bank_phone)
+
+    def delete_current_phone(self, customer, customer_phone):
+        current_phone = next(
+            six.moves.filter(
+                lambda p: p.phone_id == customer_phone.phone_id,
+                customer.master.current_phones
+            ), None
+        )
+        # If we cannot find current phone by id, we find the current phone by
+        # phone_type, since the same phone number could have a different phone
+        # type in some cases.
+        if not current_phone and customer_phone:
+            current_phone = next(
+                six.moves.filter(
+                    lambda p: p.phone_type_code == customer_phone.phone_type_code,
+                    customer.master.current_phones
+                ), None
+            )
+        if current_phone:
+            customer.master.current_phones.remove(current_phone)
+        return
+
+    def create_version_update_phone(self, phone_number, phone_type_code, customer, customer_phone, primary=True):
+        # create temporary placeholder for phone
+        _phone = self.phone_template(phone_number=phone_number, phone_type_code=phone_type_code)
+        phone_db_action = self._phone_versioning(_phone, customer_phone)
+        customer_phone = customer.get_phone_by_phone_number(phone_number)
+
+        # Create a new phone when the phone type has changed.
+        if customer_phone and all([
+            customer_phone.phone_number == phone_number,
+            customer_phone.phone_type_code != _phone.phone_type_code
+        ]):
+            customer_phone = self._create_phone(_phone, customer)
+
+        # Create or version
+        elif phone_db_action in (PhoneVersioning.NewPhone, PhoneVersioning.NewVersion):
+            # create phone model
+            if phone_number not in customer.phone_numbers:
+                customer_phone = self._create_phone(_phone, customer)
+                customer_phone.phone_type_code = phone_type_code
+
+        # We don't want to set business phones as primary or secondary so we
+        # limit this to `Home` and `Cell`
+        if _phone.phone_type_code in ['HOME', 'CELL']:
+            if primary:
+                customer.hub.primary_phone = customer_phone
+                customer.hub.primary_phone.phone_type_code = _phone.phone_type_code
+            else:
+                customer.hub.secondary_phone = customer_phone
+                customer.hub.secondary_phone.phone_type_code = _phone.phone_type_code
+
+        return customer_phone, phone_db_action
+
+    def _create_phone(self, phone_template, customer):
+        customer_phone = Phone(
+            master=customer.master,
+            phone_number=phone_template.phone_number,
+            phone_type_code=phone_template.phone_type_code,
+        )
+        # TODO (serkan): thanks to the wonky cc3 relations, setting master of customer won't
+        # back populate phone into master.phones and leave it in pending state so we have to do this manually
+        if customer_phone not in customer.master.phones:
+            customer.master.phones.append(customer_phone)
+
+        self.session.add(customer_phone)
+        return customer_phone
+
+    def append_current_phone(self, customer, phone, remove_current_phone=True):
+        """ add current phone to current phone table
+        """
+        current_phone = customer.get_current_phone_of_type(phone.phone_type_code,
+                                                           phone_or_current=False)
+        if current_phone is None:
+            current_phone = CurrentPhone(phone_id=phone.phone_id,
+                                         customer=customer,
+                                         phone=phone,
+                                         phone_type_code=phone.phone_type_code)
+            customer.master.current_phones.append(current_phone)
+        elif remove_current_phone:
+            # We remove the old current phone and add the new one so the phone
+            # type codes and phone ids are updated correctly.
+            customer.master.current_phones.remove(current_phone)
+            current_phone = CurrentPhone(
+                phone=phone,
+                customer=customer,
+                phone_id=phone.phone_id,
+                phone_type_code=phone.phone_type_code
+            )
+            customer.master.current_phones.append(current_phone)
+
+    def create_or_update_customer_emails(self, data, customer):
+        """
+        Create or update customer emails
+        """
+        if data.get('email_address'):
+            self.create_or_update_customer_email(data, customer)
+        else:
+            current_email = customer.get_current_email_of_type(HOME_EMAIL_TYPE, False)
+            if current_email:
+                customer.master.current_emails.remove(current_email)
+
+    def create_or_update_customer_email(self, data, customer):
+        """
+        Creates or Updates Email model object from given data
+        """
+        customer_email = customer.get_current_email_of_type(HOME_EMAIL_TYPE)
+
+        # create temporary placeholder for email
+        _email = self.email_template(email_address=data.get('email_address', ''),
+                                     email_type_code=HOME_EMAIL_TYPE)
+        email_db_action = self._email_versioning(_email, customer_email)
+
+        if email_db_action in (EmailVersioning.NewEmail, EmailVersioning.NewVersion):
+            # create new email model
+            customer_email = Email()
+            customer_email.email_type_code = _email.email_type_code
+            customer.master.emails.append(customer_email)
+
+        customer_email.email_address = _email.email_address
+
+        if email_db_action in (EmailVersioning.NewEmail, EmailVersioning.NewVersion):
+            current_email = customer.get_current_email_of_type(customer_email.email_type_code, False)
+            if current_email is None:
+                current_email = CurrentEmail(master=customer.master, email=customer_email,
+                                             email_type_code=customer_email.email_type_code)
+            else:
+                current_email.email = customer_email
+                current_email.email_id = customer_email.email_id
+
+        self.session.flush()
+        return customer_email
+
+    def create_or_update_customer_employments(self, data, customer):
+        """
+        Create or update both current and previous customer employments
+        """
+        # We must call `create_or_update_previous_customer_employment` first
+        # to avoid integrity error when users remove current employment and
+        # previous employment all at once by removing current_employment from
+        # the form.
+        self.create_or_update_previous_customer_employment(data, customer)
+        self.create_or_update_current_customer_employment(data, customer)
+
+    def create_or_update_current_customer_employment(self, data, customer):
+        """
+        Creates or Updates Customer Employment model
+        object from given data
+        """
+        if data.get('employment_status_code'):
+            current_employment = \
+                self._create_or_update_current_customer_employment(data, customer)
+            if not current_employment:
+                # We need to explicity make current_employment_id
+                # None to make delete work. If not, sqlalchemy
+                # throws an Integrity error.
+                customer.hub.current_employment_id = None
+                del customer.master.employments[:]
+
+    def get_data_prefix(self, previous_or_current):
+        if previous_or_current == 'P':
+            data_prefix = 'previous_'
+        elif previous_or_current == 'C':
+            data_prefix = 'current_'
+        else:
+            raise ValueError('Invalid Previous or Current Option, should be C or P but it is - {}'.format(previous_or_current))
+
+        return data_prefix
+
+    def _get_month_employed_count(self, data, previous_or_current):
+        data_prefix = self.get_data_prefix(previous_or_current)
+        years = data.get(data_prefix + 'employed_years', '')
+        months = data.get(data_prefix + 'employed_months', '')
+        return get_month_count(years, months)
+
+    def _get_month_address_count(self, data, previous_or_current):
+
+        data_prefix = self.get_data_prefix(previous_or_current)
+        years = data.get(data_prefix + 'address_years', '')
+        months = data.get(data_prefix + 'address_months', '')
+        return get_month_count(years, months)
+
+    def _address_versioning(self, input_address, db_address):
+        """ address versioning
+
+        Args:
+            input_address(object): customer address from input
+            db_address(object): customer address from database
+
+        Returns:
+            AddressVersioning type
+        """
+
+        if db_address is None:
+            return AddressVersioning.NewAddress
+
+        to_compare = ['line_1_address', 'line_2_address', 'city', 'state_province_code', 'postal_code',
+                      'country_code', 'street_number', 'prestreet_directional_code', 'street_name',
+                      'poststreet_directional_code', 'street_type_code', 'apartment_number', 'suite_number',
+                      'po_box', 'rural_road_number', 'box_number', 'mail_stop_code']
+
+        if any(field_should_be_versioned(getattr(input_address, i), getattr(db_address, i))
+               for i in to_compare):
+            return AddressVersioning.NewVersion
+        else:
+            return AddressVersioning.UpdateInPlace
+
+    def _employment_versioning(self, input_employment, db_employment):
+
+        if db_employment is None:
+            return EmploymentVersioning.NewEmployment
+
+        to_compare = ['occupation_name', 'employment_status_code', 'organization_name', 'month_employed_count']
+
+        if any(field_should_be_versioned(getattr(input_employment, i), getattr(db_employment, i))
+               for i in to_compare):
+            return EmploymentVersioning.NewVersion
+        else:
+            return EmploymentVersioning.UpdateInPlace
+
+    def _phone_versioning(self, input_phone, db_phone):
+
+        if db_phone is None:
+            return PhoneVersioning.NewPhone
+
+        to_compare = ['phone_number', 'phone_type_code']
+
+        if any(field_should_be_versioned(getattr(input_phone, i), getattr(db_phone, i))
+               for i in to_compare):
+            return PhoneVersioning.NewVersion
+        else:
+            return PhoneVersioning.UpdateInPlace
+
+    def _email_versioning(self, input_email, db_email):
+
+        if db_email is None:
+            return EmailVersioning.NewEmail
+
+        to_compare = ['email_address', 'email_type_code']
+
+        if any(field_should_be_versioned(getattr(input_email, i), getattr(db_email, i))
+               for i in to_compare):
+            return EmailVersioning.NewVersion
+        else:
+            return EmailVersioning.UpdateInPlace
+
+    def get_organization_name(self, data, prefix=''):
+        """ Check for School, Since both organization_name and school are using same field."""
+        if data.get(prefix + 'school', ''):
+            organization_name = data.get(prefix + 'school', '')
+        else:
+            organization_name = data.get(prefix + 'organization_name', '')
+        return organization_name
+
+    def _create_or_update_current_customer_employment(self, data, customer):
+        """
+        Helper function which actually creates or updates
+        customer employment information.
+        """
+        if all([not self.check_data_matches_model(data, Employment()),
+                not data.get('current_employed_years', ''),
+                not data.get('current_employed_months', '')]):
+            return
+
+        current_employment = customer.current_employment
+
+        # create a temporary placeholder for employment information
+        _employment = self.employment_template(occupation_name=data.get('occupation_name'),
+                                               employment_status_code=data.get('employment_status_code'),
+                                               month_employed_count=self._get_month_employed_count(data, 'C'),
+                                               organization_name=self.get_organization_name(data))
+
+        employment_db_action = self._employment_versioning(_employment, current_employment)
+
+        if employment_db_action in (EmploymentVersioning.NewEmployment, EmploymentVersioning.NewVersion):
+            # create new employment model
+            current_employment = Employment()
+            self.session.add(current_employment)
+            customer.master.employments.append(current_employment)
+
+        current_employment.month_employed_count = _employment.month_employed_count
+        current_employment.occupation_name = _employment.occupation_name
+        current_employment.employment_status_code = _employment.employment_status_code
+        current_employment.organization_name = _employment.organization_name
+
+        if employment_db_action in (EmploymentVersioning.NewEmployment, EmploymentVersioning.NewVersion):
+            self.session.flush()
+            customer.hub.current_employment_id = current_employment.employment_info_id
+            customer.hub.current_employment = current_employment
+
+        return current_employment
+
+    def create_or_update_previous_customer_employment(self, data, customer):
+        """
+        Creates or Updates Customer Previous Employment
+        model object from given data
+        """
+        if 'previous_employment_status_code' in data:
+            self._create_or_update_previous_customer_employment(data, customer)
+
+    def _create_or_update_previous_customer_employment(self, data, customer):
+        """
+        Helper function which actually creates or updates
+        customer previous employment information.
+        """
+        if not data.get('previous_employment_status_code', ''):
+            customer.hub.previous_employment_id = None
+            return
+
+        previous_employment = customer.previous_employment
+
+        # create a temporary placeholder for employment information
+        _employment = self.employment_template(occupation_name=data.get('previous_occupation_name'),
+                                               employment_status_code=data.get('previous_employment_status_code'),
+                                               month_employed_count=self._get_month_employed_count(data, 'P'),
+                                               organization_name=self.get_organization_name(data, prefix='previous_'))
+
+        employment_db_action = self._employment_versioning(_employment, previous_employment)
+
+        if employment_db_action in (EmploymentVersioning.NewEmployment, EmploymentVersioning.NewVersion):
+            # create new employment model
+            previous_employment = Employment()
+            customer.master.employments.append(previous_employment)
+
+        previous_employment.employment_status_code = _employment.employment_status_code
+        previous_employment.occupation_name = _employment.occupation_name
+        previous_employment.organization_name = _employment.organization_name
+        previous_employment.month_employed_count = _employment.month_employed_count
+
+        if employment_db_action in (EmploymentVersioning.NewEmployment, EmploymentVersioning.NewVersion):
+            self.session.flush()
+            customer.hub.previous_employment_id = previous_employment.employment_info_id
+            customer.hub.previous_employment = previous_employment
+
+        return previous_employment
+
+    def check_data_matches_model(self, data, model_object):
+        """
+        Checks model object contains value in data.
+
+        This method doesn't do anything useful. If it finds one common
+        attribute, even if it's not something unique to the model, it passes.
+        """
+        for attribute in dir(model_object):
+            if not attribute == 'cc_id' and data.get(attribute, None):
+                return True
+
+        return False
+
+    def get_models_for_customer_by_ccid(
+            self,
+            cc_id,
+            deal=None,
+            deal_customer_attr='applicant',
+            include_deal_customer=True,
+            include_employments=True,
+            include_emails=True,
+            include_phones=True,
+            include_credit_score=True):
+        """
+        Return list of sql alchemy models wrapped
+        for a given customer id
+
+        :param cc_id: Customer id for whom to get models
+        :param deal: (optional) Deal to be included in the model list
+        :param deal_customer_attr: (optional) Deal attribute
+            to retrieve customer which if available
+            and if ``include_deal_customer`` is ``True``
+            will be included in the models list.
+            Default attribute is ``"applicant"``
+        :param include_deal_customer: (optional) If the deal
+            is provided and if the customer exists this
+            parameter specifies whether to include deal
+            customer in the models list
+        :param include_employments: (optional) Whether to include
+            customer first employments entry to the models.
+            Default is ``True``
+        :param include_emails: (optional) Whether to include
+            customer first emails entry to the models.
+            Default is ``True``
+        :param include_phones: (optional) Whether to include
+            customer first phones entry to the models.
+            Default is ``True``
+        """
+        customer = self.get_latest_customer(cc_id=cc_id)
+
+        model_classes = [
+            ModelClass(customer),
+            ModelClass(customer.hub.current_address),
+            ModelClass(customer.master.customer_sensitive),
+            ModelClass(customer.master.identity),
+        ]
+
+        if deal:
+            model_classes.append(ModelClass(deal))
+
+            deal_customer = getattr(deal, deal_customer_attr)
+            if include_deal_customer and deal_customer:
+                model_classes.append(ModelClass(deal_customer))
+
+        if include_employments and customer.current_employment:
+            model_classes.append(ModelClass(customer.current_employment))
+
+        if include_emails and customer.master.emails:
+            model_classes.append(ModelClass(customer.master.emails[0]))
+
+        if include_phones and customer.master.phones:
+            model_classes.append(ModelClass(customer.master.phones[0]))
+
+        if include_credit_score and customer.credit_scores:
+            model_classes.append(ModelClass(customer.master.credit_scores[0]))
+
+        return model_classes
+
+    def get_models_for_coapplicant_from_deal(self, deal):
+        """
+        Return list of sql alchemy models wrapped in model class
+        """
+        deal_customer = deal.coapplicant
+        coapplicant = None
+        if deal_customer:
+            coapplicant = deal_customer.customer_detail
+
+        if coapplicant:
+            model_classes = [
+                ModelClass(deal_customer),
+                ModelClass(coapplicant),
+                ModelClass(coapplicant.hub.current_address),
+                ModelClass(coapplicant.master.customer_sensitive),
+                ModelClass(coapplicant.master.identity)
+            ]
+            if coapplicant.current_employment:
+                model_classes.append(ModelClass(coapplicant.current_employment))
+            if coapplicant.emails:
+                model_classes.append(ModelClass(coapplicant.emails[0]))
+            if coapplicant.phones:
+                model_classes.append(ModelClass(coapplicant.phones[0]))
+            if coapplicant.credit_scores:
+                model_classes.append(ModelClass(coapplicant.credit_scores[0]))
+
+            return model_classes
+
+        return
+
+    def get_models_for_customer_spouses(self, deal):
+        """
+        Get models for deal app and coapp spouses
+        """
+        applicant = deal.applicant
+        coapplicant = deal.coapplicant
+
+        model_classes = []
+        mapping = {
+            'app_spouse_': applicant,
+            'coapp_spouse_': coapplicant
+        }
+        for prefix, model in mapping.items():
+            if model and model.deal_customer_spouse:
+                model_classes.append(
+                    ModelClass(model.deal_customer_spouse[0],
+                               prefix)
+                )
+
+        return model_classes
+
+    def get_business_data_by_cc_id(self, cc_id, spec_fields):
+        """
+        This method returns applicant data dictionary for the given cc_id
+        where each model field will correspond to a key in the dict
+        """
+
+        result_dict = {}
+        try:
+            joinedload_all_options = [joinedload_all('master.addresses'), joinedload_all('master.phones'),
+                                      joinedload_all('master.emails'), joinedload_all('master.identity'),
+                                      joinedload_all('master.employments'), joinedload_all('master.customer_sensitive')]
+
+            applicant = self.get_latest_customer(cc_id, special_options=joinedload_all_options)
+        except (NoResultFound, MultipleResultsFound):
+            result_dict = {'error': 'Customer Does Not Exist'}
+            return result_dict
+
+        model_classes = [
+            applicant,
+            applicant.hub.current_address,
+            applicant.master.customer_sensitive,
+            applicant.master.identity,
+        ]
+        if applicant.master.employments:
+            model_classes.append(applicant.master.employments[0])
+        if applicant.master.emails:
+            model_classes.append(applicant.master.emails[0])
+
+        for model_class in model_classes:
+            result_dict = property_mapper(model_class, spec_fields, result_dict)
+
+        result_dict.update({
+            'business_phone': applicant.current_business_phone.phone_number,
+            'business_tax_id_number': None
+        })
+        if applicant.current_bank_phone:
+            result_dict.update({
+                'bank_phone_number': applicant.current_bank_phone.phone_number,
+            })
+
+        return result_dict
+
+    def get_score_for_bureau(self, credit_scores, bureau_code):
+        """
+        Gets score for the bureau code provided
+        """
+        for score in credit_scores:
+            if score.credit_bureau_code == bureau_code:
+                return score.credit_score
+        return
+
+    def check_applicant_in_cp_state(self, customer, spouse_req_states_only=False):
+        """
+        This method checks if customer belongs to CP State or not.
+
+        Args:
+            customer (Customer): Customer object containing address info
+            spouse_req_states_only (bool): True to return only community
+                property states which require spouse information to be filled.
+        Returns:
+            Returns True if customer belongs to Community Property; False otherwise.
+        """
+        valid_states = CP_STATES_REQUIRE_SPOUSE if spouse_req_states_only else CP_STATES
+        try:
+            return customer.customer_detail.current_address.us_state_code in valid_states
+        except AttributeError:
+            return False
+
+    def get_differences_between_two_versions_of_customer(self, dealjacket_id):
+        """Return a list of differences between dealjacket customer(s) and latest customer(s).
+
+        Difference is determined by business rules defined in UserManager for minor
+        variation in first name, last name, business name, address or employment
+
+        Args:
+          dealjacket_id (int): dealjacket_id
+
+        Returns:
+          List of differences
+        """
+        differences = OrderedDict()
+        dj_manager = getManager(DealJacketManager, self.context)
+        dealjacket = dj_manager.get_dealjacket(dealjacket_id)
+        ccm = getManager(CustomerManager, self.context)
+        applicant = ccm.get_latest_customer(dealjacket.dealjacket_customer.cc_id)
+        self._find_and_add_difference(dealjacket.dealjacket_customer, applicant, differences)
+        app_last_modified_on = applicant.hub.updated_timestamp
+
+        co_app_last_modified_on = None
+        if dealjacket.dealjacket_co_applicant:
+            co_applicant = ccm.get_latest_customer(dealjacket.dealjacket_co_applicant.cc_id)
+            if co_applicant:
+                self._find_and_add_difference(dealjacket.dealjacket_co_applicant, co_applicant, differences, CO_APPLICANT)
+                co_app_last_modified_on = co_applicant.hub.updated_timestamp
+
+        last_modified_on = None
+        if app_last_modified_on and co_app_last_modified_on:
+            last_modified_on = max(app_last_modified_on, co_app_last_modified_on)
+        elif app_last_modified_on:
+            last_modified_on = app_last_modified_on
+        else:
+            last_modified_on = co_app_last_modified_on
+
+        if last_modified_on != dealjacket.modified_timestamp:
+            differences[VERSIONED_MODIFIED_ON_FIELD['updated_timestamp']] = (last_modified_on, dealjacket.modified_timestamp)
+
+        return differences
+
+    def is_customers_information_out_of_date(self, dealjacket_customer, latest_customer):
+        """Function to verify whether customers information is out of date or not
+
+        Args:
+          dealjacket_customer (Customer): Customer that referred by dealjacket
+          latest_customer (Customer): Latest customer
+
+        Return:
+          True or False
+        """
+        if dealjacket_customer and latest_customer:
+            return any([latest_customer.customer_id != dealjacket_customer.customer_version_number,
+                        latest_customer.current_address != dealjacket_customer.current_address,
+                        latest_customer.previous_address != dealjacket_customer.previous_address,
+                        latest_customer.current_employment != dealjacket_customer.current_employment,
+                        latest_customer.previous_employment != dealjacket_customer.previous_employment,
+                        latest_customer.email_address != dealjacket_customer.email_address])
+
+    def _find_and_add_difference(self, dealjacket_customer, latest_customer, differences, co_app_prefix=None):
+        """Function to find the list of differences between dealjacket customer
+        and latest customer and add those differences to the given list
+
+        Args:
+          fields_to_verify (dict): dictionary of fields to find differences
+          latest_customer (Customer):  Latest customer object
+          dealjacket_customer (Customer):  Dealjacket customer object
+          differences (dict): list where we suppose update the difference if any
+          co_app_prefix (string): if its for co_app attach pprefix to the lable
+
+        Returns:
+          Returns a list of differences between dealjacket_customer and latest_customer for given fields.
+        """
+
+        if dealjacket_customer.customer != latest_customer:
+            self._get_and_add_differences(VERSIONED_CUSTOMER_FIELDS, dealjacket_customer.customer,
+                                          latest_customer, differences, co_app_prefix)
+
+        if dealjacket_customer.email_address != latest_customer.email_address:
+            self._get_and_add_differences(VERSIONED_EMAIL_FIELD, dealjacket_customer, latest_customer, differences,
+                                          co_app_prefix)
+
+        if latest_customer.current_address != dealjacket_customer.current_address:
+            self._get_and_add_differences(VERSIONED_ADDRESS_FIELDS, dealjacket_customer.current_address,
+                                          latest_customer.current_address, differences, co_app_prefix)
+
+        if latest_customer.previous_address != dealjacket_customer.previous_address:
+            self._get_and_add_differences(VERSIONED_ADDRESS_FIELDS, dealjacket_customer.previous_address,
+                                          latest_customer.previous_address, differences,
+                                          "{0} {1}".format(co_app_prefix, PREVIOUS)
+                                          if co_app_prefix else PREVIOUS)
+
+        if latest_customer.current_employment != dealjacket_customer.current_employment:
+            self._get_and_add_differences(VERSIONED_EMPLOYMENT_FIELDS, dealjacket_customer.current_employment,
+                                          latest_customer.current_employment, differences, co_app_prefix)
+
+        if latest_customer.previous_employment != dealjacket_customer.previous_employment:
+            self._get_and_add_differences(VERSIONED_EMPLOYMENT_FIELDS, dealjacket_customer.previous_employment,
+                                          latest_customer.previous_employment, differences,
+                                          "{0} {1}".format(co_app_prefix, PREVIOUS)
+                                          if co_app_prefix else PREVIOUS)
+
+    def _get_and_add_differences(self, fields_to_verify, old_object, new_object, list_difference, prefix=None):
+        """Function to find the list of differences between two object and add those to given list
+
+        Args:
+          fields_to_verify (dict): dictionary of fields to find differences,key would be the field name
+                                    and value would be actual label name
+          old_object (type):  old version of customer info object
+          new_object (type):  new version of customer info object
+          list_difference (dict): list where we suppose update the difference if any
+          prefix (string): prefix text that needs to be get attached to label
+
+        Returns:
+          Returns a list of differences between two objects for given fields.
+        """
+        for field, name in fields_to_verify.items():
+            old_value = getattr(old_object, field, '') or ''
+            new_value = getattr(new_object, field, '') or ''
+
+            if field == 'employed_years_months':
+                if old_value:
+                    old_value = "{year} {year_text} {month} {month_text}"\
+                        .format(year=old_value[0], year_text='yrs' if old_value[0] > 1 else 'yr',
+                                month=old_value[1], month_text='mos' if old_value[1] > 1 else 'mo')
+                if new_value:
+                    new_value = "{year} {year_text} {month} {month_text}"\
+                        .format(year=new_value[0], year_text='yrs' if new_value[0] > 1 else 'yr',
+                                month=new_value[1], month_text='mos' if new_value[1] > 1 else 'mo')
+
+            if old_value.upper() != new_value.upper():
+                if field == 'state':
+                    new_value = new_value.upper()
+                    old_value = old_value.upper()
+
+                name = "{0} {1}".format(prefix, name) if prefix else name
+                list_difference[name] = (new_value if new_value else '-', old_value if old_value else '-')
+        return list_difference
+
+    def get_customer_address_by_id(self, address_id):
+        dealer_code = self.context['dealer_code']
+        try:
+            query = (self.session.query(Address)
+                     .filter(and_(Address.dealer_code == dealer_code,
+                                  Address.address_id == address_id)))
+            return query.one()
+
+        except NoResultFound:
+            msg = 'No customer address found for address_id={}'
+            self.log.info(msg.format(address_id))
+            self.log_event(
+                event_nm='No customer address found',
+                log_type='error',
+                error_message=msg.format(address_id)
+            )
+            return
+
+
+class Validate(object):
+
+    """
+    base class for object validators
+    This uses the adapter pattern.
+
+    The work is done in the validate method which
+    **must be overridden** in subclasses of this class
+
+    usage: ValidateSubclass(object).validate()
+
+    validate should return None or a string indicating the error
+    """
+
+    def __init__(self, manager, data, customer):
+        self.manager = manager
+        self.data = data
+        self.customer = customer
+
+    def validate(self):
+        """
+        actual validation method.
+        **must override**
+        this should return a string (empty if no validation notes)
+        representation of the validation error or state
+        """
+        raise NotImplementedError('Should override this method!')
+
+
+class ValidateCustLastNameChange(Validate):
+
+    def validate(self):
+        """
+        checks the difference in the customer last name
+
+        :param cust: Customer object to check
+        :returns: category of change i.e. one of ['', 'BIG','SMALL']
+                  always returns a string marking the "size'" of the change
+        """
+        input_last_name = self.data.get('last_name', None)
+        if input_last_name and self.customer.last_name:
+            if self.manager.is_big_name_change(input_last_name, self.customer.last_name):
+                return 'BIG'
+            else:
+                return 'SMALL'
+        else:
+            return 'SMALL'
+
+
+class ValidateTaxIdChange(Validate):
+
+    def validate(self):
+        """
+        checks the difference in the customer name
+
+        :param cust: Customer object to check
+        :returns: category of change i.e. one of ['', 'BIG','SMALL']
+                  always returns a string marking the "size'" of the change
+        """
+        ident = self.customer.master.identity
+        if not ident:
+            return 'SMALL'
+
+        input_tax_id = self.data.get('tax_id', None)
+        db_tax_id = ident.tax_id
+        if input_tax_id and input_tax_id.isdigit() and db_tax_id:
+            old_sum = sum(int(c) for c in db_tax_id)
+            new_sum = sum(int(c) for c in input_tax_id)
+
+            msg = 'tax id change: {} {} {} {}'
+            self.manager.log.info(msg.format(old_sum, new_sum, db_tax_id, input_tax_id))
+            return 'BIG' if abs(old_sum - new_sum) > 3 else 'SMALL'
+        else:
+            return 'SMALL'
+
+
+class ValidateBusinessNameChange(Validate):
+
+    def validate(self):
+        """
+        checks the difference in the Business name
+
+        :param cust: Customer object to check
+        :returns: category of change i.e. one of ['', 'BIG','SMALL']
+                  always returns a string marking the "size'" of the change
+        """
+        input_business_name = self.data.get('business_name', None)
+        if input_business_name and self.customer.business_name:
+            if self.manager.is_big_name_change(input_business_name, self.customer.business_name):
+                return 'BIG'
+            else:
+                return 'SMALL'
+        else:
+            return 'SMALL'
+
+
+class ValidateBusinessTaxIdChange(Validate):
+
+    def validate(self):
+        """
+        checks the difference in the customer.business_tax_id_number name
+
+        :param cust: Customer object to check
+        :returns: category of change i.e. one of ['', 'BIG','SMALL']
+                  always returns a string marking the "size'" of the change
+        """
+        input_business_tax_id_number = self.data.get('business_tax_id_number', None)
+        if input_business_tax_id_number and input_business_tax_id_number.isdigit() and self.customer.business_tax_id_number:
+            old_sum = sum(int(c) for c in self.customer.business_tax_id_number)
+            new_sum = sum(int(c) for c in input_business_tax_id_number)
+
+            msg = 'tax id change: {} {} {} {}'
+            self.manager.log.info(msg.format(old_sum,
+                                             new_sum,
+                                             self.customer.business_tax_id_number,
+                                             input_business_tax_id_number))
+            return 'BIG' if abs(old_sum - new_sum) > 3 else 'SMALL'
+        else:
+            return 'SMALL'
+
+
+class ValidateCustomerNameChangeV3(Validate):
+    def validate(self):
+
+        if self._is_new_individual_customer(self.data, self.customer):
+            return 'BIG'
+        else:
+            return 'SMALL'
+
+    def _is_new_individual_customer(self, data, customer):
+        """
+        this will be New Customer if any of the following is true
+        1.)For Individual, if first character of first name is different
+        2.)For Individual, if first two characters are different.
+        """
+        if n_char_compare(data.get('last_name', ''), customer.last_name, 2):
+            return True
+        else:
+            return n_char_compare(data.get('first_name', ''),
+                                  customer.first_name, 1)
+
+
+class ValidateBusinessNameChangeV3(Validate):
+    def validate(self):
+
+        if self.customer is None or self._is_new_business_customer(self.data, self.customer):
+            return 'BIG'
+        else:
+            return 'SMALL'
+
+    def _is_new_business_customer(self, data, customer):
+        """
+        this will be New Customer if any of the following is true
+        1.)For Business, if first two characters are different
+        """
+        return n_char_compare(data.get('business_name', ''),
+                              customer.business_name, 2)
+
+
+class CustomerVersioningRules():
+
+    individual_template = namedtuple('individual_template', ['external_customer_id', 'preferred_name', 'middle_name', 'salutation_code',
+                                                             'suffix_code', 'birth_month_code', 'birth_day_number', 'tax_id_last_four',
+                                                             'allow_contact_by_postal', 'allow_contact_by_phone', 'allow_contact_by_email',
+                                                             'preferred_language_code', 'preferred_contact_method_code', 'drivers_license_us_state_code',
+                                                             'identity_tax_id', 'identity_date_of_birth', ])
+
+    business_template = namedtuple('business_template', ['business_tax_id_number', 'years_in_business_count', 'employee_count', 'business_established_date',
+                                                         'business_type_code', 'incorporation_us_state_code',
+                                                         'allow_contact_by_postal', 'allow_contact_by_phone', 'allow_contact_by_email',
+                                                         'preferred_language_code', 'preferred_contact_method_code', 'drivers_license_us_state_code'])
+
+    def __init__(self, manager):
+        self.manager = manager
+
+    def generate(self, data):
+        """This method will parse a data dictionary and return customer_versioning rules on how to process
+        the customer information
+
+        Returns:
+            dict with three keys - data, customer_db_action, cc_id
+
+        """
+        cc_id = data.get("cc_id") or None
+
+        if cc_id is None:
+            # cc_id not provided, do not assign cc_id and request
+            # new customer creation
+            customer_cc_id = None
+            customer_db_action = CustomerVersioning.NewCustomer
+        else:
+            customer = self.manager.get_latest_customer(cc_id=cc_id)
+            if customer is None:
+                # cc_id does not exist in db, do not assign cc_id and let manager methods
+                # actually create a new customer and commit appropriate models
+                customer_cc_id = None
+                customer_db_action = CustomerVersioning.NewCustomer
+            # Customer is found !!!
+            elif self._is_customer_changes_big(data, customer):
+                # Big change has occurred, do not assign cc_id and request
+                # creation of new customer and commit appropriate models
+                customer_cc_id = None
+                customer_db_action = CustomerVersioning.NewCustomerBigChange
+            elif self._is_new_version(data, customer):
+                # doesnt follow new customer requirements so request that
+                # new version be generated
+                customer_cc_id = cc_id
+                customer_db_action = CustomerVersioning.NewVersion
+                # when versioning we need to carry over some fields from the previous customer
+                old_customer = OldCustomerData(data, customer)
+                return {'input_data': data,
+                        'cc_id': customer_cc_id,
+                        'customer_db_action': customer_db_action,
+                        'old_customer': old_customer}
+
+            else:
+                # doesnt follow new version requirements, so request to do update in place
+                customer_cc_id = customer.cc_id
+                customer_db_action = CustomerVersioning.UpdateInPlace
+
+        return {'input_data': data,
+                'cc_id': customer_cc_id,
+                'customer_db_action': customer_db_action}
+
+    def _is_customer_changes_big(self, data, customer):
+
+        validators = self.manager.get_big_change_validators()
+
+        if data.get('is_business', 'N') == 'Y':
+            validators = validators['business']
+        else:
+            validators = validators['user']
+
+        changes = [validator(self.manager, data, customer).validate()
+                   for validator in validators]
+
+        # let's just turn it into a string for convenience here
+        # the final return type is not certain (tuples, errors, ....)
+        changes = ''.join(filter(None, changes))
+        if 'BIG' in changes:
+            return True
+        else:
+            return False
+
+    def _is_new_version(self, data, db_customer):
+        """
+        this will be New Version if any of the following is true
+        1.)For Business, business names have changed
+        2.)For Individual, if first name has changed
+        3.)For Individual, if last name has changed
+        """
+        if data.get('is_business', 'N') == 'Y':
+            business_name = data.get('business_name', None)
+            if business_name is not None and db_customer.business_name != business_name:
+                return True
+            else:
+                return False
+        else:
+            first_name = data.get('first_name', None)
+            last_name = data.get('last_name', None)
+            if any([(first_name is not None and first_name != db_customer.first_name),
+                   (last_name is not None and last_name != db_customer.last_name)]):
+                return True
+            else:
+                return False
+
+
+class AddressData(object):
+
+    def __init__(self, address):
+        self.cc_id = address.cc_id
+        self.dealer_code = address.dealer_code
+        self.line_1_address = address.line_1_address
+        self.line_2_address = address.line_2_address
+        self.city = address.city
+        self.state_province_code = address.state_province_code
+        self.postal_code = address.postal_code
+        self.country_code = address.country_code
+        self.street_number = address.street_number
+        self.prestreet_directional_code = address.prestreet_directional_code
+        self.street_name = address.street_name
+        self.poststreet_directional_code = address.poststreet_directional_code
+        self.street_type_code = address.street_type_code
+        self.apartment_number = address.apartment_number
+        self.suite_number = address.suite_number
+        self.po_box = address.po_box
+        self.rural_road_number = address.rural_road_number
+        self.box_number = address.box_number
+        self.mail_stop_code = address.mail_stop_code
+
+
+class OldCustomerData(object):
+
+    def __init__(self, data, customer):
+
+        self.previous_identity_tax_id = customer.identity.tax_id if customer.identity else None
+        self.previous_identity_birth_date = customer.identity.birth_date if customer.identity else None
+
+        carry_over_fields = BUSINESS_APPLICATION_FIELDS if data.get('is_business') == 'Y' else APPLICATION_FIELDS
+
+        for field in carry_over_fields:
+            setattr(self, field, getattr(customer, field))

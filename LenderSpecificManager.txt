@@ -1,0 +1,663 @@
+from dtplatform.dtcom.credit_app.lender_specific_manager import LenderSpecificManager
+
+
+# -*- coding: utf-8 -*-
+import json
+from collections import OrderedDict
+from datetime import datetime
+
+from sqlalchemy import and_
+
+from platform_utils.utils.functools import cache_property
+
+from dtplatform.common.base_manager import BaseManager, getManager
+from dtplatform.common.constants import LenderSpecific, SubfeatureCode
+from dtplatform.common.fusion.partner_manager import PartnerManager
+from dtplatform.core.caching_manager import caching
+from dtplatform.core.dealermanager import DealerManager
+from dtplatform.core.models.ca.credit_app import CreditAppMisc
+from dtplatform.core.models.config.lender_specific import LenderSpecificFields
+from dtplatform.core.models.cp.credit_union_sublender import CreditUnionSubLenders
+from dtplatform.core.models.cp.dealer_partner import DealerPartner
+from dtplatform.core.models.cp.sublender_by_dealer import SublenderByDealer
+
+
+class LenderSpecificManager(BaseManager):
+    # mapping of lender specific forms.
+    lender_specific_map = {}
+
+    @cache_property
+    def dealer_manager(self):
+        return getManager(DealerManager, self.context)
+
+    @cache_property
+    def partner_manager(self):
+        return getManager(PartnerManager, self.context)
+
+    def get_values_by_category(self, category_code):
+        """ get the field names and values for any given filed category code"""
+        query = self.session.query(LenderSpecificFields).order_by(LenderSpecificFields.sort_order.asc())
+        lsp_objs = query.filter_by(category_code=category_code).all()
+        result = OrderedDict()
+        for obj in lsp_objs:
+            result[obj.field_value] = obj.field_name
+        return result
+
+    @caching
+    def get_sublendernames_by_state(self, cp_id, us_st_cd):
+        """ get the sublender names for any given lender and state"""
+        query = self.session.query(CreditUnionSubLenders.sublender_nm).\
+            order_by(CreditUnionSubLenders.sublender_nm.asc())
+        sublender_objs = query.filter_by(cp_id=cp_id,
+                                         us_st_cd=us_st_cd,
+                                         stus_cd='A').all()
+        return sublender_objs
+
+    @caching
+    def get_sublendernames_by_dealer(self, cp_id, dealer_code):
+        """Gets a list of sublenders from a lender for a specified dealer"""
+        query = self.session.query(
+            SublenderByDealer.sublender_name
+        ).join(
+            SublenderByDealer.partner
+        ).filter(
+            and_(
+                SublenderByDealer.partner_id == cp_id,
+                DealerPartner.dealer_code == dealer_code,
+                SublenderByDealer.fusion_product_code == self.context['fusion_prod_code'],
+                SublenderByDealer.status_code == 'A',
+            )
+        ).order_by(
+            SublenderByDealer.sublender_name.asc()
+        ).distinct()
+
+        return [item[0] for item in query.all()]
+
+    def get_lender_specific_lenders(self, cpid_program_list, session_data=None):
+        """
+        Return the lender and program ids from cpid_program list for all lender specific programs.
+
+        :param cpid_program_list:
+            Iterable of 2-tuples containing a cp_id and `None, or a cp_id and program_id
+        :param session_data:
+            The credit application session data (used to determine conditional lender specific programs)
+        :return:
+            A list containing the 2-tuples for each lender that requires additional information
+        """
+        dealer = self.dealer_manager.get_dealer_by_dealer_code(self.context['dealer_code'])
+        return [(l, p) for l, p in cpid_program_list if self._check_lender_specific(l, p, session_data, dealer.state_code)]
+
+    def is_lender_specific(self, cpid_program_list, session_data=None):
+        """
+        Returns True if even one of the selected lenders need additional information.
+
+        :param cpid_program_list: a list of tuples, where each tuple is of size 2, and the first
+            element is cp_id and the second element is a program_id. The cp_id is
+            mandatory and the program_id can be None, if it's not available. But
+            the size must be 2.
+        :param session_data: Some lender specific forms are only required when certain conditions are met involving the
+            credit app forms' data. These forms register a custom function that expects to be given this data as a dict.
+        """
+        dealer = self.dealer_manager.get_dealer_by_dealer_code(self.context['dealer_code'])
+        return any([self._check_lender_specific(l, p, session_data, dealer.state_code) for l, p in cpid_program_list])
+
+    def _check_lender_controlled(self, cp_id):
+        """Checks if LSP is lender controlled
+        Args:
+            cp_id (int): Partner id
+        Returns:
+            True if LSP is controlled by lender else False
+        """
+        partner_settings = self.partner_manager.get_partner_subfeature_setting(
+            cp_id, SubfeatureCode.LENDER_ADDITIONAL_PAGES)
+        return True if partner_settings.get('lender_page_settings') else False
+
+    def is_lender_controlled_lsp(self, cp_ids):
+        """
+        Method to identify if LSP are lender controlled
+        Args:
+            cp_ids(list): List of selected Partner IDs
+        Returns:
+            True if lender_page_settings exists else return None
+        """
+        cp_ids = filter(bool, cp_ids)
+        if not cp_ids:
+            return False
+        return any(self._check_lender_controlled(cp_id) for cp_id in cp_ids)
+
+    def get_lender_controlled_lenders(self, cpid_program_list):
+        """Return the lender and program ids from cpid_program list for all lender controlled programs.
+
+        Args:
+            cpid_program_list(list): a list of tuples, where each tuple is of size 2, and the first
+            element is cp_id and the second element is program name. The cp_id is mandatory and the
+            program name can be None, if it's not available. But the size must be 2
+        Returns:
+            A list of tuples containing lenders with LCP
+        """
+        return [(cp_id, program) for cp_id, program in cpid_program_list if self._check_lender_controlled(cp_id)]
+
+    def lender_specific_keys(self):
+        """
+        Returns cp_ids for LenderConfigReferenceManager as a set.
+        """
+        keys = []
+        for cp_id, value in self.lender_specific_map.iteritems():
+            for program, mapping in self.lender_specific_map[cp_id].iteritems():
+                keys.append((cp_id, program))
+        return keys
+
+    def get_forms(self, cp_id_program_tuple, module):
+        """
+        Returns the form classes for the given cp_id_program_tuple. cp_id_program_tuple must be a list of tuples, where
+        the first element is the cp_id (as string), and the second element is a program name (as strong).
+
+        :param cp_id_program_tuple:
+        :return:
+        """
+        dealer = self.dealer_manager.get_dealer_by_dealer_code(self.context['dealer_code'])
+        forms = []
+        for cp_id, program_id in cp_id_program_tuple:
+
+            # validate cp_id
+            if cp_id not in self.lender_specific_map:
+                continue
+
+            lender_specific_data = self.lender_specific_map.get(cp_id, {}).get(program_id, {})
+            klass = lender_specific_data.get('class')
+            if not klass:
+                self.log.error("Unable to retrieve form for lender (%s)" % cp_id)
+                continue
+
+            if self.is_sublender_additional(cp_id, program_id):
+                if not self.lender_has_sublenders(cp_id, self.context['dealer_code'], dealer.state_code):
+                    continue
+
+            # import class
+            forms.append(getattr(module, klass))
+        return forms
+
+    def lender_has_sublenders(self, cp_id, dealer_code, dealer_state):
+        """Checks if lender has sublender data
+
+        Args:
+            cp_id (int): Lender partner id
+            dealer_code (int): Dealer id
+            dealer_state (str): Dealers state
+        Returns:
+            True if lender has sublenders else False
+        """
+        state_sublenders = self.get_sublendernames_by_state(cp_id, dealer_state)
+        dealer_sublenders = self.get_sublendernames_by_dealer(cp_id, dealer_code)
+        return state_sublenders or dealer_sublenders
+
+    def is_sublender_additional(self, cp_id, program):
+        """Checks if lender additional type sublender
+        Args:
+            cp_id (int): Partner id
+            program (str): Lender program
+        Returns:
+            True if lender is sublender type else False
+        """
+        lender_specific_data = self.lender_specific_map.get(cp_id, {}).get(program, {})
+        return lender_specific_data.get('additional_type') == 'sublender'
+
+    def create_credit_app_misc(self, credit_app, additional_data=None):
+        """create and return CreditAppMisc object"""
+        if not credit_app:
+            raise ValueError('credit_app is required')
+
+        if additional_data:
+            return CreditAppMisc(
+                credit_app=credit_app,
+                lender_specif_json_tx=json.dumps(additional_data),
+                created_ts=datetime.utcnow()
+            )
+
+        return None
+
+    def _get_lender_specific_settings(self, cp_id, program_id):
+        """
+        Gets the lender specific program data associated with the
+        specified partner and program_id.
+
+        :param cp_id: The partner ID
+        :param program_id: The program ID, or `None` if no program is selected.
+        :return: `None` unless the lender has lender specific settings.
+            Otherwise, a `dict` containing:
+                - `class`:
+                    The name of the form class to display for this program
+                - `stortname`:
+                    The prefix used by the form
+                - `condition`:
+                    A callable for programs that only conditionally require
+                    additional data. If this is `None` then the lender always
+                    requires the additional data.
+        """
+        return self.lender_specific_map.get(str(cp_id), {}).get(program_id)
+
+    def _check_lender_specific(self, cp_id, program_id, session_data, dealer_state_code):
+        """Checks the condition for a lender specific program.
+
+        :param cp_id: The partner ID
+        :param program_id: The program ID, or `None` if no program is selected.
+        :param session_data: The contents of the view's dtsession
+        :return:
+            `True` if there is no condition (i.e. the extra data is
+            unconditionally required), or returns the result
+            of calling the `condition` member of the lender specific
+            settings.
+        """
+        settings = self._get_lender_specific_settings(cp_id, program_id)
+        if settings:
+            if self.is_sublender_additional(cp_id, program_id):
+                if not self.lender_has_sublenders(cp_id, self.context['dealer_code'], dealer_state_code):
+                    return False
+            condition = settings.get('condition')
+            if condition is None:
+                return True
+
+            try:
+                return condition(session_data)
+            except Exception:
+                self.log.exception(
+                    "Exception raised when testing lender specific condition for lender {0} with program '{1}'".format(
+                        cp_id, program_id
+                    )
+                )
+
+        return False
+
+    @classmethod
+    def register_lender(cls, cp_id, shortname, class_name, condition=None, additional_type=None):
+        """
+        Registers the lender specific form for a given cp_id and short_name value. Optionally specify a callable that determines
+        the conditions in which the lender requires additional information.
+
+        :param cp_id: The common partner lender id
+        :param shortname:
+            A short name used for prefixing fields and retrieving data from the :meth:`_fields` and :meth:`cleaned_data` methods.
+        :param class_name:
+            The name of the django form class to display for this lender and program.
+        :param condition:
+            If specified, a callable that accepts a dict composed of dicts of all the credit app forms. This callable should return
+            `True` if the lender needs additional information and `False` otherwise.
+        """
+        cls.register_lender_with_program(cp_id, shortname, None, class_name, condition, additional_type)
+
+    @classmethod
+    def register_lender_with_program(cls, cp_id, shortname, program_id, class_name, condition=None, additional_type=None):
+        """
+        Registers the lender specific form for a given cp_id, short_name, and program. Optionally specify a callable that determines
+        the conditions in which the lender requires additional information.
+
+        :param cp_id: The common partner lender id.
+        :param shortname:
+            A short name used for prefixing fields and retrieving data from the :meth:`_fields` and :meth:`cleaned_data` methods.
+        :param program_id: The id of a lender program for which the form is being registered.
+        :param class_name:
+            The name of the django form class to display for this
+            lender and program.
+        :param condition:
+            If specified, a callable that accepts a dict composed of dicts of all the credit app forms. This callable should return
+            `True` if the lender needs additional information and `False` otherwise.
+        """
+        # TODO: This method is not thread-safe, which doesn't matter right now but may if the use case changes
+        if cp_id not in cls.lender_specific_map:
+            cls.lender_specific_map[cp_id] = {}
+
+        cls.lender_specific_map[cp_id][program_id] = {
+            'shortname': shortname,
+            'class': class_name,
+            'condition': condition,
+            'additional_type': additional_type
+        }
+
+    def get_external_sublenders_configurations(self, cp_id):
+        """
+        Method to retrieve sublender configurations from lender system
+        Args:
+            cp_id(int): Partner ID
+        """
+        # This is stub as of now, until we get confirmation on parser for AimBridge
+        sublenders = [('sublender_1', 'Sub Lender 1'),
+                      ('sublender_2', 'Sub Lender 2'),
+                      ('sublender_3', 'Sub Lender 3')]
+        eligibility = [('affiliation', 'Affiliation'),
+                       ('family', 'Family'),
+                       ('live', 'Live'),
+                       ('worship', 'Worship'),
+                       ('attend_school', 'Attend School'),
+                       ('volunteer', 'Volunteer'),
+                       ('work', 'Work')]
+        eligibility_type = [('member1_type', 'Sibling 1'),
+                            ('member2_type', 'Sibling 2'),
+                            ('member3_type', 'Sibling 3')]
+        return sublenders, eligibility, eligibility_type
+
+
+# register lenders that need additional information
+# MILES
+LenderSpecificManager.register_lender(
+    LenderSpecific.MILES,
+    'dfn',
+    'DFNLenderForm')
+
+# NISSAN
+LenderSpecificManager.register_lender(
+    LenderSpecific.NISSAN,
+    'nis',
+    'NissanLenderForm')
+
+# NISSAN - PreApproval / VRU
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'VRU',
+    'NissanPreApprovalVRUForm')
+
+# NISSAN - Start Up Nissan 1.0
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'EPP',
+    'NissanLenderForm')
+
+# NISSAN - Start Up Nissan 2.0
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'SUN',
+    'NissanLenderForm')
+
+# NISSAN - N/A
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'NAP',
+    'NissanLenderForm')
+
+# NISSAN - Advertise Eligible Special APR
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'AEP',
+    'NissanLenderForm')
+
+# NISSAN - CPO Cash
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'CPC',
+    'NissanLenderForm')
+
+# One Pay Lease
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'ONE',
+    'NissanLenderForm')
+
+# Collage Graduate
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'COL',
+    'NissanLenderForm')
+
+# Battery Program
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.NISSAN,
+    'nis',
+    'BAT',
+    'NissanLenderForm')
+
+
+# SNAAC
+LenderSpecificManager.register_lender(
+    LenderSpecific.SNAAC,
+    'sn2',
+    'SN2LenderForm')
+
+# SNAAC.
+LenderSpecificManager.register_lender(
+    LenderSpecific.SN4,
+    'sn4',
+    'SN4LenderForm')
+
+# WESTLAKE_WL2 FINANCIAL SERVICES
+LenderSpecificManager.register_lender(
+    LenderSpecific.WESTLAKE_WL2,
+    'wl2',
+    'WestlakeLenderForm'
+)
+
+# WESTLAKE_WL2 FINANCIAL SERVICES
+LenderSpecificManager.register_lender(
+    LenderSpecific.WESTLAKE_WLF,
+    'wlf',
+    'WestlakeWLFLenderForm'
+)
+
+# HMF FINANCIAL SERVICES
+LenderSpecificManager.register_lender(
+    LenderSpecific.HMF,
+    'hmf',
+    'HMFLenderForm'
+)
+
+# KIA FINANCIAL SERVICES
+LenderSpecificManager.register_lender(
+    LenderSpecific.KIA,
+    'kia',
+    'KiaLenderForm'
+)
+
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.VOLVO,
+    'vlc', 'COLLEGE',
+    'VolvoCollegeGradLenderForm'
+)
+
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.VOLVO,
+    'vlc', 'EXPAT',
+    'VolvoExpatriateLenderForm'
+)
+
+
+def una_condition(session_data):
+    """
+    UNA is expecting income type only for Applicant and Co-Applicant.
+    If Application received is of Business type then they are expecting ONLY Co-Applicant income type.
+    If Business application doesn't have a co-applicant no LSP page should be displayed.
+
+    Args:
+        session_data(dict) : session_data of a request.
+
+    Return:
+        `False` ONLY if current application is of `business` type and has NO `co_applicant` else returns `True`
+    """
+    if not session_data:
+        return True
+
+    return not(session_data.get('applicant_form', {}).get('is_business') == 'Y' and
+               session_data.get('applicant_form', {}).get('has_coapplicant') == 'False')
+
+
+def bethpage_condition(session_data):
+    """
+    Bethpage is only lender specific when MSRP is not supplied on a new vehicle or retail amount & source are not
+    supplied on a used vehicle.
+
+    :param session_data: The session data from the web request.
+    :return: `True` if the required data is missing; otherwise, `False`.
+    """
+    vehicle_form_data = session_data.get('vehicle_form', {})
+    condition = vehicle_form_data.get('condition_type')
+    if condition == 'NEW':
+        return not vehicle_form_data.get('msrp_amount')
+    elif condition is not None:
+        return not (vehicle_form_data.get('retail_amount') and vehicle_form_data.get('retail_source'))
+    return False
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.BETHPAGE, 'bpg', 'BethpageLenderForm', condition=bethpage_condition
+)
+
+# CRA
+LenderSpecificManager.register_lender(
+    LenderSpecific.CRA,
+    'cra',
+    'CRALenderForm'
+)
+
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.CRA,
+    'cra', 'PUR',
+    'CRALenderForm'
+)
+
+LenderSpecificManager.register_lender_with_program(
+    LenderSpecific.CRA,
+    'cra', 'POR',
+    'CRALenderForm'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.ARCUSO,
+    'arc',
+    'ARCSubLenderForm',
+    additional_type='sublender'
+)
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.CUAC,
+    'cua',
+    'CUACLenderForm',
+    additional_type='sublender'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.PKN,
+    'pkn',
+    'PKNLenderForm',
+    additional_type='sublender'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.CSY,
+    'csy',
+    'CSYLenderForm',
+    additional_type='sublender'
+)
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.FLN,
+    'fln',
+    'FLNLenderForm',
+    additional_type='sublender'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.FLS,
+    'fls',
+    'FLSLenderForm',
+    additional_type='sublender'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.IFF,
+    'iff',
+    'IFFLenderForm',
+    additional_type='sublender'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.CUC,
+    'cuc',
+    'CUCLenderForm',
+    additional_type='sublender'
+)
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.CDI,
+    'cdi',
+    'CDILenderForm',
+    additional_type='sublender'
+)
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.CHE,
+    'che',
+    'CHELenderForm',
+    additional_type='sublender'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.FKA,
+    'fka',
+    'FKALenderForm',
+    additional_type='sublender'
+)
+
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.CS1,
+    'cs1',
+    'CS1LenderForm',
+    additional_type='sublender'
+)
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.CU2,
+    'cu2',
+    'CU2LenderForm',
+    additional_type='sublender'
+)
+
+# Top Finance Lender Form.
+LenderSpecificManager.register_lender(
+    LenderSpecific.TP1,
+    'tp1',
+    'TopFinanceCompanyForm')
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.UNA,
+    'una',
+    'UNALenderForm',
+    condition=una_condition)
+
+LenderSpecificManager.register_lender(
+    LenderSpecific.AMP,
+    'amp',
+    'AMPLenderForm')
+
+# Prime Acceptance Corp Form.
+LenderSpecificManager.register_lender(
+    LenderSpecific.PRM,
+    'prm',
+    'PrimeAcceptanceCorpForm')
+
+# WESTconsin Credit Union Form.
+LenderSpecificManager.register_lender(
+    LenderSpecific.WC2,
+    'wc2',
+    'WESTconsinCreditUnionForm'
+)
+
+# SOME OTHER PROGRAM SPECIFIC LENDER
+# LenderConfigReferenceManager.register_lender_with_program(
+# LenderSpecific.FOO,
+# 'foo',
+# 'Standard',
+#     'dtweb.dtcom.credit_app.lender_additional.forms.lender_forms.FooForm'
+# )

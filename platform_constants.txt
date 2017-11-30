@@ -1,0 +1,1024 @@
+from dtplatform.common import constants as platform_constants
+from dtplatform.common.constants import EditMode
+
+
+
+# -*- coding: utf-8 -*-
+"""Constants common in dtplatform."""
+
+from __future__ import absolute_import, print_function, unicode_literals
+
+from dt_database_utils import constants as database_utils_constants
+from platform_utils.utils.enum import Enum
+
+
+CMN = 'CMN'
+DEFAULT_TENANT_CODE = 'DTCOM'
+DEFAULT_FUSION_PROD_CODE = 'DTCOM'
+DEFAULT_BRAND_ID = 'DT'
+DEALERTRACK_TECHNOLOGIES = 'DealerTrack Technologies'
+
+ROUTE_KEY = 'ROUTE'
+FEATURE_KEY = 'FEATURE_EVENT'
+
+DEFAULT_DB_INSTANCE = 'db2_dtc'
+DEALER_CODE_KEY = 'dealer_code'
+DEAL_JACKET_ID_KEY = 'deal_jacket_id'
+CUSTOMER_ID_KEY = 'customer_id'
+PARTNER_ID_KEY = 'partner_id'
+USER_CODE_KEY = 'user_code'
+CREATED_BY_USER_CODE_KEY = 'created_by_user_code'
+DEAL_EVENT_KEY = 'Deal Event'
+PDF_DB_NAME = 'docs'
+
+DEALER_GROUP_KEY = 'dealergroup_'
+
+EMPTY_VALUES = (None, '', [], (), {})
+CO_APP_HISTORY_EVENT_TXT = {'J': 'Individual with Joint Applicant',
+                            'G': 'Business with Guarantor Applicant',
+                            'C': 'Individual with Co-Signer Applicant'}
+
+DEAL_APPROVED = 'Approved'
+DEAL_CONDITIONALLY_APPROVED = 'Conditionally Approved'
+DEAL_DECLINED = 'Declined'
+DEAL_PENDING = 'Pending'
+CONTRACT_BOOKED = 'Booked'
+CONTRACT_RETURNED = 'Returned'
+CONTRACT_SUSPENDED = 'Suspended'
+CONTRACT_PENDING = 'Pending'
+CONTRACT_DOCS_RECEIVED = 'Docs Received'
+
+COMPANY_CODE = 'ZE7'
+ENTERPRISE_CODE = 'ZE'
+SERVER_NAME = 'arkonap.arkona.com'
+RNR_PARTNER_ID = 113431077
+BALLOON_PRODUCT_TYPE = 'Balloon'
+LEASE_PRODUCT_TYPE = 'Lease'
+RETAIL_PRODUCT_TYPE = 'Retail'
+NON_PRIME_PRODUCT_TYPE = 'Non Prime'
+DEAL_CONDITIONALLY_APPROVED_CODE = 'COFR'
+
+CONTRACT_MATERIAL_CODES = ['ESMN2']
+XT_KEY = 'ATS'
+
+MATERIAL_CODES = {'CMP': ('CMSA',), 'RF': ('RFSAR',),
+                  'DESK': ('DLSA',),
+                  'DLT': ('DMSAADP', 'DMSARAR'),
+                  # Redflags Fraud Index Subscription
+                  'RFI': ('RFFS',),
+                  'EMN': ('MTSA',
+                          'MTSAADP',
+                          'MTSADTC',
+                          'MTSAGRP',
+                          'MTSAHYCD',
+                          'MTSAIPD',
+                          'MTSAJM',
+                          'MTSAMBCD',
+                          'MTSARAR',
+                          'MTSJ',
+                          'MTSJADP',
+                          'MTSJDTC',
+                          'MTSJGRP',
+                          'MTSJMACD',
+                          'MTSJRAR',
+                          'MTST',
+                          'MTSTADP',
+                          'MTSTDTC',
+                          'MTSTGRP',
+                          'MTSTHYCD',
+                          'MTSTMBCD',
+                          'MTSTRAR',
+                          'MTSTWG',
+                          'MTSTWGAD',
+                          'MTSTWGCD',
+                          'MTSTWGDT',
+                          'MTSTWGGR',
+                          'MTSTWGIP',
+                          'MTSTWGRA',
+                          'MTSTWGSE',
+                          'MTSURAR')
+                  }
+
+COMPLIANCE_FEATURE = 'Compliance'
+
+VEHICLE_MODULE = 'dtplatform.core.models.dj.vehicle'
+DEALJACKET_VEHICLE = 'Vehicle'
+
+VEHICLE_CODE_NEW = 'NEW'
+VEHICLE_CODE_USED = 'USED'
+VEHICLE_CODE_DEMO = 'DEMO'
+VEHICLE_CODE_CERT = 'CERT'
+
+VEHICLE_SOLD_CODE = 'SOLD'
+
+HONDA_PRODUCT_DIV_CD = 'HONDA'
+ACURA_PRODUCT_DIV_CD = 'ACURA'
+
+EXPORT_IDEAL_SOURCE_NAME = 'Dealertrack'
+EXPORT_FROM_IDEAL_SOURCE_NAME = 'iDeal'
+IMPORTED_DEALS = 'import_deals'
+
+VEH_YEAR_NAME = (VEHICLE_MODULE, DEALJACKET_VEHICLE, 'year_name')
+VEH_MAKE_NAME = (VEHICLE_MODULE, DEALJACKET_VEHICLE, 'make_name')
+VEH_MODEL_NAME = (VEHICLE_MODULE, DEALJACKET_VEHICLE, 'model_name')
+VEH_TRIM_NAME = (VEHICLE_MODULE, DEALJACKET_VEHICLE, 'trim_name')
+LOAN_APP_IDS = ('A', 'B')
+
+# It's just a random number chosen to avoid overloading existing levels which django message app use.
+USER_LOG_LEVEL = 60
+
+DEAL_JACKET_LOCK = '0070'
+NOTIFY_CODE_NEW_COMMENT_RECVD = '0219'
+NOTIFY_CODE_CONTRACT_NEW_DECISION_AVAILABLE = '0320'
+NOTIFY_CODE_PENDING_DOCS = '0330'
+COMMENT_ALERT_DISPLAY_ROUTES = ('dealjacket_deal_summary', 'detail', 'contract_detail', 'dealjacket_index', 'contract_funding_documents')
+DECISION_ALERT_DISPLAY_ROUTES = ('dealjacket_deal_summary', 'detail', 'contract_detail', 'dealjacket_index')
+CONTRACT_ALERT_DISPLAY_ROUTES = ('dealjacket_deal_summary', 'contract_detail', 'dealjacket_index')
+CONTRACT_NEW_DECISION_AVAILABLE_ALERT_DISPLAY_URLS = ('base-contract-flow', 'contract-flow-coapplicant', 'contract-flow-vehicle', 'contract-flow-finance', 'contract_funding_documents')
+NEW_DECISION_UPDATE_CONTRACT_ALERT_DISPLAY_URLS = ('contract_funding_documents', 'contract-flow', 'base-contract-flow',
+                                                   'contract-flow-coapplicant', 'contract-flow-vehicle', 'contract-flow-finance',
+                                                   'contract-flow-modifiers', 'contract_ancillary_document')
+
+
+class MDconstants(object):
+    """
+    Menudriver constants
+    """
+    CONTENT_NAME_DICT = {
+        1: 'Image',
+        2: 'Video',
+        3: 'Text',
+        4: 'Thumbnail',
+        5: 'PDF'
+    }
+    RESOURCE_TYPE_CODE = [1, 2, 3, 4, 5]
+    IMAGE_TYPE_CODE = 1
+    VIDEO_TYPE_CODE = 2
+    TEXT_TYPE_CODE = 3
+    THUMB_TYPE_CODE = 4
+    PDF_TYPE_CODE = 5
+
+    CONTENT_NAME_DICT_INV = {v: k for k, v in CONTENT_NAME_DICT.items()}
+
+    CUSTOM_PRODUCT_CODE = 'C'
+    UNIVERSAL_PRODUCT_CODE = 'U'
+    EMENU_PRODUCT_CODE = 'E'
+
+    PRODUCT_NAME_DICT = {
+        CUSTOM_PRODUCT_CODE: 'Custom',
+        UNIVERSAL_PRODUCT_CODE: 'Universal',
+        EMENU_PRODUCT_CODE: 'eMenu'
+    }
+
+    PRODUCT_NAME_DICT_INV = {v: k for k, v in PRODUCT_NAME_DICT.items()}
+    VECHILE_COND_DETAILS = {
+        'New': 'New',
+        'Used': 'Used',
+        'Certified': 'Certified Pre-Owned'
+    }
+    VECHILE_CONDITIONS = (
+        ('New', 'New'),
+        ('Used', 'Used'),
+        ('Certified', 'Certified Pre-Owned')
+    )
+    VEHICLE_COND_NEW = 'NEW'
+    VEHICLE_COND_USED = 'USED'
+    VEHICLE_COND_CERTIFIED = 'CERTIFIED'
+
+    DEAL_TYPE_FINANCE = 'FIN'
+    DEAL_TYPE_LEASE = 'LEAS'
+    DEAL_TYPE_CASH = 'CASH'
+
+    AMN_CATEGORY_CODE = 'VSC'
+    AMN_SUPPORT = 'MB VSC'
+
+    USER_TYPE_CODE = 'C'
+
+    EMENU_SUB_CODE = 'menu'
+    EMENU_PRODUCT_STATUS = 'A'
+
+
+class DealTypeLease(object):
+    type = 'LEAS'
+
+    class SubTypes(object):
+        ONEPAYLEASE = 'OPLE'
+
+
+class DealType(object):
+    """DealType constants
+    """
+    RETAIL = 'RETL'
+    LEASE = DealTypeLease.type
+    BALLOON = 'BALL'
+
+
+class ApplicationType(object):
+    """
+    Application Types
+    """
+    INDIVIDUAL = 'I'
+    INDIVIDUAL_WITH_COSIGNER = 'IC'
+    BUSINESS = 'B'
+    BUSINESS_WITH_GUARANTOR = 'BG'
+    JOINT = 'J'
+    BUSINESS_JOINT = 'BJ'
+
+
+class EditMode(object):
+    """Business Customer Form edit modes."""
+    CREATE = 'c'
+    EDIT = 'e'
+    APPLICATION = 'a'
+
+
+class LenderSpecific(object):
+
+    """
+    Acts like an Enum, and is used to get the cp_ids for lenders that need
+    additional information.
+    """
+
+    MILES = '113430363'
+    NISSAN = '113430964'
+    WESTLAKE_WL2 = '100002103'
+    WESTLAKE_WLF = '113431417'
+    SNAAC = '120950063'
+    CUAC = '113430324'
+    CRA = '130940001'
+    CUC = '113430325'
+    HMF = '113430723'
+    KIA = '113430800'
+    VOLVO = '121580001'
+    BETHPAGE = '400005224'
+    ARCUSO = '113430089'
+    CDI = '100002346'
+    PKN = '400008478'
+    CSY = '400013171'
+    FLN = '113430598'
+    FLS = '113430600'
+    IFF = '113430760'
+    CHE = '113430237'
+    FKA = '113430591'
+    CS1 = '400013466'
+    TP1 = '400014260'
+    UNA = '400004440'
+    AMP = '113430070'
+    CU2 = '400014214'
+    PRM = '113431058'
+    SN4 = '400016195'
+    WC2 = '400006595'
+
+
+IsolationLevel = database_utils_constants.IsolationLevel
+
+
+class ExternalDealSource(object):
+    Contract = "CON"
+    EMenu = "EMN"
+    ExportIDeal = "DTIDL"
+
+
+class ExternalDealTypeCode(object):
+    Deal = None
+    Contract = "CON"
+    EMenu = "EMN"
+
+
+class OutOfWalletConstant(object):
+    """
+    Constants for Out Of Wallet
+    """
+    OOWFeatureCd = 'OOW'
+    OOWFeatureStatusCode = 'SAVE'
+    OutOfWalletFailed = 'OOW_FAILED'
+    OutOfWalletPassed = 'OOW_PASSED'
+    DocumentStatus = {'COMP': OutOfWalletPassed, 'INCMP': OutOfWalletFailed}
+
+
+class RedFlagFeatureCodeConstants(object):
+    IDVFeatureCode = 'IDV'
+    IDVFeatureStatusCode = 'SAVE'
+    DocumentStatus = {'COMP': 'ID_PASSED', 'INCMP': 'ID_FAILED'}
+
+
+class CustInvestigationReportConstants(object):
+    FeatureCode = 'CMP'
+    DEFAULT_FEATURE_STATUS_CODE = 'SAVE'
+    APP_CIR_FEATURE_EVENT_CODE = 'CIRTA'
+    COAPP_CIR_FEATURE_EVENT_CODE = 'CIRTC'
+
+
+class DealerParticipationReportConstants(object):
+    """
+    Dealer Participation Report
+    """
+    FeatureCode = 'CMP'
+    FeatureStatusCode = 'SAVE'
+    FeatureEventCode = 'DLRPT'
+
+
+class ReviewerParticipationReportConstants(DealerParticipationReportConstants):
+    """Reviewer Participation Certificate Constants"""
+    FeatureEventCode = 'RVRPT'
+
+
+class IRSReportConstants(object):
+    FeatureCode = 'CMP'
+    FeatureEventCode = 'IRSRT'
+    TemplateName = '10K_IRS_Reporting_Form.pdf'
+
+
+class OFACFeatureCodeConstants(object):
+    OFACFeatureCode = 'OFAC'
+    OFACFeatureStatusCode = 'SAVE'
+    DocumentStatus = {'COMP': 'OFAC_PASSED', 'INCMP': 'OFAC_FAILED'}
+
+
+class DocumentTypeConstants(object):
+    DocumentTypePdf = 'PDF'
+    DocumentTypeHtml = 'HTML'
+
+
+class FeatureCode(object):
+    """
+    Feature Code Constants
+    """
+    CreditDecision = 'CD'
+    ContractDecision = 'CON'
+    DealJacket = 'DJ'
+    LenderText = 'LT'
+    CreditApp = 'CA'
+    CreditBureau = 'CB'
+    CommonFramework = 'CF'
+    ReHash = 'RH'
+    Desking = 'DESK'
+    Compliance = 'CMP'
+    EMenu = 'EMN'
+
+
+class SubfeatureCode(object):
+    PROSPECT = 'PR'
+    PAYOFF_QUOTES = 'PQ'
+    CREDIT_APP = 'CA'
+    RESTRICTIONS = 'RT'
+    DEAL_UPDATE = 'DU'
+    CREDIT_DECISIONS = 'CD'
+    COMMON = 'CF'
+    RED_FLAG_OFAC_REQUEST = 'RF'
+    LENDER_BOOKOUT = 'BO'
+    DEALER_COMMENTS = 'CM'
+    CREDIT_BUREAU = 'CB'
+    DEALER_MANAGEMENT_SYSTEM = 'DMS'
+    STAR_SCHEMA_INDICATOR = 'STAR'
+    BILLING = 'BI'
+    PAYOFF_QUOTES_EMAIL_RECIPIENT = 'EM'
+    DIGITAL_CONTRACTING = 'DCON'
+    FINANCE_DRIVER = 'FD'
+    LEAD_DRIVER = 'LD'
+    PASS_THRU_HIDDEN_INDICATOR = 'PT'
+    SPLIT_ROUTING_INDICATOR = 'SR'
+    DIGITAL_DOCUMENT_SERVICE = 'DDS'
+    OEM_INCENTIVES = 'INCEN'
+    LENDER_ADDITIONAL_PAGES = 'LA'
+    PAYOFF_DOCUMENTS = 'PD'
+    DECISION_STATUS_CUSTOM_DISPLAY = 'CDDSP'
+    LENDER_TEXT = 'LT'
+    REHASH = 'RH'
+    OUT_OF_WALLET = 'OOW'
+
+
+class FeatureStatusCode(object):
+    """
+    Feature Status Code Constants
+    """
+    ContractSave = 'SAVE'
+    ContractBooked = 'BOOK'
+    Submit = 'SUBM'
+    Transmitting = 'XMIT'
+    Pending = 'PEND'
+    CreditApproved = 'APPR'
+    CreditDeclined = 'DECL'
+    CreditTransmissionError = 'XMTR'
+    Cancelled = 'CANC'
+    ContractVerified = 'VRFY'
+    ConditionallyApproved = 'COFR'
+    ContractSuspended = 'SUSP'
+    ContractVerificationFailed = 'VRFA'
+    ContractVerificationWarning = 'VRWR'
+    ContractVerificationRejected = 'VREJ'
+    ContractVerificationReview = 'VRRW'
+    ContractModified = 'MODI'
+    ContractSubmitVerification = 'SUVR'
+    ContractReturn = 'RTRN'
+    ContractReceived = 'RCVD'
+    ContractPendingVerification = 'VPEN'
+    Created = 'CR'
+    ContractFunded = 'FUND'
+    DocsReceived = 'DOCR'
+    FaxFunded = 'FAXF'
+    AdverseActionPrinted = 'AANP'
+    ContractExpired = 'EXPR'
+    DecisionExpired = 'DECE'
+    RBPNoticeComplete = 'RBPP'
+    Requested = 'REQ'
+    OFACVerification = 'OFAC'
+    OutOfWallet = 'OOW'
+    IDVerification = 'IDV'
+    ContractTerminated = 'TERM'
+    ContractExported = 'XPORT'
+    ContractPendingDocs = 'PDOC'
+    ContractSigned = 'SIGN'
+    ContractPartiallySigned = 'PSIGN'
+    DecisionApprovedBlank = 'ABLNK'
+    DecisionConditionallyApprovedBlank = 'CBLNK'
+    SpotBlank = 'SBLNK'
+    PrivacyPolicyGiven = 'PPACQ'
+    CreditBureauAuthorizationEvent = 'CBATH'
+    Save = 'SAVE'
+    CustInvestigationReportApp = 'CIRTA'
+    CustInvestigationReportCoApp = 'CIRTC'
+    ContractVerificationExpired = 'VEXP'
+    VehicleSold = 'VEHS'
+    VehicleUnSold = 'VEHU'
+    CompliancePending = 'COMPN'
+    DealerParticipationReport = 'DLRPT'
+    ReviewerParticipationReport = 'RVRPT'
+    ComplianceComplete = 'COMP'
+    ComplianceInComplete = 'INCMP'
+
+
+# Edit link should be disabled when FeatureStatusCode is Booked, Funded,
+# PendingVerification, Submit, Received, Returned, Docs Received, Contract Suspended or Contract Verification Expired
+DISABLE_EDIT_LINK = (FeatureStatusCode.ContractBooked,
+                     FeatureStatusCode.ContractFunded,
+                     FeatureStatusCode.ContractPendingVerification,
+                     FeatureStatusCode.Submit,
+                     FeatureStatusCode.ContractReceived,
+                     FeatureStatusCode.DocsReceived,
+                     FeatureStatusCode.ContractVerificationExpired,
+                     FeatureStatusCode.ContractExported,
+                     FeatureStatusCode.ContractPendingDocs,
+                     FeatureStatusCode.ContractSuspended)
+
+
+class FeatureToggleFeatureCode(object):
+    """High-level codes used to organize features specifically for the FeatureToggle."""
+    CreditApp = 'CA'
+    DealJacket = 'DJ'
+    Generic = 'GEN'
+    Compliance = 'CMP'
+    Contract = 'CON'
+    Desking = 'DESK'
+
+
+class FeatureToggleSubfeatureCode(object):
+    """Used to determine the codes for subfeatures that will be toggled."""
+    ExternalAddressParser = 'external_address_parser'
+    SearchModal = 'search_modal'
+    NewRelic = 'new_relic'
+    AwsStaticAsset = 'aws_static_assets'
+    OnePage = 'one_page'
+    DealerImpersonation = 'dealer_impersonation'
+    DTVApi = 'dtv_api'
+    ComplianceChecklist = 'checklist'
+    Bookout = 'dealer_bookout'
+    Phase4Release = 'phase4_release_items'  # FIS phase 4 release features
+    NotificationsMicroservice = 'notifications_microservice'
+    ItemizedFlexCash = 'itemized_flex_cash'
+    Motorcycle = 'motorcycle'
+    OnePay = 'one_pay'
+    Desking2Rollout = 'desking_2_rollout'
+    ContractDMSSubscription = 'contract_dms_subscription'
+
+
+class SignerTypeCode(object):
+    """
+    Signer Type Code Constants
+    """
+    SignerTypeC = 'C'
+    SignerTypeJ = 'J'
+    SignerTypeG = 'G'
+
+
+class DocumentStatus(object):
+    """
+    Document Status Code Constants
+    """
+    IdPassed = 'ID_PASSED'
+    OfacPassed = 'OFAC_PASSED'
+
+
+# All the Log event name need to be added as a attribute to LogEventNames class
+# Do not move or add new log events to Tenant specific packages.
+class LogEventName(object):
+    BULK_CREATE_EVENT_ERROR = 'BULK_CR_EVENT_ERROR'
+    BULK_MARK_VEHICLES_SOLD = 'BULK_MRK_VH_SOLD'
+    BOOKOUT_AUTH_REQUEST = 'BOOKOUT_AUTH_REQUEST'
+    BOOKOUT_JSON_DECODE_ERROR = 'BOOKOUT_JSON_DECODE_ERROR'
+    BOOKOUT_ENDPOINT_ERROR = 'BOOKOUT_ENDPOINT_ERROR'
+    BOOKOUT_ERROR = 'BOOKOUT_ERROR'
+    BOOKOUT_INACTIVE = 'BOOKOUT_INACTIVE'
+    BOOKOUT_PDF_ERROR = 'BOOKOUT_PDF_ERROR'
+    BOOKOUT_PDF_STORE_START = 'BOOKOUT_PDF_STORE_START'
+    BOOKOUT_PDF_STORE_ERROR = 'BOOKOUT_PDF_STORE_ERROR'
+    BOOKOUT_PDF_REQUEST = 'BOOKOUT_PDF_REQUEST'
+    BOOKOUT_PDF_SUCCESS = 'BOOKOUT_PDF_SUCCESS'
+    BOOKOUT_SUCCESS = 'BOOKOUT_SUCCESS'
+    BOOKOUT_START = 'BOOKOUT_START'
+    BOOKOUT_UPDATE = 'BOOKOUT_UPDATE'
+    BOOKOUT_UPDATE_RAW = 'BOOKOUT_UPDATE_RAW'
+    COMBINED_ADVERSE_ACTION_ERROR = 'COMBINED_ADVERSE_ACTION_ERROR'
+
+    CREDIT_APP_ACKNOWLEDGE_ERROR = 'CA_ERROR'
+    CREDIT_APP_ACKNOWLEDGE_PARTNER_ERROR = 'CA_ACK_PARTNER_ERROR'
+    CREDIT_APP_ACKNOWLEDGE_RECEIVED = 'CA_ACK_RECEIVED'
+    CREDIT_APP_ACKNOWLEDGE_SAVE = 'CA_ACK_SAVE'
+    CREDIT_APP_ACKNOWLEDGE_DROPPED = 'CA_ACK_DROPPED'
+    CREDIT_APP_RESUBMIT = 'CA_RESUBMIT'
+    CREDIT_APP_SAVE = 'CA_SAVE'
+    CREDIT_APP_SNAPSHOT_SAVE = 'CA_SNAPSHOT_SAVE'
+    CREDIT_APP_SNAPSHOT_SAVE_FAIL = 'CA_SNAPSHOT_SAVE_FAIL'
+    CREDIT_BUREAU_OOW_SAVE = 'OOW_SNAPSHOT_SAVE'
+    CREDIT_APP_SUBMIT = 'CA_SUBMIT'
+    CREDIT_APP_ACK_RETRY = 'CA_ACK_RETRY'
+    CREDIT_APP_SUBMIT_ERROR = 'CA_SUBMIT_ERROR'
+
+    CREDIT_BUREAU_ERROR = 'CB_ERROR'
+    CREDIT_BUREAU_RESPONSE_PAYLOAD = 'CB_RESPONSE_PAYLOAD'
+    CREDIT_BUREAU_REPORT_GET = 'CB_REPORT_GET'
+    CREDIT_BUREAU_REPORT_SAVE = 'CB_REPORT_SAVE'
+    CREDIT_BUREAU_REPORT_PAYLOAD = 'CB_REPORT_PAYLOAD'
+    CREDIT_BUREAU_SUBMIT = 'CB_SUBMIT'
+    CREDIT_BUREAU_SUBMIT_ERROR = 'CB_SUBMIT_ERROR'
+    CREDIT_BUREAU_SUBSCRIPTION_ERROR = 'CREDIT_BUREAU_SUBSCRIPTION_ERROR'
+
+    CREDIT_DECISION_COMMENTS_ONLY_DECISION_SAVE = 'CD_COMMENTS_ONLY_DECISION_SAVE'
+    CREDIT_DECISION_DETAIL_ERROR = 'CD_DECISION_DETAIL_ERROR'
+    CREDIT_DECISION_ERROR = 'CD_ERROR'
+    CREDIT_DECISION_RETRY = 'CD_RETRY'
+    CREDIT_DECISION_IGNORE = 'CD_IGNORE'
+    CREDIT_DECISION_FOR_OLD_APP = 'CD_FOR_OLD_APP'
+    CREDIT_DECISION_RECEIVED = 'CD_RECEIVED'
+    CREDIT_DECISION_SAVE = 'CD_SAVE'
+    DECISION_CODE_NOT_FOUND = 'DECISION_CODE_NOT_FOUND'
+    DEAL_UPDATE_APP = 'DEAL_UPDATE_APP'
+
+    COMPLIANCE_UPLOAD_ERROR = 'COMPLIANCE_UPLOAD_ERROR'
+    COMPLIANCE_DOCUMENT_PDF_SAVE_ERROR = 'COMPLIANCE_DOCUMENT_PDF_SAVE_ERROR'
+    COMPLIANCE_DOCUMENT_PDF_SAVE_SUCCESS = 'COMPLIANCE_DOCUMENT_PDF_SAVE_SUCCESS'
+    COMPLIANCE_DOCUMENT_LONG_TERM_SAVE_SUCCESS = 'COMPLIANCE_DOCUMENT_LONG_TERM_SAVE_SUCCESS'
+    COMPLIANCE_DOCUMENT_LONG_TERM_SAVE_ERROR = 'COMPLIANCE_DOCUMENT_LONG_TERM_SAVE_ERROR'
+
+    CONTRACT_COMMENTS_ONLY_DECISION_SAVE = 'CON_COMMENTS_ONLY_DECISION_SAVE'
+    CONTRACT_DECISION_BOOKED = 'CON_BOOKED'
+    CONTRACT_DECISION_CANCEL = 'CON_CANCEL'  # This is a lender cancel
+    CONTRACT_DECISION_CREDIT_APP_NOT_FOUND = 'CON_CA_NOTFOUND'
+    CONTRACT_DECISION_DETAIL_ERROR = 'CON_DECISION_DETAIL_ERROR'
+    CONTRACT_DECISION_ERROR = 'CON_ERROR'
+    CONTRACT_DECISION_RETRY = 'CON_RETRY'
+    CONTRACT_DECISION_KEY_PARAMETER_ERROR = 'CON_KEY_PARAMETER_MISSING'
+    CONTRACT_DECISION_RECEIVED = 'CON_RECEIVED'
+    CONTRACT_DECISION_SAVE = 'CON_SAVE'
+    CONTRACT_DOC_RESET_ON_VERIFICATION_FAILED = 'CON_DOC_RESET_ON_VERIFICATION_FAILED'
+
+    # If lender send any decision which is not in ssequens this event will log.
+    INVALID_CONTRACT_DECISION = "INVALID_CONTRACT_DECISION"
+
+    CONTRACT_STANDARD_FEATURE_START = 'CON_STANDARD_START'
+    CONTRACT_SPOT_FEATURE_START = 'CON_SPOT_START'
+    CONTRACT_FEATURE_START_FAILED = 'CON_START_FAILED'
+    CONTRACT_FPP_CREATED = 'CON_FPP_CREATED'
+    CONTRACT_FPP_FAILED = 'CON_FPP_FAILED'
+    CONTRACT_FPP_CREATION_FAILED = 'CON_FPP_CREATION_FAILED'
+    CONTRACT_CALC_FAILED = 'CON_CALC_FAILED'
+    CONTRACT_VALIDATION_FAILED = 'CON_VALIDATION_FAILED'
+    CONTRACT_DOCUMENT_SAVED = 'CON_SAVED'
+    CONTRACT_CLEAN_INS_HARD_ADDS_ERROR = 'CONTRACT_CLEAN_INS_HARD_ADDS_ERROR'
+
+    CONTRACT_DECISION_SUBMIT = 'CON_SUBMIT'
+    CONTRACT_DECISION_UPDATE = 'CON_DECISION_UPDATE'
+    CONTRACT_DECISION_VPEN = 'CON_PENDING_VERIFICATION'
+    CONTRACT_DECISION_VPEN_ACK = 'CON_PENDING_VERIFICATION_ACK'
+    CONTRACT_DECISION_VREJ = 'CON_VERIFICATION_REJECTED'
+    CONTRACT_DECISION_VRFA = 'CON_VERIFICATION_FAILED'
+    CONTRACT_DECISION_VRFY = 'CON_VERIFIED'
+    CONTRACT_DECISION_VRRW = 'CON_VERIFICATION_REVIEW'
+    CONTRACT_DECISION_VRWR = 'CON_VERIFICATION_WARNING'
+
+    DCON_DECISION_BOOK = 'DCON_DECISION_BOOK'
+
+    CONTRACT_PENDING_DOCS = 'CON_PENDING_DOCS'
+    # TODO temp event code
+    CONTRACT_VERIFICATION_REQUEST = 'CON_VERIFICATION_REQUEST'
+    CONTRACT_SUBMIT_REQUEST = 'CON_SUBMIT_REQUEST'
+    CONTRACT_TRAILING_REQUEST = 'CON_TRAILING_REQUEST'
+
+    CONTRACT_ANC_COMPLETED = 'CON_ANC_COMPLETED'
+    CONTRACT_ANC_COMPLETED_FAILED = 'CON_ANC_COMPLETED_FAILED'
+    CONTRACT_ANC_DTE_REMOVED = 'CON_ANC_DTE_REMOVED'
+    CONTRACT_ANC_DTE_FAILED = 'CON_ANC_DTE_FAILED'
+    CONTRACT_ANC_DTE_ADD = 'CON_ANC_DTE_ADD'
+
+    CONTRACT_ANC_DATA_ENTRY_FIELDS = 'CON_ANC_DATA_ENTRY_FIELDS'
+
+    CONTRACT_COMPLETE = 'CON_COMPLETE'
+    TRAILING_DOC_SUBMIT = 'TRAILING_DOC_SUBMIT'
+    CONTRACT_CANCEL_REQUEST = 'CON_CANCEL_REQUEST'  # Notify lender about dealer cancel
+
+    CON_SUBMIT_RESPONSE = "CON_SUBMIT_RESPONSE"
+    CON_VERIFICATION_RESPONSE = "CON_VERIFICATION_RESPONSE"
+    DOC_CONTINUE = "DOC_CONTINUE"
+    DOC_COMPLETED = 'DOC_COMPLETE'
+    DOC_SUBMITED = 'DOC_SUBMITED'
+    DOC_SUBMITED_FAIL = 'DOC_SUBMITED_FAIL'
+    DOC_IGNORED = 'DOC_IGNORED'
+
+    CONTRACT_DOCUMENT_PDF_SAVE_ERROR = 'CON_DOCUMENT_PDF_SAVE_ERROR'
+    CONTRACT_DOCUMENT_PDF_SAVE_SUCCESS = 'CON_DOCUMENT_PDF_SAVE_SUCCESS'
+    CONTRACT_DOCUMENT_UPDATE = 'CON_DOCUMENT_UPDATE'
+    CONTRACT_DOCUMENT_UPDATE_FAILED = 'CON_DOCUMENT_UPDATE_FAILED'
+    CONTRACT_EXPORT_LENDER_NOTIFY_ERROR = 'CON_EXP_LENDER_NOTIFY_ERROR'
+    CONTRACT_EXPORT_LENDER_NOTIFY_SUCCESS = 'CON_EXP_LENDER_NOTIFY_SUCCESS'
+    CONTRACT_TERMINATE_LENDER_NOTIFY_ERROR = 'CON_TERM_LENDER_NOTIFY_ERROR'
+    CONTRACT_TERMINATE_LENDER_NOTIFY_SUCCESS = 'CON_TERM_LENDER_NOTIFY_SUCCESS'
+    CONTRACT_TRANSFER_LENDER_NOTIFY_ERROR = 'CON_TRNS_LENDER_NOTIFY_ERROR'
+    CONTRACT_TRANSFER_LENDER_NOTIFY_SUCCESS = 'CON_TRNS_LENDER_NOTIFY_SUCCESS'
+    CONTRACT_MODIFIERS_SAVE = 'CON_MODIFIERS_SAVED'
+    CONTRACT_SUBMIT_ACKNOWLEDGED = 'CON_SUBMIT_ACK'
+    CONTRACT_TRAILING_ACKNOWLEDGED = 'CON_TRAILING_ACK'
+    CONTRACT_VERIFICATION_ACKNOWLEDGED = 'CON_VERIFICATION_ACK'
+    CONTRACT_ACKNOWLEDGED_FAILED = 'CON_ACKNOWLEDGED_FAILED'
+    # Update contract type based on paper vs digital
+    CONTRACT_TYPE_UPDATION = 'CON_TYPE_UPDATION'
+    CONTRACT_SIGNED = 'CON_SIGNED'
+    CONTRACT_PARTIALLY_SIGNED = 'CON_PARTIALLY_SIGNED'
+    CONTRACT_VERIFICATION_EXPIRED = 'CON_VERIFICATION_EXPIRED'
+    CONTRACT_VERIFICATION_EXPIRED_FAILED = 'CON_VERIFICATION_EXPIRED_FAILED'
+    CONTRACT_SIGNATURE_EXPIRED = 'CON_SIGNATURE_EXPIRED'
+
+    SPOT_CREDIT_APP_SUBMIT_SUCCESS = 'SPOT_CA_SUBMIT_SUCCESS'
+    SPOT_CREDIT_APP_SUBMIT_ERROR = 'SPOT_CA_SUBMIT_ERROR'
+
+    DEALER_PARTNER_RELATIONSHIP_SAVE = 'DLR_PARTNER_RLTNSP_SAVE'
+    DATA_MIGRATION = 'DATA_MIGRATION'
+    DEALER_ROLLOUT = 'DLR_ROLLOUT'
+    USER_PERMISSION_MIGRATED = 'USER_PERMISSION_MIGRATED'
+
+    EXTERNAL_DECISION_SAVE = 'EXT_DEC_SAVE'
+
+    CACHE_ERROR = 'CACHE_ERROR'
+    SNAPSHOT_ERROR = 'SNAPSHOT_ERROR'
+
+    DMS_IMPORT_ERROR = 'DMS_IMPORT_ERROR'
+    DMS_IMPORT_JSON_KEY_ERROR = 'DMS_IMPORT_JSON_KEY_ERROR'
+    DMS_DEAL_FINANCE_SAVED = 'DMS_DEAL_FINANCE_SAVED'
+    DMS_IMPORT_VALIDATION_ERROR = 'DMS_IMPORT_VALIDATION_ERROR'
+    DMS_IMPORT_DEALJACKET_NOT_FOUND = 'DMS_IMPORT_DEALJACKET_NOT_FOUND'
+    DMS_IMPORT_DMS_DEAL_NOT_FOUND = 'DMS_IMPORT_DMS_DEAL_NOT_FOUND'
+    DMS_IMPORT_DEALJACKET_CREATE_ERROR = 'DMS_IMPORT_DEALJACKET_CREATE_ERROR'
+    DMS_IMPORT_DEALJACKET_JSON_ERROR = 'DMS_IMPORT_DEALJACKET_JSON_ERROR'
+    DMS_IMPORT_FEES_MISSING_REQUIRED = 'DMS_IMPORT_FEES_MISSING_REQUIRED'
+    DMS_IMPORT_FEES_MISSING_MAPPING = 'DMS_IMPORT_FEES_MISSING_MAPPING'
+    DMS_IMPORT_FEES_CONNECTION_ERROR = 'DMS_IMPORT_FEES_CONNECTION_ERROR'
+    DMS_IMPORT_FEES_UNSUCCESSFUL_RESPONSE = 'DMS_IMPORT_FEES_UNSUCCESSFUL_RESPONSE'
+    DMS_IMPORT_TAXES_MISSING_REQUIRED = 'DMS_IMPORT_TAXES_MISSING_REQUIRED'
+    DMS_IMPORT_TAXES_CONNECTION_ERROR = 'DMS_IMPORT_TAXES_CONNECTION_ERROR'
+    DMS_IMPORT_TAXES_UNSUCCESSFUL_RESPONSE = 'DMS_IMPORT_TAXES_UNSUCCESSFUL_RESPONSE'
+    DMS_IMPORT_TAXES_NOT_AUTOGENERATED = 'DMS_IMPORT_TAXES_NOT_AUTOGENERATED'
+    DMS_IMPORT_TAX_PAYMENT_FLAG_ERROR = 'DMS_IMPORT_TAX_PAYMENT_FLAG_ERROR'
+    DMS_DEAL_IMPORTED = 'DMS_DEAL_IMPORTED'
+    DMS_CONTRACT_IMPORTED = 'DMS_CONTRACT_IMPORTED'
+    DMS_EXPORT_SERVICE_ERROR = 'DMS_EXPORT_SERVICE_ERROR'
+    DMS_EXPORT_DATAPOWER_ERROR = 'DMS_EXPORT_DATAPOWER_ERROR'
+    DMS_EXPORT_DATAPOWER_SUCCESS = 'DMS_EXPORT_DATAPOWER_SUCCESS'
+
+    CDMS_UNSUCCESSFUL_RESPONSE = 'CDMS_UNSUCCESSFUL_RESPONSE'
+    CDMS_GET_DEAL_ERROR = 'CDMS_GET_DEAL_ERROR'
+    CDMS_GET_DEAL_NO_JSON = 'CDMS_GET_DEAL_NO_JSON'
+    CDMS_GET_DEAL_SUCCESS = 'CDMS_GET_DEAL_SUCCESS'
+    CDMS_GET_DEAL_DB_ERROR = 'CDMS_GET_DEAL_DB_ERROR'
+    CDMS_GET_DEAL_DB_SUCCESS = 'CDMS_GET_DEAL_DB_SUCCESS'
+    CDMS_GET_DEAL_DATAPOWER_CONNECTION_ERROR = 'CDMS_GET_DEAL_DATAPOWER_CONNECTION_ERROR'
+    CDMS_GET_DEALS_DEALER_NOT_FOUND = 'CDMS_GET_DEALS_DEALER_NOT_FOUND'
+    CDMS_GET_DEALS_NO_PAYLOAD = 'CDMS_GET_DEALS_NO_PAYLOAD'
+    CDMS_GET_DEALS_SUCCESS = 'CDMS_GET_DEALS_SUCCESS'
+    CDMS_GET_DEALS_DB_ERROR = 'CDMS_GET_DEALS_DB_ERROR'
+    CDMS_GET_DEALS_DB_SUCCESS = 'CDMS_GET_DEALS_DB_SUCCESS'
+    CDMS_GET_DEALS_BAD_DATA_ERROR = 'CDMS_GET_DEALS_BAD_DATA_ERROR'
+    CDMS_GET_DEALS_CONNECTION_ERROR = 'CDMS_GET_DEALS_CONNECTION_ERROR'
+    CDMS_GET_DEALS_JSON_MISSING_KEYS = 'CDMS_GET_DEALS_JSON_MISSING_KEYS'
+    CDMS_GET_DEALS_JSON_NO_DEALS = 'CDMS_GET_DEALS_JSON_NO_DEALS'
+    CDMS_UPDATE_DEAL_MATCH_RESULTS = 'CDMS_UPDATE_DEAL_MATCH_RESULTS'
+    CDMS_EXPORT_ADD_ADDITIONAL_DATA_ERROR = 'CDMS_EXPORT_ADD_ADDITIONAL_DATA_ERROR'
+    CDMS_EXPORT_SERIALIZER_ERROR = 'CDMS_EXPORT_SERIALIZER_ERROR'
+    DMS_RECEIVED = 'DMS_RECEIVED'
+    DMS_ERROR = 'DMS_ERROR'
+    DMS_BUY_VEHICLE_VIN_DECODE_ERROR = 'DMS_BUY_VEHICLE_VIN_DECODE_ERROR'
+    DMS_TRADE_IN_VEHICLE_VIN_DECODE_ERROR = 'DMS_TRADE_IN_VEHICLE_VIN_DECODE_ERROR'
+
+    LOGIN_RAIL_SERVICE_CALL_ERROR = 'LOGIN_RAIL_SERVICE_CALL_ERROR'
+
+    DOCCENTER_SIG_CONSENT_ACCEPTED = 'DOCCENTER_SIG_CONSENT_ACCEPTED'
+    DOCCENTER_SIG_CREATED = 'DOCCENTER_SIG_CREATED'
+    DOCCENTER_SIG_BOUND_AND_STORED = 'DOCCENTER_SIG_BOUND_AND_STORED'
+    DOCCENTER_SIG_DOCUMENT_STORED = 'DOCCENTER_SIG_DOCUMENT_STORED'
+    DOCCENTER_SIG_SAVE_AND_EXIT = 'DOCCENTER_SIG_SAVE_AND_EXIT'
+    DOCCENTER_SIG_WITHDRAW_CONSENT = 'DOCCENTER_SIG_WITHDRAW_CONSENT'
+
+    SITEMINDER_HEADERS = 'SITEMINDER_HEADERS'
+
+    CONTRACT_EXPORT_SUCCESS = 'CON_EXPORT_SUCCESS'
+    CONTRACT_EXPORT_FAILED = 'CON_EXPORT_ERROR'
+    CONTRACT_EXPORT_TIMEOUT = 'CON_EXPORT_TIMEOUT'
+
+    CONTRACT_EXPORT_CONFIRM_SUCCESS = 'CON_EXPORT_CONFIRM_SUCCESS'
+    CONTRACT_EXPORT_CONFIRM_FAILED = 'CON_EXPORT_CONFIRM_ERROR'
+
+    CONTRACT_EXPORT_CANCEL_SUCCESS = 'CON_EXPORT_CANCEL_SUCCESS'
+    CONTRACT_EXPORT_CANCEL_FAILED = 'CON_EXPORT_CANCEL_ERROR'
+
+    CONTRACT_TERMINATE_SUCCESS = 'CON_TERMINATE_SUCCESS'
+    CONTRACT_TERMINATE_FAILED = 'CON_TERMINATE_ERROR'
+
+    CONTRACT_VIEW_SUCCESS = 'CON_VIEW_SUCCESS'
+    CONTRACT_VIEW_FAILED = 'CON_VIEW_ERROR'
+
+    CONTRACT_LEASE_TO_ONE_PAY_SWITCH = 'CON_LEAS_TO_OPLE_SWITCH'
+    CONTRACT_ONE_PAY_TO_LEASE_SWITCH = 'CON_OPLE_TO_LEASE_SWITCH'
+    CONTRACT_LEASE_ONE_PAY_SWITCH_SUCCESS = 'CON_LEAS_OPLE_SWITCH_SUCCESS'
+    CONTRACT_LEASE_ONE_PAY_SWITCH_ERROR = 'CON_LEAS_OPLE_SWITCH_ERROR'
+
+    PDF_DATA_MAPPING_ATTRIBUTE_NOT_FOUND = 'PDF_DATA_MAPPING_ATTRIBUTE_NOT_FOUND'
+
+    CREATE_FUNDING_PACKAGE_TASK_STARTED = 'CREATE_FUNDING_PACKAGE_TASK_STARTED'
+    UPDATE_CREDIT_APP_DOCUMENT_TASK_STARTED = 'UPDATE_CREDIT_APP_DOCUMENT_TASK_STARTED'
+
+    DOCCENTER_CREATE_FUNDING_PACKAGE_SUCCESS = 'DOCCENTER_CREATE_FUNDING_PACKAGE_SUCCESS'
+    DOCCENTER_CREATE_FUNDING_PACKAGE_RETRY = 'DOCCENTER_CREATE_FUNDING_PACKAGE_RETRY'
+    DOCCENTER_CREATE_FUNDING_PACKAGE_ERROR = 'DOCCENTER_CREATE_FUNDING_PACKAGE_ERROR'
+    DOCCENTER_UPDATE_DOCUMENT_ERROR = 'DOCCENTER_UPDATE_DOCUMENT_ERROR'
+    DOCCENTER_UPDATE_DOCUMENT_PACKAGE_RETRY = 'DOCCENTER_UPDATE_DOCUMENT_PACKAGE_RETRY'
+    DOCCENTER_UPDATE_DOCUMENT_PACKAGE_ERROR = 'DOCCENTER_UPDATE_DOCUMENT_PACKAGE_ERROR'
+    DOCCENTER_GET_FUNDING_DOCUMENT_LIST_EXCEPTION = 'DOCCENTER_GET_FUNDING_DOCUMENT_LIST_EXCEPTION'
+    DOCCENTER_GET_FUNDING_DOCUMENT_LIST_ERROR = 'DOCCENTER_GET_FUNDING_DOCUMENT_LIST_ERROR'
+    DOCCENTER_GET_FUNDING_DOCUMENT_LIST_RETRY = 'DOCCENTER_GET_FUNDING_DOCUMENT_LIST_RETRY'
+    DOCCENTER_GET_PDF_DOCUMENT_EXCEPTION = 'DOCCENTER_GET_PDF_DOCUMENT_EXCEPTION'
+    DOCCENTER_GET_PDF_DOCUMENT_ERROR = 'DOCCENTER_GET_PDF_DOCUMENT_ERROR'
+    DOCCENTER_DOCUMENT_NOT_FOUND = 'DOCCENTER_DOCUMENT_NOT_FOUND'
+
+    ECORE_DOCCENTER_CALLBACK = 'ECORE_DOCCENTER_CALLBACK'
+    ECORE_SIGNATURE_BINDING = 'ECORE_SIGNATURE_BINDING'
+    ECORE_SIGNATURE_BINDING_ERROR = 'ECORE_SIGNATURE_BINDING_ERROR'
+    ECORE_RETRIEVE_RESOURCE = 'ECORE_RETRIEVE_RESOURCE'
+
+    EXTERNAL_ADDRESS_PARSER = 'EXTERNAL_ADDRESS_PARSER'
+
+    NOTIFICATIONS_API = 'NOTIFICATIONS_API'
+    PREAPPROVAL = 'PREAPPROVAL'
+    REWARD_RESPONSE_SUCCESS = 'REWARD_RESPONSE_SUCCESS'
+    REWARD_RESPONSE_FAILURE = 'REWARD_RESPONSE_FAILURE'
+    REWARD_REQUEST_SUCCESS = 'REWARD_REQUEST_SUCCESS'
+    REWARD_REQUEST_FAILURE = 'REWARD_REQUEST_FAILURE'
+    REWARD_REQUEST_SUBMISSION_FAILURE = 'REWARD_REQUEST_SUBMISSION_FAILURE'
+
+    DEALJACKET_EVENT_TASK = 'DEALJACKET_EVENT_TASK'
+    LONG_TERM_EVENT_TASK = 'LONG_TERM_EVENT_TASK'
+    CMPL_IMPLICIT_EVENTS_TASK = 'CMPL_IMPLICIT_EVENTS_TASK'
+
+    # partner settings log event
+    PARTNER_SETTINGS = 'PARTNER_SETTINGS'
+
+    CUSTOMER_INVESTIGATION_REPORT_SUCCESS = 'CUSTOMER_INVESTIGATION_REPORT_SUCCESS'
+    CUSTOMER_INVESTIGATION_REPORT_FAILURE = 'CUSTOMER_INVESTIGATION_REPORT_FAILURE'
+
+    VEHICLE_INVENTORY_SUCCESS = 'VEHICLE_INVENTORY_SUCCESS'
+    VEHICLE_SOLD_STATUS = 'VEHICLE_SOLD_STATUS'
+
+    SPOT_CONTRACT_LENDER_APP_ID_ALREADY_EXISTS = 'SPOT_CONTRACT_LENDER_APP_ID_ALREADY_EXISTS'
+    SPOT_CONTRACT_LENDER_APP_ID_UPDATE_SUCCESS = 'SPOT_CONTRACT_LENDER_APP_ID_UPDATE_SUCCESS'
+    SPOT_CONTRACT_LENDER_APP_ID_UPDATE_FAILURE = 'SPOT_CONTRACT_LENDER_APP_ID_UPDATE_FAILURE'
+
+    UPDATE_ADVERSE_ACTION_STATUS = 'UPDATE_ADVERSE_ACTION_STATUS'
+
+    # Desking Log events
+    DESKING_DEAL_SAVE = 'DESK_DEAL_SAVE'
+    DESKING_LENDER_PROGRAM_INCENTIVE_SEARCH = 'DESK_LP_INCV_SEARCH'
+    DESKING_DEALER_FEE_SAVE = 'DESK_DLR_FEE_SAVE'
+    DESKING_DEALER_FEE_GET = 'DESK_DLR_FEE_GET'
+    DESKING_LENDER_SETUP_SAVE = 'DESK_LENDER_STP_SAVE'
+    DESKING_LENDER_SETUP_DELETE = 'DESK_LENDER_STP_DEL'
+    DESKING_DEAL_FEE_SAVE = 'DESK_DEAL_FEE_SAVE'
+    DESKING_DEAL_FEE_GET = 'DESK_DEAL_FEE_GET'
+    DESKING_DEAL_TAX_SAVE = 'DESK_DEAL_TAX_SAVE'
+    DESKING_DEAL_TAX_GET = 'DESK_DEAL_TAX_GET'
+    REWARD_SAVE_BILLING_SUCCESS = 'REWARD_SAVE_BILLING_SUCCESS'
+    REWARD_SAVE_BILLING_FAILURE = 'REWARD_SAVE_BILLING_FAILURE'
+    # Compliance
+    COMPLIANCE = 'COMPLIANCE'
+    REDFLAGS = 'REDFLAGS'
+    OFAC = 'OFAC'
+    OUT_OF_WALLET = 'OUT_OF_WALLET'
+    # ERJ Log events
+    DEALER_PARTICIPATION_SUCCESS = 'DEALER_PARTICIPATION_SUCCESS'
+    REVIEWER_PARTICIPATION_SUCCESS = 'REVIEWER_PARTICIPATION_SUCCESS'
+
+    # DTV AWS API
+    DTV_API = 'DTV_API'
+    DTV_API_ERROR = 'DTV_API_ERROR'
+
+    # UI Injection Log Events
+    UI_INJECTION = 'UI_INJECTION'
+
+    ASYNC_VAULT_TRANSFER_SUCCESS = 'ASYNC_VAULT_TRANSFER_SUCCESS'
+    ASYNC_VAULT_TRANSFER_FAILURE = 'ASYNC_VAULT_TRANSFER_FAILURE'
+    VAULT_TRANSFER_FAILURE = 'VAULT_TRANSFER_FAILURE'
+
+    SALES_PROGRAM_RESPONSE_FAILURE = 'SALES_PROGRAM_RESPONSE_FAILURE'
+    SALES_PROGRAM_CAM_INFO = 'SALES_PROGRAM_CAM_INFO'
+
+    SERVICE_CALL_ERROR = 'SERVICE_CALL_ERROR'
+
+    LEAD_PREFILL = 'LEAD_PREFILL'
+
+    COPY_APP = 'CREDIT_APPLICATION_COPIED'
+
+
+LOG_EVENT_MAPPINGS = {FeatureStatusCode.ContractPendingVerification: LogEventName.CONTRACT_DECISION_VPEN,
+                      FeatureStatusCode.Cancelled: LogEventName.CONTRACT_DECISION_CANCEL,
+                      FeatureStatusCode.Submit: LogEventName.CONTRACT_DECISION_SUBMIT,
+                      FeatureStatusCode.ContractVerificationFailed: LogEventName.CONTRACT_DECISION_VRFA,
+                      FeatureStatusCode.ContractVerified: LogEventName.CONTRACT_DECISION_VRFY,
+                      FeatureStatusCode.ContractVerificationRejected: LogEventName.CONTRACT_DECISION_VREJ,
+                      FeatureStatusCode.ContractVerificationReview: LogEventName.CONTRACT_DECISION_VRRW,
+                      FeatureStatusCode.ContractVerificationWarning: LogEventName.CONTRACT_DECISION_VRWR,
+                      FeatureStatusCode.ContractSigned: LogEventName.CONTRACT_SIGNED,
+                      FeatureStatusCode.ContractPartiallySigned: LogEventName.CONTRACT_PARTIALLY_SIGNED,
+                      FeatureStatusCode.ContractExpired: LogEventName.CONTRACT_VERIFICATION_EXPIRED}
+
+
+SYSTEM_USER = {
+    'AHFC': 'PTNRUPDTH',
+    'DTCOM': 'PTNRUPDT',
+}
+
+
+class VCSProductName(object):
+    """
+    VCS DB Product Name Constants For Lender Program Setup
+    """
+    VCS_FINANCE = 'VCS-F'
+    VCS_LEASE = 'VCS-L'
+    VCS_BALLOON = 'VCS-BL'
+    VCS_NON_PRIME = 'VCS-NP'
+
+
+class LenderSetupStatus(object):
+    """
+    Status constant to verify active or inactive lender program setup
+    """
+    IS_ACTIVE = 1
+    IS_INACTIVE = 0
+
+
+# Allow credit and contract data entry pages while deal is in one of the following statuses
+STATUS_ALLOWED_FOR_DATA_ENTRY = {
+    FeatureCode.CreditDecision: (FeatureStatusCode.ContractSave,
+                                 FeatureStatusCode.DecisionApprovedBlank,
+                                 FeatureStatusCode.DecisionConditionallyApprovedBlank),
+    FeatureCode.ContractDecision: (FeatureStatusCode.Submit,
+                                   FeatureStatusCode.ContractPendingVerification),
+}
+
+DEAL_FEE_FIELDS_MAPPER = {'retail_amt': 'retail_amount',
+                          'lease_amt': 'lease_amount',
+                          'fee_name': 'fee_name',
+                          'fee_type_id': 'fee_type_id',
+                          'fee_category_id': 'fee_category_id',
+                          'cap_in': 'capatilize_indicator',
+                          'paid_to': 'paid_to',
+                          'balloon_indicator': 'balloon_indicator',
+                          'finance_indicator': 'finance_indicator',
+                          'cash_indicator': 'cash_indicator',
+                          'lease_indicator': 'lease_indicator',
+                          'retail_advance': 'retail_advance',
+                          'lease_advance': 'lease_advance',
+                          'monthly_used_tax': 'monthly_used_tax',
+                          'cap_reduction_tax': 'cap_reduction_tax',
+                          'dealer_fee_id': 'fee_id'}
+
+DEAL_FEE_INFO_MESSAGE = {'saved': 'Fees saved.',
+                         'invalid': 'Invalid zipcode entered.',
+                         'not_available': 'No fees available in setup for state ({}).',
+                         'state_changed': 'State is changed please click on fee link to review fees.'}
+
+
+class DLR_By_Partner_Stus(Enum):
+    """
+    Dealer By Partner Status code constants
+    """
+    ACTIVE = 'A'
+    INACTIVE = "I"
+
+
+class PartnerToMake_Del_In(Enum):
+    """
+    Partner To Make Del Indicator constants
+    Indicator to indicate whether given CP_ID and DIVISIONID combination is active or not.
+    """
+    YES = "Y"
+    NO = "N"
+
+
+COMMON_DEALER = 'CDLR'
+
+PRODUCT_TYPE_MAPPING = {'VCS-F': 'Retail',
+                        'VCS-L': 'Lease',
+                        'VCS-BL': 'Balloon',
+                        'VCS-NP': 'Non Prime'}
+
+DOCUMENT_TYPE_TO_PERMISSION = {'credit_bureau_report_document': 'CBRPT',
+                               'personal_credit_info': 'CAVIEW',
+                               'financial_collateral_info': 'CAVIEW',
+                               'all_archived_docs': 'VUCMPLDOCS'}
+
+
+class DeskingStatusCode(Enum):
+    """
+    Desking Feature Status code constant
+    """
+    SUBMIT = "SUBM", "Quote Submitted"
+    CONDITIONAL_APPROVED = "COFR", "Quote Conditionally Approved"
+    PENDING = 'PEND', "Quote Pending Decision"
+    APPROVED = "APPR", "Quote Approved"
+    ACCEPT = "ACEP", "Quote Accepted"
+
+
+class FeeDealTypeIndicators(Enum):
+    """ This class define common and deal level fee deal type indicators. for example for retail type indicator will be retail_indicator"""
+    RETL = 'finance_indicator', 'finance indicator'
+    LEAS = 'lease_indicator', 'lease indicator'
+    BALL = 'balloon_indicator', 'balloon indicator'
+
+
+class DMSSubscriptionIDs(object):
+    # We need common references for these
+    DTDMS_CP_ID = 400008301
+
+
+DB_USER_LOGIN_ID = {'DTCOM': 'DBBATCH',
+                    'AHFC': 'DBDTHBATCH'}
+
+BOOKOUT_MATERIAL_CODES = ['BNSA', 'BBSW', 'BBSA', 'BKSA']
+BOOKOUT_USER_PERMISSIONS = ['BKOTVEH', 'RETBKOTVEH']
+
+CONTRACT_STATUS_PAPER = [FeatureStatusCode.ContractBooked,
+                         FeatureStatusCode.ContractSuspended,
+                         FeatureStatusCode.DocsReceived,
+                         FeatureStatusCode.ContractFunded,
+                         FeatureStatusCode.ContractPendingDocs,
+                         FeatureStatusCode.ContractReturn,
+                         FeatureStatusCode.Cancelled]
+
+CONTRACT_STATUS_NULL = [FeatureStatusCode.ContractReturn,
+                        FeatureStatusCode.Cancelled]
+
+STATUS_ALLOWED_AFTER_SUBMIT_FOR_FUNDING = [FeatureStatusCode.Submit,
+                                           FeatureStatusCode.ContractReceived,
+                                           FeatureStatusCode.DocsReceived,
+                                           FeatureStatusCode.ContractSuspended,
+                                           FeatureStatusCode.ContractBooked,
+                                           FeatureStatusCode.ContractFunded]
+
+PAPER_CONTRACT_FLAG = "P"
+FNI_APPS = 'fni'
+CDN_APPS = 'cdn'
+
+DTC_RESTRICTED_DOC_STORAGE_EVENTS = ['AANP', 'CBRBP']
+
+FNI_REACT_APP_PORTS = {'fni-menu-dealer-app': 6127,
+                       'fni-menu-cust-app': 6357,
+                       'fni-aftermarket-app': 6135,
+                       'fni-desking-app': 6234
+                       }
+
+
+class StateCodes(object):
+    """Class to hold state codes of different states of US"""
+    MICHIGAN = "MI"
+
+
+class PartyRelationship(object):
+    """ Class contains different relationship's for cobuyer"""
+    SPOUSE = "S",
+    RELATIVE = "R"
+    OTHER = "O"
+
+
+DISABLED_MENU_MANAGER_FEATURE_STATUSES = (FeatureStatusCode.ContractVerified,
+                                          FeatureStatusCode.ContractSigned,
+                                          FeatureStatusCode.ContractVerificationWarning)
+
+SWAP_APPLICANTS_COPY_EVENT_CODES = ['CIRTC', 'CBBR', 'CBATH', 'OOW', 'OFAC', 'PPACQ', 'CIRTA', 'CBRBP', 'VEHS',
+                                    'VEHU', 'IDV', 'AANP', 'AANR', 'AANI', 'AANMP', 'AANRM', 'OFACM', 'AANM', 'OOWM',
+                                    'MNSDM', 'CIRM', 'IDVM', 'PPMC', 'CBATM', 'RBPM']

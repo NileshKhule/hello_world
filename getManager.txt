@@ -1,0 +1,584 @@
+from dtplatform.common.base_manager import getManager
+
+
+# -*- coding: utf-8 -*-
+"""
+At dealertrack, most of the business logic gets implemented
+in managers, so it is very important to properly setup managers.
+That includes using the correct base classes as well as properly
+registering them.
+
+``BaseManager``
++++++++++++++++
+
+All of our managers **MUST** subclass :class:`.BaseManager`.
+The base manager ensures that each manager correctly
+initializes the session (``self.session``) and it also sets up
+other nice things such as log which does not require
+``extra`` data to be passed in.
+
+Manager registration
+++++++++++++++++++++
+
+Simply defining a manager is not enough to use it.
+Since we support multiple tenants, we have to register managers
+for a particular tenant (or no tenant for common managers).
+Doing that will allow us at runtime to get the appropriate
+manager depending on the ``tenant_code`` in the ``context_data``.
+
+.. important:: Our registration process has changed so please make
+    sure to use the new approach described below or your managers
+    will not be registered.
+
+We used to use a decorator on the manager class to register
+that manager with the given tenant_code, however that approach
+is limiting since we have to import all managers in order for
+them to be registered. To solve that, we now have a "global"
+manager registration file which registers all managers.
+Not to pollute manager registration file with managers
+from all tenants, we use one such "global" registration file
+per tenant. That file can be found in each tenant package
+named ``manager_registration.py``. The file format is very
+simple::
+
+    from dtplatform.common.base_manager import register_many_managers
+    register_many_managers(
+        'DTCOM',
+        'dtplatform.dtcom. ... .FooManager',
+    )
+
+So in order to register a new manager class, simply add a parameter
+to the ``register_many_managers`` function specifying Python
+dot-notation importable path of your manager.
+
+.. note:: We do not have such file for the common managers
+    since there is no need to register them. More on that below.
+
+Also you can auto-generate the ``managers_registration.py`` file by
+using the ``dtplatform/scripts/manager_registration_generator.py`` script.
+That script finds all managers within a given package and autogenerates the
+``manager_registration.py`` file for the given tenant code.
+
+::
+
+    $ cd dtplatform/scripts
+    $ ./manager_registration_generator.py
+          dtplatform.dtcom # importable path to introspect
+          DTCOM
+          > ../dtplatform/dtcom/manager_registration.py # Write to manager_registration.py
+
+Using managers
+++++++++++++++
+
+To use managers we **ALWAYS MUST** use a manager getter - :func:`.getManager`.
+We should **never** manually instantiate the manager class, with the only
+exception being manager tests.
+The getter will inspect the context data and will return the appropriate
+manager for the tenant in the context data. For example::
+
+    getManager(CustomerManager, context).create_customer(...)
+
+If no tenant-specific manager is found, it will simply return the given manager.
+That allows not to register common managers because they
+have to be imported in order to use ``getManager``,
+in which case ``getManager`` will just return the common manager
+since it wont be found in the LUT.
+
+.. note::
+    When using managers in scripts you need to import dtplatform packages to
+    correctly register tenant managers.
+    For examlple::
+
+        import dtplatform.dtcom
+        import dtplatform.ahfc
+
+Under the hood
+++++++++++++++
+
+Under the hood the new implementation is actually very simple.
+As you might have guessed, ``managers_registration.py`` calls
+:func:`.register_many_managers` which imports all specified managers
+and adds them into the lookup singleton :data:`.MANAGER_LUT`.
+Then when using :func:`.getManager`, it looks up the appropriate
+manager in LUT and simply returns the found manager. If no match
+is found, it then returns the given manager.
+"""
+import inspect
+import logging
+from collections import Mapping
+from functools import partial
+
+import six
+from compiler.ast import flatten
+from sqlalchemy.sql.expression import and_
+
+from dt_database_utils.db_wrapper import get_orm_session
+from platform_utils.utils.dt_context import Context
+from platform_utils.utils.dt_importlib import import_module_attribute
+from platform_utils.utils.string_functions import format_log_dict_to_string_key_value
+
+from dtplatform.common.constants import IsolationLevel
+from dtplatform.common.transaction import TransactionMode
+from dtplatform.conf import settings
+
+
+MANAGER_LUT = {}
+
+# Global variable/singleton to store manager registration
+# lookup table/dict (LUT). The dictionary is structured
+# to allow tenant-specific manager lookups. Also
+# the dictionary is structured for fast and efficient
+# manager lookups by manager name independent of the tenant.
+# Dictionary structure looks something like::
+#
+#     {
+#         # tenant code
+#         'DTCOM': {
+#             'FooManager': <class DTCOMFooManager>,
+#             ...
+#         },
+#     }
+
+
+class DTBaseException(Exception):
+    """
+    Base class for all DT Manager custom exceptions
+
+    Custom DT code common to all such exceptions goes here.
+    """
+
+
+def _get_manager_class(manager_cls, context):
+    """
+    Helper method for retrieving tenant-aware manager
+    class for the given context.
+
+    :param manager_cls: manager to be looked up.
+        Must be a subclass of :class:`.BaseManager`.
+
+        .. note:: If the tenant-specific implementation
+            is not found for the given manager,
+            the given manager is returned.
+            This allows for common managers not to be
+            registered.
+    :param context: DT context instance.
+        Must contain ``tenant_code`` key
+        to lookup a tenant-specific manager implementation.
+        Otherwise, context can be omitted which will
+        return the provided manager.
+
+    :returns: Tenant-specific manager class
+        or default one if no tenant-specific
+        implementation exists.
+    """
+    if not inspect.isclass(manager_cls) or not issubclass(manager_cls, BaseManager):
+        raise TypeError(
+            'getManager must be called with a BaseManager subclass. '
+            'Was called with "{}"'.format(manager_cls)
+        )
+
+    tenant_code = context.get('tenant_code')
+
+    # tenant is not recognized hence manager cannot be looked
+    # so just return the provided manager class
+    if tenant_code not in MANAGER_LUT:
+        return manager_cls
+
+    return MANAGER_LUT[tenant_code].get(manager_cls.__name__,
+                                        manager_cls)
+
+
+def getManager(manager_cls, context, *args, **kwargs):
+    """
+    Helper method for retrieving tenant-aware manager class
+    for the given context and instantiating it.
+
+    :param manager_cls: same as in :func:`._get_manager_class`:
+    :param context: same as in :func:`._get_manager_class`:
+    :param args: All additional arguments which
+        will be passed in manager instantiation
+    :param kwargs: All additional kwargs which
+        will be passed in manager instantiation
+
+    :returns: Tenant-specific manager instance
+        or default one if no tenant-specific
+        implementation exists.
+    """
+    if not isinstance(context, Context):
+        context = Context(context)
+
+    manager = _get_manager_class(manager_cls, context)
+    return manager(ctx=context, *args, **kwargs)
+
+
+def _get_ancestor_class_from_mro(klass, base):
+    """
+    Helper function to get ancestor class of ``klass`` which
+    subclasses ``base``.
+
+    For example::
+
+        >>> class Base(object): pass
+        >>> class Mixin(object): pass
+        >>> class Foo(Mixin, Base): pass
+        >>> class Bar(Foo): pass
+        >>> assert _get_ancestor_class_from_mro(Bar, Base) is Foo
+
+    :param klass: Class object for which to get ancestor class
+    :param base: Base class which ancestor should subclass
+    """
+    if not issubclass(klass, base):
+        msg = '{klass} is not a subclass of {base}'
+        raise TypeError(msg.format(klass=klass.__name__,
+                                   base=base.__name__))
+
+    # Attempt to get find ancestor by looping over mro
+    mro = klass.mro()
+
+    # the is guaranteed to return something since
+    # the check above passed that the given klass
+    # is a subclass of base so
+    # there must be at least one class in mro
+    # above base which inherits it
+    # hence will be the ancestor
+    return filter(lambda i: issubclass(i, base),
+                  mro[:mro.index(base)][::-1])[0]
+
+
+def register_single_manager(manager, tenant_code):
+    """
+    Method for registering single manager class.
+
+    :param manager: Either python dot-notation importable string
+        or actual manager class object
+    :param tenant_code: Tenant code string under which manager
+        will be registered
+    """
+    if isinstance(manager, six.string_types):
+        manager = import_module_attribute(manager)
+
+    if not tenant_code:
+        raise ValueError('Must provide tenant_code to register manager')
+
+    ancestor = _get_ancestor_class_from_mro(manager, BaseManager)
+
+    MANAGER_LUT.setdefault(tenant_code, {})
+    MANAGER_LUT[tenant_code][ancestor.__name__] = manager
+
+
+def register_many_managers(tenant_code=None, *managers):
+    """
+    Method for registering many managers at once.
+
+    :param tenant_code: Tenant under which to register all managers
+    :param managers: List of managers to register,
+        either as manager class objects or list of
+        Python dot-notation importable strings
+    """
+    # list guarantees that all iterations get executed
+    # vs returning iterable/generator
+    list(map(partial(register_single_manager, tenant_code=tenant_code),
+             managers))
+
+
+class LogManagerMixin(object):
+    """
+    Common logger Mixin class
+    """
+    log_keys = [
+        'app_first_name',
+        'app_last_name',
+        'app_ssn',
+        'coapp_first_name',
+        'coapp_last_name',
+        'coapp_ssn',
+        'dealjacket_id',
+        'deal_jacket_id',
+        'deal_id',
+        'dealer_code',
+        'dt_app_id',
+        'fusion_prod_code',
+        'lender_app_id',
+        'partner_code',
+        'user_code',
+        'dealer_id',
+        'decision_delta_from_classic'  # TODO: Remove this Once the LCM team fixes the Routing issue
+    ]
+
+    def log_event(self, event_nm, log_type='info', error_message=None, extra_kwargs=None, **kwargs):
+        """
+        Helper for logging a feature event, such as 'CA_SUBMIT'.
+
+        Method will accept any dictionary like context dict and converts to key value pair.
+        Default log type is info we can also set error, debug based on the usecase.
+
+        Note:
+            This method is not designed for generic application logs.
+
+        Args:
+            event_nm (str): Event name need to be logged
+            log_type (str): Default to info
+            error_message (Optional[str]): Default to None
+            extra_kwargs (Optional[dict]): Additional kwargs to be logged disregarding
+                allowed kwargs via :py:attr:`.log_keys`
+
+        example:
+            input: {'foo':'bar'}
+            output: 'foo=bar'
+        """
+        pairs = {k: v for k, v in kwargs.items() if k in self.log_keys}
+        pairs.update(extra_kwargs or {})
+        if error_message:
+            pairs['error_message'] = '<{}>'.format(error_message)
+        pairs['event_name'] = event_nm
+        getattr(self.log, log_type)(format_log_dict_to_string_key_value(pairs), exc_info=1)
+
+
+class BaseManager(LogManagerMixin):
+    """
+    Base class for managers
+
+    Subclasses should define class level instance of:
+
+    ``cls.managed_classes``: a tuple of classes that this manager will handle
+
+    Managers will not be discoverable by :func:`.getManager` unless they are
+    *registered* in ``manager_registration.py`` tenant-specific file.
+    To find out out, please read :module:`.`
+
+    .. important::
+        All subclasses **MUST** call super with args and kwargs.
+        Though BaseManager inherits from object, calling super
+        is important in case of multiple inheritance.
+        That ensures base classes ``__init__`` gets
+        called with args and kwargs. Example::
+
+            class FooManager(BaseManager):
+                def __init__(self, *args, **kwargs):
+                    super(FooManager, self).__init__(*args, **kwargs)
+    """
+    # classes that this manager is responsible for
+    managed_classes = tuple()
+    # subclasses can redefine this key ... this should be OK for most
+
+    # primary_key attribute names
+    class_keys = {}
+
+    def _setup_transaction_mode(self, ctx, **kwargs):
+        '''Sets up the transaction_mode for the manager methods'''
+        self.transaction_mode = ctx.get("transaction_mode", TransactionMode.Commit)
+
+    def __init__(self, ctx, *args, **kwargs):
+        assert isinstance(ctx, Mapping), "Must create manager with a context"
+        # TODO: how much responsibility should we take for validating the
+        # context?? this will set a bunch of blank defaults...but it's a start
+
+        self.context = ctx if isinstance(ctx, Context) else Context(ctx)
+        # This will take the connection key from the passed in context
+        # or if the connection key is not passed or context is not passed
+        # it will set the connection key to the default
+        self.context['connection_key'] = ctx['connection_key'] \
+            if ctx.get('connection_key') \
+            else settings.MAIN_DB_CONNECTION_KEY
+
+        # this can change but it allows for doorman to be installed or not
+        # installed
+        if get_orm_session.implementation != get_orm_session.original:
+            self.session = get_orm_session(self.context['connection_key'],
+                                           self.context.get('tenant_code'))
+        else:
+            self.session = get_orm_session(self.context['connection_key'])
+
+        # This will set the db transaction isolation level
+        self.trans_isolation_level = ctx.get('trans_isolation_level',
+                                             IsolationLevel.ReadUncommitted)
+        if 'user_code' in ctx:
+            self.session._dt_user_code = ctx['user_code']
+        if 'tenant_code' in ctx:
+            self.session.tenant_code = ctx['tenant_code']
+        # logging to log name dtplatform.foomanager with extra
+        log = logging.getLogger("dtplatform.%s" %
+                                self.__class__.__name__.lower())
+        self.log = logging.LoggerAdapter(log, self.context)
+
+        # Transaction mode
+        self._setup_transaction_mode(ctx, **kwargs)
+
+        # pop to ensure the super call works, we don't need it anymore
+        if 'transaction_mode' in kwargs:
+            kwargs.pop('transaction_mode')
+
+        # required for multiple inheritance
+        super(BaseManager, self).__init__(*args, **kwargs)
+
+    def query(self, *entities, **kwargs):
+        """
+        Its a wrapper method for sql alchemy session's query method
+
+        :param *args: model objects as would be used in a sqlalchemy session.query
+        :param **kwargs: would be used in a sqlalchemy session.query
+        :return: instance of type query
+        """
+        return self.session.query(*entities, **kwargs)
+
+    def read(self, cls, *args, **kwargs):
+        """
+        Read from database;
+
+        :param cls: class of request object, must be a *managed_classes* inst
+        :param *args: primary keys as would be used in a sqlalchemy `.get()`
+        :param **kwargs: same as args but as keywords are autofilled from
+                         the current manger context
+                         (i.e. the dealer_code and possibly other keys can be
+                         omitted from the call)
+        :return: instance of type cls
+
+        is equivalent to session.query().get() i.e.::
+
+            with getManager(DealjacketManager, Context()) as djm:
+                oldway = djm.session.query(DealJacket).get((12,123))
+                newway = djm.get(DealJacket, 12, 123)
+                assert oldway == newway
+
+        Note that primary key items like dealer_code are usually in the
+        context. They can now be made optional in a get call::
+
+            context = Context({'dealer_code': 12, 'deal_jacket_id': 123})
+            with getManager(DealjacketManager, context) as djm:
+                oldway = djm.session.query(Deal).get((12, 123, 1234))
+                newway = djm.get(Deal, deal_id=1234)
+                assert oldway == newway
+
+        """
+        if not issubclass(cls, self.managed_classes):
+            raise AttributeError("%s is not a manager for %s \
+                only %r" % (self.__class__.__name__, cls,
+                            self.managed_classes))
+
+        if kwargs and args:
+            raise TypeError("Unexpected kwargs, call %s.get with args or \
+                kwargs but not both" % (self.__class__.__name__))
+
+        if args:
+            return self.session.query(cls).get(args)
+
+        # construct from kwargs
+        if cls not in self.class_keys:
+            self.class_keys[cls] = class_keys(cls)
+
+        newargs = []
+        for key in self.class_keys[cls]:
+            newargs.append(kwargs.get(key) or self.context.get(key))
+
+        return self.session.query(cls).get(newargs)
+
+    def get(self, criteria=None, spec=None):
+        """
+        Primary generic API for retrieving persisted object from database
+
+        usage::
+
+            criteria = {
+                "Entity Class Name": [EntityClass.field == passed value]
+            }
+            spec = {
+                "selection": [EntityClass.field,
+                              AnotherEntityClass.field],
+                "join": ["relationship name",
+                         "another relationship name"]
+            }
+            manager.get(criteria, spec)
+
+        :param dict criteria: dictionary specifying the where clause
+        :param dict spec: dict containing ``selection`` and ``join`` keys.
+
+            :selection: specifies the fields should be returned from various tables
+            :join: specifies the tables or referenced or related tables for join
+        """
+        # don't return whole table,
+        # allow to return whole table
+        if not spec:
+            return None
+
+        selection_list = spec["selection"]
+
+        join_list = spec.get("join", None)
+
+        # flat all lists in the dictionary's value (ignore the key)
+        flist = flatten(criteria.values()) if criteria else []
+
+        query = self.session.query(*selection_list).filter(and_(*flist))
+
+        if join_list:
+            query = query.join(*join_list)
+
+        return query
+
+    def persist(self, objects=None, autocommit=False, transaction=False):
+        """
+        Persist an instance of one of the managed_classes for this manager
+
+        :param objects: list of objects to persist to the database
+        """
+        with self:  # this with statement creates a transaction commit
+            for inst in objects:
+                if not isinstance(inst, self.managed_classes):
+                    raise TypeError("A %s was asked to persist a %s" %
+                                    (self.__class__.__name__,
+                                     inst.__class__.__name__))
+
+                if inst not in self.session:
+                    self.session.add(inst)
+                    # need to handle merge needs not just add
+                else:
+                    pass  # maybe return is item is not dirty
+
+    def __enter__(self):
+        # for now we will leave the push and pop operation out...
+        self.context.push({})
+        return self
+
+    def __exit__(self, exc_type, exc_val, traceback):
+        self.context.pop()
+
+
+def class_keys(cls):
+    """T
+    his is a utility function to get the attribute names for
+    the primary keys of a class
+
+    ::
+
+        >>> class_keys(Deal)
+        ('dealer_code', 'deal_jacket_id', 'deal_id')
+    """
+    # TODO: move the import or move the function...
+    # yeah I know the import statment shouldn't be here
+    # It's presence here implies that this function should not
+    # be in this file.  The dependency seems wrong.
+    # anyone who want's to PEP 8 this faux pas is welcome
+    from sqlalchemy.orm import class_mapper
+
+    reverse_map = {}
+    for name, attr in cls.__dict__.items():
+        try:
+            reverse_map[attr.property.columns[0].name] = name
+        except Exception:
+            pass
+    mapper = class_mapper(cls)
+    return tuple(reverse_map[key.name] for key in mapper.primary_key)
+
+
+class DatabaseError(Exception):
+    """A general database error encountered by the response processor."""
+    pass
+
+
+class DatabaseTimeoutError(Exception):
+    """A database timeout error encountered by the response processor."""
+    pass
+
+
+class ParseError(Exception):
+    """A general error encountered by the response processor while parsing."""
+    pass

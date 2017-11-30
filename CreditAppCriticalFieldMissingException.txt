@@ -1,0 +1,7 @@
+from dtplatform.dtcom.credit_app.exceptions import CreditAppCriticalFieldMissingException
+
+
+# -*- coding: utf-8 -*-
+class CreditAppCriticalFieldMissingException(Exception):
+    """Raised when an essential field is missing from a credit app before it has been serialized."""
+    pass

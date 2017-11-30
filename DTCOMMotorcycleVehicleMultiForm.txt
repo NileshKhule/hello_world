@@ -1,0 +1,693 @@
+from .vehicle.forms import (
+    DTCOMMotorcycleVehicleMultiForm,
+    DTCOMVehicleMultiForm,
+)
+
+
+
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import, print_function, unicode_literals
+import itertools
+import operator
+from datetime import datetime
+from functools import partial
+
+import simplejson
+import six
+from django import forms
+from django.core.urlresolvers import reverse_lazy
+from django.forms import formset_factory
+from django.utils.translation import ugettext_lazy as _
+
+from dt_django_base.forms.base import BaseForm, IgnoreEmptyFormSet
+from dt_django_base.forms.fields import (
+    AlphaNumericField,
+    EncodedMultipleChoiceField,
+    USDecimalCurrencyField,
+)
+from dt_django_base.forms.multiform import DTMultiForm, FormAggregate
+from dt_django_base.forms.widgets import TextInputOptional
+from platform_utils.utils.dt_encoding import decode, encode_if_not_encoded
+from platform_utils.utils.string_functions import string_to_boolean
+
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.credit_app import constants
+from dtplatform.common.dtv.vehicle_options_manager import VehicleOptionsManager
+from dtplatform.core.ymmt_manager import YMMTManager
+
+from common.credit_app.vehicle.forms import (
+    MONTHLY_PAYMENT_AMOUNT,
+    TRADE_FINANCED_NAME,
+    BaseVehicleFinanceForm,
+    ChromeTradeinYMMTForm,
+    ChromeYMMTForm,
+)
+
+
+MOTORCYCLE_ASSET_TYPE_CHOICES = [
+    (vehicle_type.name, vehicle_type.value) for vehicle_type in constants.VehicleType if vehicle_type.name != 'A'
+]
+
+
+class VehicleOptionsField(EncodedMultipleChoiceField):
+    """
+    Vehicle Options Field which abstracts all json
+    data-encoding from the form.
+
+    All values are automatically json encoded and then
+    base64 encoded via super class.
+    This allows for the value to pack multiple
+    pieces of information in one value
+    which is required for vehicle options
+    (e.g. supply both global vehicle options id and description).
+
+    In addition, automatic encoding is extended to the
+    field choices. When settings choices, they can be
+    simply set to a list of vehicle options json
+    and the choice tuples will be determined automatically.
+    """
+    default_error_messages = {
+        'not_json': 'Value is not encoded as json',
+        'not_json_object': 'Value was not decoded as json object',
+        'unsupported_keys': 'Vehicle option json object has unsupported keys',
+        'missing_json_key': 'Vehicle option json is missing "{}"',
+    }
+    json_fields = {
+        'id': forms.IntegerField().clean,
+        'name': forms.CharField().clean,
+        'preselected': forms.BooleanField(required=False).clean,
+    }
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('encode', encode_if_not_encoded)
+        kwargs.setdefault('decode', partial(decode, with_indicator=True))
+
+        super(VehicleOptionsField, self).__init__(*args, **kwargs)
+
+    def _get_choices(self):
+        """
+        Required for choices property redefinition
+        """
+        return super(VehicleOptionsField, self)._get_choices()
+
+    def _set_choices(self, choices):
+        """
+        Json encode all provided choices and use choice['name']
+        as choice label.
+        """
+        if choices:
+            def is_valid(i):
+                return (isinstance(i, dict) and 'id' in i and 'name' in i)
+            if all(map(is_valid, choices)):
+                choices = map(
+                    lambda i: (encode_if_not_encoded(simplejson.dumps(i)),
+                               i['name']),
+                    choices
+                )
+            else:
+                choices = tuple()
+        super(VehicleOptionsField, self)._set_choices(choices)
+
+    # redefine property since _set_choices
+    # is overwritten
+    choices = property(_get_choices, _set_choices)
+
+    def valid_value(self, value):
+        """
+        Disable validation of each value
+        to check that it is one of the supplies choices.
+        """
+        return True
+
+    def validate(self, value):
+        """
+        Validate supplied values that all of them
+        are json encoded and have appropriate keys
+        with correctly validated data.
+        """
+        super(VehicleOptionsField, self).validate(value)
+
+        try:
+            value = map(
+                lambda i: simplejson.loads(i) if isinstance(i, six.string_types) else i,
+                value
+            )
+        except ValueError:
+            raise forms.ValidationError(self.error_messages['not_json'])
+
+        # validate presence of correct data
+        if not all(map(lambda i: isinstance(i, dict), value)):
+            raise forms.ValidationError(self.error_messages['not_json_object'])
+
+        # validate that all required json fields are present
+        for name in self.json_fields.keys():
+            if not all(map(lambda i: name in i, value)):
+                msg = self.error_messages['missing_json_key']
+                raise forms.ValidationError(msg.format(name))
+
+        # validate that no other extra fields have been provided
+        if any(map(lambda i: len(i.keys()) != len(self.json_fields.keys()),
+                   value)):
+            raise forms.ValidationError(self.error_messages['unsupported_keys'])
+
+        # validate each json value
+        for name, field in self.json_fields.items():
+            map(field, map(operator.itemgetter(name), value))
+
+    def clean(self, value):
+        """
+        Once the data is validated, decode json
+        to get the valid data.
+        """
+        value = super(VehicleOptionsField, self).clean(value)
+
+        # at this point value was validated
+        # so loading json value should be safe
+        value = map(
+            lambda i: simplejson.loads(i) if isinstance(i, six.string_types) else i,
+            value
+        )
+
+        # Apply each field clean on the parsed json
+        # to guarantee valid json has expected data-types.
+        # For example, this will guarantee that "preselected"
+        # will be a Python boolean vs "false" string
+        for v in value:
+            for name, field in self.json_fields.items():
+                v[name] = field(v[name])
+
+        return value
+
+    def to_python(self, value):
+        """
+        Overwrite super to_python in which the value
+        is not normalized to string which is necessary
+        when the provided value is not already structured
+        data (e.g. dict).
+        """
+        if not value:
+            return []
+        elif not isinstance(value, (list, tuple)):
+            raise forms.ValidationError(self.error_messages['invalid_list'])
+
+        return map(
+            lambda i: self.decode(i) if isinstance(i, six.string_types) else i,
+            value
+        )
+
+    def prepare_value(self, value):
+        """
+        Even though choices are automatically encoded,
+        when widget tries to figure out if the given
+        value should be selected (e.g. <option selected="selected"/>)
+        it compares the choice value to the field value.
+        Since however choice value is encoded,
+        field value should also be encoded to make
+        accurate comparisons.
+        """
+        if value and isinstance(value, (tuple, list)):
+            if all(map(lambda i: isinstance(i, dict), value)):
+                value = map(simplejson.dumps, value)
+        return super(VehicleOptionsField, self).prepare_value(value)
+
+
+class DTCOMVehicleOptionsFormMixin(forms.Form):
+    """
+    DTCOM mixin which adds vehicle options field to the form.
+    """
+
+    vehicle_options = VehicleOptionsField(
+        required=False,
+        label=_('Options'),
+    )
+    vehicle_options_all = VehicleOptionsField(
+        required=False,
+        widget=forms.MultipleHiddenInput,
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.deal = kwargs.pop('deal', None)
+
+        super(DTCOMVehicleOptionsFormMixin, self).__init__(*args, **kwargs)
+
+        self._populate_choices()
+        self._adjust_fields()
+
+    def _normalize_vehicle_options_choices(self, choices):
+        """
+        Normalize vehicle options choices in case there
+        generated from submitted data in which case
+        they will be base64 encoded. In that case,
+        simply running then via VehicleOptionsField
+        normalizes the data.
+        """
+        if not choices:
+            return choices
+
+        if all(map(lambda i: isinstance(i, dict), choices)):
+            return choices
+
+        def process(choice):
+            try:
+                return VehicleOptionsField().clean([choice])
+            except forms.ValidationError:
+                return []
+
+        return filter(None, itertools.chain(*map(process, choices)))
+
+    def _populate_choices(self):
+        """
+        Populate various field choices if necessary.
+        """
+        if 'vehicle_options' in self.fields:
+            # vehicle_options have been provided
+            # either via submission (self.data)
+            # or via session data (self.initial)
+            # and they need to be added as field choices
+            vehicle_options_source = None
+            key = 'vehicle_options'
+            if self.add_prefix('vehicle_options') in self.data:
+                key = self.add_prefix('vehicle_options')
+                vehicle_options_source = self.data
+            elif 'vehicle_options' in self.initial:
+                vehicle_options_source = self.initial
+
+            if vehicle_options_source:
+                options = vehicle_options_source[key]
+                if hasattr(vehicle_options_source, 'getlist'):
+                    options = vehicle_options_source.getlist(key)
+                if not isinstance(options, (tuple, list)):
+                    options = [options]
+
+                options = self._normalize_vehicle_options_choices(options)
+
+                self.fields['vehicle_options'].choices = options
+
+            # otherwise lookup existing vehicle options
+            # from db and add them as choices
+            # also, make them selected by default
+            elif getattr(self.deal, 'buy_vehicle', None):
+                vom = getManager(VehicleOptionsManager, self.context_data)
+
+                self.fields['vehicle_options'].choices = \
+                    map(VehicleOptionsManager.construct_json_from_options,
+                        vom.get_all_vehicle_options(self.deal))
+                self.initial['vehicle_options_all'] = \
+                    map(VehicleOptionsManager.construct_json_from_options,
+                        vom.get_all_vehicle_options(self.deal))
+                self.initial['vehicle_options'] = \
+                    map(VehicleOptionsManager.construct_json_from_options,
+                        vom.get_selected_vehicle_options(self.deal))
+
+    def _adjust_fields(self):
+        """
+        Adjust some fields in the form such as
+        making field disabled.
+        """
+        self.fields['trim_id'].widget.attrs.update({
+            'data-vehicle-options': 'true',
+            'data-vehicle-condition': 'input[name=condition_type]',
+            'data-vehicle-options-name': 'vehicle_options'
+        })
+
+        if self.deal:
+            self.fields['trim_id'].widget.attrs['data-vehicle-options-url'] = reverse_lazy(
+                'vehicle_options_lookup_for_credit_app',
+                kwargs={
+                    'dealjacket_id': self.deal.deal_jacket_id,
+                    'deal_id': self.deal.deal_id,
+                    'trim_id': 'trim_id',
+                })
+
+        if 'vehicle_options' in self.fields:
+            # vehicle options should be disabled
+            # and then re-enabled via js
+            self.fields['vehicle_options'].widget.attrs.update({
+                'readonly': 'readonly',
+            })
+
+    def pop_vehicle_options_fields(self):
+        """
+        Remove vehicle options fields from form.
+
+        Since vehicle options fields always normalize to
+        iterable, in some scenarios when vehicle options
+        data is not, vehicle options would be removed
+        so in those scenarios, callee can explicitly remove
+        vehicle options fields.
+        """
+        self.fields.pop('vehicle_options', None)
+        self.fields.pop('vehicle_options_all', None)
+
+
+class DTCOMVehicleFinanceForm(DTCOMVehicleOptionsFormMixin,
+                              BaseVehicleFinanceForm):
+    """
+    DTCOM-specific vehicle & finance form
+    which includes vehicle options via mixin.
+    """
+    pass
+
+
+class DTCOMMotorcycleVehicleCommonMixin(BaseForm):
+    def __init__(self, *args, **kwargs):
+        super(DTCOMMotorcycleVehicleCommonMixin, self).__init__(*args, **kwargs)
+        self.current_year = datetime.utcnow().year
+        ymmt_manager = getManager(YMMTManager, self.context_data)
+        year_choices = ymmt_manager.find_years()
+        self.year_choices = [(year, year) for year in year_choices]
+
+
+class DTCOMMotorcycleVehicleCollateralFormMixin(BaseForm):
+    vehicle_type_code = forms.ChoiceField(
+        label=_("Asset Type"),
+        required=True,
+        initial='C',
+        choices=MOTORCYCLE_ASSET_TYPE_CHOICES,
+        widget=forms.RadioSelect(attrs={})
+    )
+
+    manufacturer = forms.CharField(
+        required=True,
+        label=("Manufacturer"),
+        min_length=1,
+        max_length=25,
+    )
+
+    engine_displacement_cubic_inch_number = forms.IntegerField(
+        required=True,
+        label=("Engine Size (cc's)"),
+        min_value=1,
+        max_value=9999,
+        widget=forms.TextInput(attrs={
+            'class': 'input-mini'
+        }),
+    )
+
+    engine_cylinders_number = forms.IntegerField(
+        required=False,
+        label=("Cylinders"),
+        min_value=1,
+        max_value=99,
+        widget=TextInputOptional(attrs={
+            'class': 'input-mini',
+            'autocomplete': 'off'
+        }),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMMotorcycleVehicleCollateralFormMixin, self).__init__(*args, **kwargs)
+        self._adjust_collateral_choices()
+
+    def _adjust_collateral_choices(self):
+        """
+        Adjust some fields in the form such as
+        making field disabled.
+        """
+        self.fields['condition_type'].choices = [
+            ('NEW', 'New'),
+            ('USED', 'Used'),
+            ('CERT', 'Certified')
+        ]
+
+
+class DTCOMMotorcycleYMMTFormMixin(DTCOMMotorcycleVehicleCommonMixin, ChromeYMMTForm):
+    year_custom = forms.ChoiceField(label=_("Year"), choices=[])
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMMotorcycleYMMTFormMixin, self).__init__(*args, **kwargs)
+        self._adjust_make_model_fields()
+        del self.fields['make_id']
+        del self.fields['model_id']
+        del self.fields['year_id']
+        del self.fields['trim_id']
+        del self.fields['trim_custom']
+        self.fields['year_custom'].choices = self.year_choices
+        self.fields['year_custom'].initial = self.current_year
+
+    def _adjust_make_model_fields(self):
+        """
+        Adjust some fields in the form such as
+        making field disabled.
+        """
+        self.fields['make_custom'].required = True
+        self.fields['model_custom'].required = True
+
+    def clean(self):
+        cleaned_data = super(DTCOMMotorcycleYMMTFormMixin, self).clean()
+        # Setting custom ymmt to 1, so we can store custom ymmt in db.
+        cleaned_data['custom_ymmt'] = 1
+        cleaned_data['trade_in_custom_ymmt'] = 1
+        return cleaned_data
+
+
+class DTCOMMotorcycleVehicleTrailerMixin(DTCOMMotorcycleVehicleCommonMixin, BaseForm):
+    add_trailer = forms.ChoiceField(
+        label=_("Add a trailer?"),
+        required=False,
+        initial=False,
+        choices=[(True, 'Yes'), (False, 'No')],
+        widget=forms.RadioSelect(attrs={})
+    )
+
+    asset_new_used_code = forms.ChoiceField(
+        label=_("Condition"),
+        required=False,
+        initial='NEW',
+        choices=[('NEW', 'New'), ('USED', 'Used')],
+        widget=forms.RadioSelect(attrs={})
+    )
+
+    asset_year = forms.ChoiceField(
+        label=_("Year"),
+        choices=[],
+        required=False
+    )
+
+    asset_make = forms.CharField(
+        required=False,
+        min_length=1,
+        max_length=20,
+        label=("Make")
+    )
+
+    asset_model = forms.CharField(
+        required=False,
+        min_length=1,
+        max_length=20,
+        label=("Model")
+    )
+
+    asset_serial_number = AlphaNumericField(
+        required=False,
+        label=("Serial Number"),
+        min_length=1,
+        max_length=20,
+        widget=TextInputOptional()
+    )
+
+    asset_value = forms.IntegerField(
+        required=False,
+        label=("Value"),
+        min_value=1,
+        max_value=999999,
+        widget=TextInputOptional(attrs={
+            'class': 'input-mini',
+            'data-mask-input': 'number'
+        }),
+    )
+
+    asset_value_source = forms.CharField(
+        required=False,
+        label=("Value Source"),
+        min_length=1,
+        max_length=20,
+        widget=TextInputOptional(),
+    )
+
+    other_options = forms.CharField(
+        label=_("Other Options"),
+        max_length=560,
+        required=False,
+        widget=forms.Textarea(
+            attrs={
+                "class": "input-xlarge",
+                "cols": "10",
+                "rows": "8",
+                "maxlength": "560",
+                "placeholder": "optional"
+            }
+        )
+    )
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMMotorcycleVehicleTrailerMixin, self).__init__(*args, **kwargs)
+
+        self._adjust_trailer_fields()
+        self._adjust_trailer_choices()
+
+    def _adjust_trailer_fields(self):
+        """
+        Adjust some fields in the form such as
+        making field disabled.
+        """
+        self.fields['asset_new_used_code'].initial = 'NEW'
+
+    def _adjust_trailer_choices(self):
+        """
+        Adjust some fields in the form such as
+        making field disabled.
+        """
+        self.fields['asset_year'].choices = self.year_choices
+        self.fields['asset_year'].initial = self.current_year
+
+    def clean(self):
+        cleaned_data = super(DTCOMMotorcycleVehicleTrailerMixin, self).clean()
+        if '_save_' in self.data:
+            return cleaned_data
+
+        _clean_fields = ['asset_model', 'asset_make']
+        if string_to_boolean(cleaned_data.get('add_trailer')):
+            for field in _clean_fields:
+                if not cleaned_data.get(field):
+                    msg = self.fields[field].error_messages['required']
+                    self.add_error(field, msg)
+        return cleaned_data
+
+
+class DTCOMMotorcycleVehicleTradeInForm(DTCOMMotorcycleVehicleCommonMixin, ChromeTradeinYMMTForm):
+
+    lien_holder_number = TRADE_FINANCED_NAME
+    monthly_payment_amount = MONTHLY_PAYMENT_AMOUNT
+
+    trade_in_year_custom = forms.ChoiceField(
+        label=_("Year"),
+        choices=[],
+        required=False
+    )
+
+    trade_in_unpaid_balance_amount = USDecimalCurrencyField(
+        required=False,
+        label=("Payoff Amount"),
+        min_value=1,
+        max_value=999999,
+        widget=forms.TextInput(attrs={
+            'class': 'input-mini',
+            'data-mask-input': 'number'
+        }),
+    )
+
+    trade_in_engine_displacement_cubic_inch_number = forms.IntegerField(
+        required=False,
+        label=("Engine Size (cc's)"),
+        min_value=1,
+        max_value=9999,
+        widget=TextInputOptional(attrs={
+            'class': 'input-mini'
+        }),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMMotorcycleVehicleTradeInForm, self).__init__(*args, **kwargs)
+        self.fields['trade_in_vehicle_year_id'].initial = self.current_year
+        self.fields['trade_in_vehicle_year_id'].widget.attrs['class'] = 'mimic-ignore'
+        # remove the empty option in year_dropdown since its always required
+        self.fields['trade_in_vehicle_year_id'].choices.remove(("", ""))
+        # always sets value for custom trade in to true
+        # since there is no dropdowns for motorcycle tradein
+        self.fields['trade_in_custom_ymmt'].initial = 1
+        self.fields['trade_in_year_custom'].choices = self.year_choices
+        self.fields['trade_in_year_custom'].initial = self.current_year
+
+    def clean_trade_in_make_custom(self):
+        make = self.cleaned_data.get('trade_in_make_custom')
+        year = self.cleaned_data.get('trade_in_year_custom')
+        if '_save_' not in self.data and year and not make:
+            self.add_error('trade_in_make_custom', self.fields['trade_in_make_custom'].error_messages['required'])
+        return make
+
+    def clean_trade_in_model_custom(self):
+        model = self.cleaned_data.get('trade_in_model_custom')
+        year = self.cleaned_data.get('trade_in_year_custom')
+        if '_save_' not in self.data and year and not model:
+            self.add_error('trade_in_model_custom', self.fields['trade_in_model_custom'].error_messages['required'])
+        return model
+
+    def clean(self):
+        cleaned_data = super(DTCOMMotorcycleVehicleTradeInForm, self).clean()
+        if '_save_' in self.data:
+            return cleaned_data
+
+        if string_to_boolean(cleaned_data.get('trade_in')):
+            if not cleaned_data.get('trade_in_unpaid_balance_amount'):
+                msg = self.fields['trade_in_unpaid_balance_amount'].error_messages['required']
+                self.add_error('trade_in_unpaid_balance_amount', msg)
+        return cleaned_data
+
+
+class DTCOMMotorcycleVehicleFinanceForm(DTCOMMotorcycleVehicleCollateralFormMixin,
+                                        DTCOMMotorcycleVehicleTrailerMixin,
+                                        DTCOMMotorcycleVehicleTradeInForm,
+                                        DTCOMMotorcycleYMMTFormMixin,
+                                        BaseVehicleFinanceForm):
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMMotorcycleVehicleFinanceForm, self).__init__(*args, **kwargs)
+        self._adjust_motorcycle_fields()
+
+        if '_save_' in self.data or self.data.get('payment_call_indicator') == constants.PAYMENT_CALL_INDICATOR_YES:
+            self.fields['manufacturer'].required = False
+            self.fields['year_custom'].required = False
+            self.fields['make_custom'].required = False
+            self.fields['model_custom'].required = False
+            self.fields['engine_displacement_cubic_inch_number'].required = False
+            self.fields['asset_make'].required = False
+            self.fields['asset_model'].required = False
+            self.fields['trade_in_unpaid_balance_amount'].required = False
+
+    def _adjust_motorcycle_fields(self):
+        """
+        Adjust some fields in the form such as
+        making field disabled.
+        """
+        self.fields['msrp_amount'].required = False
+        self.fields['product_type'].choices = [('RETL', 'Retail')]
+
+    def shared_clean(self, cleaned_data, custom_ymmt_field, id_fields, name_fields):
+        """
+        For motorcycle apps, we do not need:
+            `trim_custom`,
+            `trade_in_trim_custom`
+
+        1. Motorcycle does not have the trim field.
+        2. We only use `make_custom`, `model_custom`, `year_custom` and `trade_in_year_custom`
+        If these fields are present, it will cause unneeded validation errors for fields
+        unused by motorcycle.
+        """
+        name_fields = [i for i in name_fields if i not in ['trim_custom', 'trade_in_trim_custom']]
+        return super(DTCOMMotorcycleVehicleFinanceForm, self).shared_clean(cleaned_data, custom_ymmt_field, id_fields, name_fields)
+
+
+class DTCOMVehicleMultiForm(DTMultiForm):
+    vehicle_form = FormAggregate(
+        DTCOMVehicleFinanceForm,
+        default=True,
+    )
+
+
+class DTCOMMotorcycleVehicleMultiForm(DTMultiForm):
+    vehicle_form = FormAggregate(
+        DTCOMMotorcycleVehicleFinanceForm,
+        default=True,
+    )
+    tradeins = FormAggregate(
+        formset_factory(
+            DTCOMMotorcycleVehicleTradeInForm,
+            formset=IgnoreEmptyFormSet,
+            extra=1,
+            max_num=2,
+        ),
+        default_kwargs={
+            'prefix': 'tradeins',
+        },
+    )

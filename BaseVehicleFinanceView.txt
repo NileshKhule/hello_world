@@ -1,0 +1,380 @@
+from common.credit_app.vehicle.views import BaseVehicleFinanceView
+
+
+# -*- coding: utf-8 -*-
+"""
+Credit Application - Vehicle and Finance View
+"""
+from django.conf import settings
+from django.http import HttpResponse
+
+from dt_django_base.views.base_form import ModelClass
+from platform_utils.utils.mapper import yesno
+
+from dtplatform.common import constants as platform_constants
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.dtv.dealer_bookout_manager import DealerBookoutManager
+from dtplatform.common.fusion.dealer_subscription_manager import DealerSubscriptionManager
+from dtplatform.core.constants import LENDER_USER_TYPE
+from dtplatform.core.usermanager import UserManager
+from dtplatform.core.ymmt_manager import YMMTManager
+from dtplatform.preferences.dealer_preferences_manager import DealerPreferencesManager
+
+from common.credit_app import constants
+from common.credit_app.vehicle.forms import (
+    BaseVehicleEditFinanceForm,
+    BaseVehicleFinanceForm,
+)
+from common.credit_app.views import BaseCreditAppView
+from common.desking.constants import VEHICLE_INVENTORY_PROGRAM_SUBSCRIPTION_MATERIAL_CODES
+from common.mixins.data_entry import LockCreditAppDataEntryPages
+from common.preferences.utils import get_dealer_preference_values
+from common.vehicle.mixins import YMMTMassageMixin
+from common.views.ajax_form_view import AjaxFieldValidationFormView
+from utils.views.generic.lock import DealjacketAccessMixin
+
+
+class BaseVehicleFinanceView(YMMTMassageMixin, LockCreditAppDataEntryPages, DealjacketAccessMixin, BaseCreditAppView,
+                             AjaxFieldValidationFormView):
+
+    """
+    View for Vehicle and Loan page
+    """
+    template_name = "credit_app/" + constants.VEHICLE_LOAN_TEMPLATE_NAME
+    next_route_name = constants.LENDERS_ROUTE_NAME
+    previous_route_name = constants.APPLICANT_ROUTE_NAME
+
+    @property
+    def delear_subscription_manager(self):
+        """
+        Provide DealerSubscriptionManager
+        """
+        return getManager(DealerSubscriptionManager, self.context)
+
+    def get_initial(self):
+        """Return applicant address for same as address checkbox"""
+        # We need to set initial values as we are not using any hidden form fields to set values
+        # for sales tax rate, state. we have verified existing functionality and its working as is.
+        initial = super(BaseVehicleFinanceView, self).get_initial()
+        if not hasattr(self, 'deal'):
+            self.deal = self.get_deal_jacket().active_deal
+        if not initial:
+            initial = {'validate_form': True}
+
+        initial.update(self.get_massaged_vehicle_ymmt_fields())
+        initial.update(self.set_vehicle_finance_preferences(initial))
+
+        # Hide payment call option if the user has submitted an application
+        # and if the payment call for that submitted application was set to "No"
+
+        initial['spot_con_in'] = self.deal.spot_contract_indicator
+
+        if self.request.method == 'POST':
+            return initial
+
+        dealer_bookout_manager = getManager(DealerBookoutManager, self.request.context_data)
+
+        # necessary fields for vehicle form to correctly display regb and comm state disclosures
+        # is_business determines whether disclosures logic should even be enabled
+        initial[constants.IS_BUSINESS_KEY] = yesno(self.deal.applicant_is_business, constants.IS_BUSINESS_YES, constants.IS_BUSINESS_NO)
+        if self.request.dtsession.get(constants.APPLICATION_KEY) and not self.deal.applicant_is_business:
+            if constants.APPLICANT_FORM_KEY in self.request.dtsession.get(constants.APPLICATION_KEY):
+                applicant_form_dict = self.request.dtsession[constants.APPLICATION_KEY][constants.APPLICANT_FORM_KEY]
+                initial[constants.APPLICANT_MARITAL_STATUS_CODE_KEY] = applicant_form_dict.get(constants.MARITAL_STATUS_CODE_KEY)
+                initial[constants.HAS_COAPPLICANT_KEY] = applicant_form_dict.get(constants.HAS_COAPPLICANT_KEY)
+                initial[constants.APPLICANT_US_STATE_CODE_KEY] = applicant_form_dict.get(constants.US_STATE_CODE_KEY)
+            if constants.COAPPLICANT_FORM_KEY in self.request.dtsession.get(constants.APPLICATION_KEY):
+                co_applicant_form_dict = self.request.dtsession[constants.APPLICATION_KEY][constants.COAPPLICANT_FORM_KEY]
+                initial[constants.PARTY_RELATIONSHIP_CODE_KEY] = co_applicant_form_dict.get(constants.PARTY_RELATIONSHIP_CODE_KEY)
+
+        initial[constants.APP_SUBMITTED_NAME] = self.deal.status.deal_status_code in constants.DISABLE_COAPP_STATUS
+        initial[constants.PAYMENT_CALL_INDICATOR_KEY] = self.deal.payment_call_indicator
+
+        if self.deal.disclosure_indicator == constants.DISCLOSER_COMMUNITY_STATE:
+            initial['disclosures'] = [constants.COMMUNITY_STATE_KEY]
+        elif self.deal.disclosure_indicator == constants.DISCLOSER_REGB:
+            initial['disclosures'] = [constants.REGB_KEY]
+        else:
+            initial['disclosures'] = []
+
+        initial['bookout_active'] = False
+        if self.request.dtsession.get(constants.APPLICATION_KEY):
+            vehicle_form = self.request.dtsession.get(constants.APPLICATION_KEY).get('vehicle_form')
+            if vehicle_form:
+                if constants.PAYMENT_CALL_INDICATOR_KEY in vehicle_form:
+                    initial[constants.PAYMENT_CALL_INDICATOR_KEY] = vehicle_form[constants.PAYMENT_CALL_INDICATOR_KEY]
+                else:
+                    initial[constants.PAYMENT_CALL_INDICATOR_KEY] = self.deal.payment_call_indicator
+
+                if vehicle_form.get(constants.TRADE_IN_KEY) in ('',):
+                    initial[constants.TRADE_IN_KEY] = False
+
+                # DTPRJ-18433: logic for showing ymmt fields. Set 0 for default
+                if vehicle_form.get(constants.TRADE_IN_CUSTOM_YMMT) in (0, 1, '0', '1'):
+                    initial[constants.TRADE_IN_CUSTOM_YMMT] = int(vehicle_form.get(constants.TRADE_IN_CUSTOM_YMMT))
+                else:
+                    initial[constants.TRADE_IN_CUSTOM_YMMT] = 0
+
+                external_ref = dealer_bookout_manager.get_external_ref(self.request.context_data['dealer_code'],
+                                                                       self.request.context_data['deal_jacket_id'],
+                                                                       self.request.context_data['deal_id'])
+                vehicle_data = {'vin_number': vehicle_form.get('vin_number') if vehicle_form.get('vin_number') else None,
+                                'year_id': int(vehicle_form.get('year_id')) if vehicle_form.get('year_id') else None,
+                                'make_id': int(vehicle_form.get('make_id')) if vehicle_form.get('make_id') else None,
+                                'model_id': int(vehicle_form.get('model_id')) if vehicle_form.get('model_id') else None,
+                                'trim_id': int(vehicle_form.get('trim_id')) if vehicle_form.get('trim_id') else None,
+                                'odometer': int(vehicle_form.get('odometer_number')) if vehicle_form.get('odometer_number') else None}
+                if (external_ref is not None and
+                   dealer_bookout_manager.is_bookout_active(external_ref) and
+                   not dealer_bookout_manager._bookout_data_changed(external_ref, vehicle_data)):
+                    initial['bookout_active'] = True
+
+        # reset lender_deal_update flag
+        if self.deal.status.deal_status_code not in ['NEW', 'ASAVE'] and self.session_helper.session:
+            self.session_helper.session['lender_deal_update'] = False
+            self.session_helper.session[constants.VEHICLE_ROUTE_NAME] = initial
+
+        # limit the year selection list
+        if initial.get('condition_type') and initial.get('product_type'):
+            condition_type = initial.get('condition_type')
+            if condition_type == 'USED' and initial.get('certified_indicator') == 'Y':
+                condition_type = 'CERT'
+                initial['condition_type'] = condition_type
+            ymmt_manager = getManager(YMMTManager, self.request.context_data)
+            filtered_years = ymmt_manager.find_filtered_years(
+                initial.get('product_type').upper(), condition_type.upper())
+            initial['year_choices'] = filtered_years
+
+        # Get estimated_monthly_payment from deal_finance.monthly_payment for spot lease deals.
+        if self.deal.product_type == 'LEAS' and self.deal.is_spot_contract:
+            initial['estimated_monthly_payment'] = self.deal.deal_finance.monthly_payment
+
+        return initial
+
+    def set_vehicle_finance_preferences(self, initial):
+        """
+        This method checks values previously filled for all vehicle and finance fields and if values is '' and not 0 or any,
+        it will apply preference values set by lender else it doesn't do anything, just return empty dictionary.
+        :param initial: initial values for customer vehicle and finance data
+        :returns: finance preference dictionary
+        """
+        if self.request.is_ajax():
+            return {}
+        dealer_preference_manager = getManager(DealerPreferencesManager, self.request.context_data)
+        us_state_code = ''
+        if self.request.context_data[constants.ROUTE_NAME_KEY] in [constants.DEAL_EDIT_TEXT, constants.DEAL_PROMPT_KEY]:
+            if self.deal.applicant and self.deal.applicant.customer_detail.current_address:
+                us_state_code = self.deal.applicant.customer_detail.current_address.us_state_code
+        else:
+            if self.request.dtsession.get(constants.APPLICATION_KEY):
+                if constants.APPLICANT_FORM_KEY in self.request.dtsession.get(constants.APPLICATION_KEY):
+                    us_state_code = self.request.dtsession.get(constants.APPLICATION_KEY)[constants.APPLICANT_FORM_KEY
+                                                                                          ][constants.US_STATE_CODE_KEY]
+        if not us_state_code and self.deal.applicant and self.deal.applicant.customer_detail.current_address:
+            us_state_code = self.deal.applicant.customer_detail.current_address.us_state_code
+        finance_preference_dict = {}
+        if us_state_code:
+            finance_preference_dict['sales_tax_rate'] = dealer_preference_manager.\
+                get_dealer_state_sales_tax_rate(us_state_code)
+            finance_preference_dict['sales_tax_rate_state'] = us_state_code
+
+        finance_preference_dict['front_end_fee_structure'] = dealer_preference_manager.\
+            get_dealer_vehicle_type_fee_dict(show_total=False)
+        finance_preference_dict.update(self.get_preference_values(initial or {}))
+
+        # DTPRJ-19131 (DTCOM & AHFC) Bug Fix:
+        # if following keys in finance_preference_dict  exists
+        # and they do not contain any value then do not pass them
+        # otherwise it will overwrite existing values in database.
+        to_delete_if_empty = ['sales_tax_amount', 'title_and_license_amount', 'front_end_fee_amount']
+        for field in to_delete_if_empty:
+            if field in finance_preference_dict.keys():
+                if finance_preference_dict[field] == '':
+                    finance_preference_dict.pop(field)
+
+        if self.deal.disclosure_indicator == constants.DISCLOSER_REGB:
+            finance_preference_dict['disclosure'] = constants.REGB_KEY
+        elif self.deal.disclosure_indicator == constants.DISCLOSER_COMMUNITY_STATE:
+            finance_preference_dict['disclosure'] = constants.COMMUNITY_STATE_KEY
+
+        return finance_preference_dict
+
+    def get_preference_values(self, initial):
+        """
+        method to get preference field value.
+        :param initial: initial dictionary
+        :returns: return dictionary with preference values
+        """
+        preference_dict = get_dealer_preference_values(initial, context_data=self.request.context_data)
+        if initial.get('sales_tax_amount', '') in platform_constants.EMPTY_VALUES:
+            preference_dict['sales_tax_amount'] = self.calculate_sales_tax(initial.get(constants.APPLICANT_US_STATE_CODE_KEY),
+                                                                           initial.get('cash_sell_price_amount'))
+        return preference_dict
+
+    def set_custom_ymmt_behavior(self, veh):
+        """Override the default behaviour of the vehicle custom_ymmt """
+        pass
+
+    def get_models(self):
+        """Return finance and buy vehicle"""
+        veh_fin_models = self.get_vehicle_finance_models()
+
+        deal_finance = veh_fin_models.deal_finance
+        buy_vehicle = veh_fin_models.buy_vehicle
+        vehicle = veh_fin_models.vehicle
+        deal_tradein = veh_fin_models.deal_tradein
+        tradein_vehicle = veh_fin_models.tradein_vehicle
+
+        model_classes = [ModelClass(deal_finance), ModelClass(self.deal)]
+
+        if deal_tradein:
+            model_classes.append(ModelClass(deal_tradein))
+        if tradein_vehicle:
+            model_classes.append(ModelClass(tradein_vehicle))
+        if buy_vehicle:
+            model_classes.append(ModelClass(buy_vehicle))
+        if vehicle:
+            self.set_custom_ymmt_behavior(vehicle)
+            model_classes.append(ModelClass(vehicle))
+
+        return model_classes
+
+    def get_context_data(self, **kwargs):
+        """Returns the context data."""
+        context = super(BaseVehicleFinanceView, self).get_context_data(**kwargs)
+        user_manager = getManager(UserManager, self.context)
+
+        # US61745 Enable/disable search button
+        context['inventory_button_enable'] = False
+        # US61744 inventory button should be configured
+        context['inventory_button'] = settings.ENABLE_INVENTORY if self.request.user.user_type != LENDER_USER_TYPE else None
+
+        if all([context['inventory_button'], self.delear_subscription_manager.is_subscribed_product(self.context['dealer_code'], VEHICLE_INVENTORY_PROGRAM_SUBSCRIPTION_MATERIAL_CODES)]):
+            context['inventory_button_enable'] = True
+
+        classic_user_permissions = user_manager.get_user_permission(self.context['user_code'],
+                                                                    self.context['tenant_code'],
+                                                                    date_version_number=1)
+        context['bookout_button_enable'] = not set(platform_constants.BOOKOUT_MATERIAL_CODES).isdisjoint(self.request.session['CMN']['subscriptions']) and not set(platform_constants.BOOKOUT_USER_PERMISSIONS).isdisjoint(classic_user_permissions)
+
+        return context
+
+    def form_back(self, form, **kwargs):
+        """
+        This method overides previous_route_name
+        """
+        applicant_form = self.request.dtsession.get(constants.APPLICATION_KEY).get(constants.APPLICANT_FORM_KEY)
+        app_us_state_code = applicant_form.get(constants.US_STATE_CODE_KEY, '')
+        if applicant_form.get(constants.HAS_COAPPLICANT_KEY) in [constants.STRING_TRUE, True]:
+            co_applicant_form = self.request.dtsession.get(
+                constants.APPLICATION_KEY).get(constants.COAPPLICANT_FORM_KEY)
+            coapp_us_state_code = co_applicant_form.get(constants.US_STATE_CODE_KEY, '')
+            party_relation_code = co_applicant_form.get(constants.PARTY_RELATIONSHIP_CODE_KEY)
+
+            if (((app_us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN and applicant_form.get(constants.MARITAL_STATUS_CODE_KEY) in
+                  (constants.MARITAL_STATUS_CODE_MARRIED, constants.MARITAL_STATUS_CODE_SEPARATED)) or
+                 (coapp_us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN and
+                  co_applicant_form.get(constants.MARITAL_STATUS_CODE_KEY) in (constants.MARITAL_STATUS_CODE_MARRIED, constants.MARITAL_STATUS_CODE_SEPARATED))) and
+                    party_relation_code != constants.PARTY_RELATIONSHIP_CODE_SPOUSE):
+                self.previous_route_name = constants.WISCONSIN_SPOUSE_ROUTE_NAME
+            else:
+                self.previous_route_name = constants.COAPPLICANT_ROUTE_NAME
+        elif (app_us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN and applicant_form.get(constants.MARITAL_STATUS_CODE_KEY) in
+              (constants.MARITAL_STATUS_CODE_MARRIED, constants.MARITAL_STATUS_CODE_SEPARATED)):
+            self.previous_route_name = constants.WISCONSIN_SPOUSE_ROUTE_NAME
+        return super(BaseVehicleFinanceView, self).form_back(form, **kwargs)
+
+    def calculate_sales_tax(self, state_code, cash_sell_price_amount):
+        """
+        calculating sales tax on state change
+        :param state_code: US state code
+        :param cash_sell_price_amount: Cash sell price amount for sales tax calculation
+        :returns: calculated sales tax amount if cash sell price is available else ''
+        """
+        if cash_sell_price_amount:
+            # getting dealer state sales tax
+            sales_tax_rate = getManager(DealerPreferencesManager, self.request.context_data). \
+                get_dealer_state_sales_tax_rate(state_code)
+            # calculating sales tax amount for customer state
+            sales_tax_amount = int(round((float(cash_sell_price_amount) * float(sales_tax_rate)) / 100.00))
+            return sales_tax_amount
+        return ''
+
+    def get_form_class(self):
+        """
+        Returns Form Class.
+        """
+        # method is required for ahfc to override
+        return BaseVehicleFinanceForm
+
+
+def costcalculation(request, dealjacket_id=None, deal_id=None):
+    """Method to calculate unpaid balance and capcost"""
+    calculated_value = 0
+    operation_type = request.GET.get(constants.OPERATION_KEY)
+    cash_selling_price = request.GET.get(constants.CASH_SELL_PRICE_AMOUNT_KEY)
+    cash_down = request.GET.get(constants.CASH_DOWN_AMOUNT_KEY)
+    rebate = request.GET.get(constants.REBATE_AMOUNT_KEY)
+    net_trade = request.GET.get(constants.TRADE_IN_VALUE_AMOUNT_KEY)
+
+    if cash_selling_price is None or len(cash_selling_price) is 0:
+        cash_selling_price = '0'
+    if rebate is None or len(rebate) is 0:
+        rebate = '0'
+    if net_trade is None or len(net_trade) is 0:
+        net_trade = '0'
+    if cash_down is None or len(cash_down) is 0:
+        cash_down = '0'
+
+    cash_selling_price = cash_selling_price.replace(",", "")
+    rebate = rebate.replace(",", "")
+    net_trade = net_trade.replace(",", "")
+    cash_down = cash_down.replace(",", "")
+
+    if operation_type == constants.UNPAID_TEXT:
+
+        sales_tax = request.GET.get(constants.SALES_TAX_AMOUNT_KEY)
+        t_and_l = request.GET.get(constants.TITLE_AND_LICENSE_AMOUNT_KEY)
+        front_end_fees = request.GET.get(constants.FRONT_END_FEE_AMOUNT_KEY)
+
+        if sales_tax is None or len(sales_tax) is 0:
+            sales_tax = '0'
+        if t_and_l is None or len(t_and_l) is 0:
+            t_and_l = '0'
+        if front_end_fees is None or len(front_end_fees) is 0:
+            front_end_fees = '0'
+
+        sales_tax = sales_tax.replace(",", "")
+        t_and_l = t_and_l.replace(",", "")
+        front_end_fees = front_end_fees.replace(",", "")
+
+        calculated_value = ((((int(cash_selling_price) + int(sales_tax) +
+                               int(t_and_l)) - int(cash_down)) +
+                             int(front_end_fees)) - int(rebate)) - int(net_trade)
+
+    if operation_type == constants.CAPCOST_TEXT:
+
+        acq_fee = request.GET.get(constants.ACQUISITION_FEE_AMOUNT_KEY)
+        if acq_fee is None or len(acq_fee) is 0:
+            acq_fee = '0'
+
+        acq_fee = acq_fee.replace(",", "")
+
+        calculated_value = (((int(cash_selling_price) - int(
+            cash_down)) - int(rebate)) - int(net_trade)) + int(acq_fee)
+
+    return HttpResponse(content=calculated_value, content_type='application/json')
+
+
+class BaseVehicleEditFinanceView(BaseVehicleFinanceView):
+    """
+    View for the edit deal vehicle finance page
+    """
+    template_name = "dealjacket/deal_editdeal.html"
+
+    def get_form_class(self):
+        """
+        Return the appropriate form, this is all we need to override since
+        all our necessary backend logic is kept in BaseVehicleFinanceView
+        """
+        return BaseVehicleEditFinanceForm

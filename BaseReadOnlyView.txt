@@ -1,0 +1,686 @@
+from common.credit_app.views import BaseReadOnlyView
+
+
+# -*- coding: utf-8 -*-
+"""
+Base implementation for all Credit App form_dict views
+"""
+import logging
+from collections import OrderedDict
+
+import simplejson as json
+from django.core.urlresolvers import reverse
+from django.http import HttpResponseRedirect
+from django.views.generic.base import TemplateResponseMixin
+
+from dt_django_base.utils.customer import has_wisconsin_spouse
+from dt_django_base.views.base import BaseView
+from dt_django_base.views.mixins.form_session import (
+    InvalidateSessionMixin,
+    RetainDealFormSessionMixin,
+)
+from dt_django_utils import progress_tracker as pt
+from dt_django_utils.mapper import property_mapper
+from platform_utils.utils.functools import cache_property
+
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.compliance import ComplianceManager
+from dtplatform.common.constants import FeatureCode
+from dtplatform.common.contract.constants import DocumentStatusName
+from dtplatform.common.contract.contract_manager import ContractManager
+from dtplatform.common.contract.doc_center_service_manager import DocCenterServiceManager
+from dtplatform.common.credit_app.credit_app_manager import CreditAppManager
+from dtplatform.common.decisions.base_decision_manager import BaseContractDecisionManager
+from dtplatform.common.decisions.constants import FeatureEventCode
+from dtplatform.common.fusion.customermanager import CustomerManager
+from dtplatform.common.fusion.dealer_subscription_manager import DealerSubscriptionManager
+from dtplatform.common.hook import tenant_hookable
+from dtplatform.core.constants import DocProcessingStatusCode
+from dtplatform.core.dealjacket_manager import DealJacketManager
+from dtplatform.core.models.dj.deal import CHANGED_VEHICLE
+from dtplatform.core.models.reference import Suffix
+from dtplatform.core.reference_manager import ReferenceManager
+
+from common.credit_app import constants
+from common.credit_app.common_session import CreditAppSessionMixin
+from common.dealjacket.forms import CONDITION_CHOICES, ComplianceAlertMixin
+from common.views.base_deal_form_session import BaseDealFormSessionView
+from common.views.customer_edit import BaseCustomerEditView
+
+
+def _(x):
+    return x
+
+
+log = logging.getLogger('dtweb.' + __name__)
+
+
+class BaseCreditAppView(RetainDealFormSessionMixin,
+                        CreditAppSessionMixin,
+                        ComplianceAlertMixin,
+                        BaseDealFormSessionView,
+                        BaseCustomerEditView):
+
+    """Base view"""
+    session_key = constants.APPLICATION_KEY
+    session_clear_key = constants.DEAL_ID_KEY
+    compare_with_arg = constants.DEAL_ID_KEY
+    deal_jacket = None
+    compliance_alert_called = False
+
+    app_sublinks = OrderedDict([
+        (constants.COAPPLICANT_FORM_KEY, {
+            constants.LINK_TITLE_KEY: constants.COAPPLICANT_LINK_TITLE,
+            constants.HIDE_ITEM_KEY: True}),
+        (constants.WISCONSIN_SPOUSE_ROUTE_NAME, {
+            constants.LINK_TITLE_KEY: constants.WISCONSIN_SPOUSE_LINK_TITLE,
+            constants.HIDE_ITEM_KEY: True})
+    ])
+
+    lender_sublinks = OrderedDict([
+        (constants.PROGRAM_ROUTING_KEY, {
+            constants.LINK_TITLE_KEY: constants.PROGRAM_ROUTING_LINK_TITLE,
+            constants.HIDE_ITEM_KEY: False})
+    ])
+
+    top_level_routes = OrderedDict([
+        (constants.APPLICANT_FORM_KEY, {
+            constants.LINK_TITLE_KEY: constants.APPLICANT_LINK_TITLE,
+            constants.SUB_LINKS_KEY: app_sublinks}),
+        (constants.VEHICLE_FORM_KEY, {
+            constants.LINK_TITLE_KEY: constants.VEHICLE_FINANCE_LINK_TITLE}),
+        (constants.LENDERS_FORM_KEY, {
+            constants.LINK_TITLE_KEY: constants.SELECT_LENDERS_LINK_TITLE,
+            constants.SUB_LINKS_KEY: lender_sublinks}),
+    ])
+
+    @cache_property
+    def dealjacket_manager(self):
+        return getManager(DealJacketManager, self.request.context_data)
+
+    @cache_property
+    def credit_app_manager(self):
+        return getManager(CreditAppManager, self.request.context_data)
+
+    def get_deal_jacket(self):
+        """ Retrieves the deal jacket based on the given deal_jacket_id
+
+        Return:
+            ``DealJacket``
+        """
+        if not self.deal_jacket:
+            self.dealjacket_id = self.request.context_data['deal_jacket_id']
+            self.deal_jacket = self.dealjacket_manager.get_dealjacket(self.dealjacket_id)
+
+        return self.deal_jacket
+
+    def get_form_kwargs(self):
+        """to test request to kwargs"""
+        kwargs = super(BaseCreditAppView, self).get_form_kwargs()
+        kwargs['context_data'] = self.request.context_data
+        kwargs['is_ajax'] = self.request.is_ajax()
+        kwargs['user_type'] = self.request.user.user_type
+        return kwargs
+
+    def get_context_data(self, **kwargs):
+        context_data = super(BaseCreditAppView, self).get_context_data(**kwargs)
+        context_data['feature_header'] = 'Credit Application'
+        if self.deal.spot_contract_indicator == 'Y':
+            context_data['feature_header'] = 'Spot Credit Application'
+
+        # Universal method which all inheriting credit app pages will call at some point. Any page
+        # is able to show the privacy policy alert.
+        self.show_compliance_alerts()
+        return context_data
+
+    def get(self, request, *args, **kwargs):
+        """Common checks across CA views"""
+        # Send back to Applicant form if session is not initialized and
+        # we are in some other view e.g. Select Lenders
+        # Note that this will change once we impl Update Payment Call or Submit
+        # to other lenders
+        response = super(BaseCreditAppView, self).get(request, *args, **kwargs)
+
+        if self.deal.credit_app_complete and \
+                self.session_helper.session.get('edit_application_id') != str(self.deal.deal_id):
+            self.session_helper.session['edit_application_id'] = str(self.deal.deal_id)
+            self.request.session.modified = True
+
+            # updating progress tracker
+            self.update_progress_tracker()
+            self.request.session.modified = True
+            return self.render_to_response(dict(response.context_data))
+
+        if (self.deal.dealjacket.is_viewonly and
+                not request.dtsession.get(constants.APPLICATION_KEY).get('edit_application_id')):
+            return HttpResponseRedirect(reverse(constants.VIEW_APPLICATION_ROUTE_NAME,
+                                                args=[self.dealjacket_id, self.deal_id]))
+        else:
+            return response
+
+    def update_progress_tracker(self):
+        """ Updating progress tracker in case of edit application.
+
+        This is called from `get()'.
+        """
+        tracker = self.session_helper.session['progress_tracker']
+        # this is temporary solution, we should have method in parent view
+        # class which returns previous route name.  Currently we have all
+        # logic in form_back method to get conditional previous_route_name,
+        # it can be separated.
+        previous_route_names = [constants.APPLICANT_ROUTE_NAME,
+                                constants.COAPPLICANT_ROUTE_NAME,
+                                constants.WISCONSIN_SPOUSE_ROUTE_NAME,
+                                constants.VEHICLE_ROUTE_NAME,
+                                constants.LENDERS_ROUTE_NAME]
+
+        def show_hide_check(coapplicant, wisconsin_spouse):
+            to_hide = []
+            to_show = []
+
+            if coapplicant:
+                to_show.append('co_applicant_form')
+            else:
+                to_hide.append('co_applicant_form')
+
+            if wisconsin_spouse:
+                to_show.append('wisconsin_spouse_form')
+            else:
+                to_hide.append('wisconsin_spouse_form')
+
+            return (to_show, to_hide)
+
+        # Hyperlink the previous step
+        for previous_route_name in previous_route_names:
+            for item, value in tracker.items():
+                if item == previous_route_name:
+                    value['link_url'] = self.request.build_absolute_uri(
+                        reverse(previous_route_name,
+                                args=[self.dealjacket_id, self.deal_id]))
+                elif 'sub_links' in value:
+                    for key, val in value['sub_links'].items():
+                        if key == previous_route_name:
+                            val['link_url'] = self.request.build_absolute_uri(
+                                reverse(previous_route_name,
+                                        args=[self.dealjacket_id, self.deal_id]))
+                            value['link_selected'] = True
+
+        to_show, to_hide = show_hide_check(self.deal.has_coapplicant,
+                                           has_wisconsin_spouse(self.request.dtsession))
+        pt.hide_items(tracker, to_hide)
+        pt.show_items(tracker, to_show)
+        self.session_helper.session['progress_tracker'] = tracker
+
+    def get_application_form_data(self, form_class, model_classes=None):
+        """
+        Method to get application data in dictionary
+        """
+        model_classes = model_classes or []
+        application_data = {}
+        for model_class in model_classes:
+            property_mapper(model_class.model, form_class,
+                            application_data, model_class.prefix)
+        return application_data
+
+    def get_success_url(self):
+        """
+        Returns deal jacket summary URL
+        """
+        redirect_to_route = None
+        if '_save_' in self.request.POST:
+            redirect_to_route = self.request.context_data.get('route_name')
+        if constants.REDIRECT_ROUTE_NAME in self.request.common:
+            redirect_to_route = self.request.common.get(constants.REDIRECT_ROUTE_NAME)
+            if '_new_' in self.request.POST and not redirect_to_route == "lender_comparison":
+                redirect_to_route = None
+            else:
+                del(self.request.common[constants.REDIRECT_ROUTE_NAME])
+        if not redirect_to_route == "deal_edit":
+            if redirect_to_route:
+                if redirect_to_route == 'detail':
+                    # detail route name is to redirect to decision details screen for a specific lender
+                    if self.deal.credit_app and len(self.deal.credit_app) == 1:
+                        return reverse(redirect_to_route, args=[self.dealjacket_id, self.deal.deal_id,
+                                                                self.deal.credit_app[0].cp_id])
+                    else:
+                        # deal with multiple apps should not have detail as route name
+                        raise ValueError('Incorrect route name for decision details url redirect.',
+                                         self.deal.deal_id)
+
+                else:
+                    return reverse(redirect_to_route, args=[self.dealjacket_id, self.deal.deal_id])
+            if self.deal.dealjacket.is_viewonly or self.deal.credit_app_complete:
+                return reverse(constants.VIEW_APPLICATION_ROUTE_NAME,
+                               args=[self.dealjacket_id, self.deal.deal_id])
+        return reverse(constants.DEALJACKET_SUMMARY_ROUTE_NAME, args=[self.dealjacket_id])
+
+    def form_valid(self, form):
+        """
+        Form Valid method
+        """
+        # Find major deal changes
+        if constants.HTTP_POST_UPDATE_TEXT in self.request.POST:
+            # Update the current deal
+            pass
+        elif constants.HTTP_POST_NEW_TEXT in self.request.POST:
+            # Create a new deal
+            with self.dealjacket_manager.session.begin_nested():
+                if self.request.dtsession.get(constants.APPLICATION_KEY).get(
+                        'edit_application_id'):
+                    self.deal = self.dealjacket_manager.copy_deal(self.deal, change_deal_status=True)
+                else:
+                    self.deal = self.dealjacket_manager.copy_deal(self.deal)
+        else:
+            # Look for changes
+            with self.dealjacket_manager.session.begin_nested():
+                changes = set([])
+                dict_data = [val for key, val in self._form_data.items() if isinstance(val, dict)]
+                # by combining these all into one, we can conveniently re-query to find the exact changes
+                combined_dict_data = {}
+                for d in dict_data:
+                    combined_dict_data.update(d)
+                changes.update(self.deal.get_major_changes(combined_dict_data))
+
+                # Eliminate CHANGED_VEHICLE changes if prior vehicle is blank
+                if CHANGED_VEHICLE in changes:
+                    underlying_changes = self.deal.vehicle_changed(combined_dict_data)
+                    # the vehicle_changed method converts everything to a string, so we need to take account of None values
+                    if underlying_changes and all((not obj_data or (obj_data == 'None'))
+                                                  for obj_data, data_data in underlying_changes):
+                        changes.remove(CHANGED_VEHICLE)
+
+                # Don't redirect if we came here from a Deal Edit page.
+                # In the future, we might want to show the Deal Prompt
+                if changes and (self.request.context_data.get(constants.ROUTE_NAME_KEY) !=
+                                constants.DEAL_EDIT_KEY):
+                    # Ask the user whether to create a new deal or update
+                    self.form_session = form.cleaned_data
+                    self.request.common[constants.REDIRECT_ROUTE_NAME] = self.request.context_data.get(
+                        'route_name', constants.VEHICLE_ROUTE_NAME)
+                    self.session_helper.session[constants.CHANGES_KEY] = changes
+                    return HttpResponseRedirect(reverse(
+                        constants.CA_PROMPT_ROUTE_NAME,
+                        args=[self.deal.deal_jacket_id, self.deal.deal_id]))
+
+        return super(BaseCreditAppView, self).form_valid(form)
+
+    def _check_coapplicant(self, customer, party_relationship_code):
+        ''' check if the save customer (co applicant) is different from deal coapplicant
+            if so delete old coapp and add the new coapp to the deal
+        '''
+        if self.deal.coapplicant.cc_id != customer.cc_id:
+            self.credit_app_manager.remove_deal_coapplicant(self.deal)
+            djmanager = getManager(DealJacketManager, self.request.context_data)
+            djmanager.add_coapplicant(self.deal, customer, party_relationship_code)
+
+    def _get_form_dict_for_save(self, form_dict):
+        """
+        Hook for adjusting form_dict collected across all forms within credit
+        app wizard just before saving data.
+
+        This hook is useful because it removes invalid forms from form_dict
+        as to not cause errors while saving credit app.
+        Here is example flow where it is necessary.
+
+        1. Full app is created and submitted
+        2. Via "Edit"->"Add Coapplicant", coapp is added with minimal information
+        3. Going to "Application" shows that application is out-of-date
+        4. "Edit" button redirect to coapp page asking user to fix form errors
+        5. Instead of fixing errors, user goes back to app page via "Back" button
+        6. User tries to save credit app
+
+        If any form errors are present there is a possibility that while saving
+        app page, saving will fail due to errors on coapp page.
+        This hook detects that and in that case removes coapp page from
+        ``form_dict`` hence allowing app saving to succeed.
+
+        Args:
+            form_dict (dict): Form dictionary where are keys are route names
+                for all pages within the wizard and values are validated data for
+                each page
+
+        Returns:
+            (dict) Form dictionary to be used for saving credit app
+        """
+        try:
+            error_route = self.session_helper.session.get('error_on_route')
+        except AttributeError:
+            # in case session is not setup which results in
+            # 'NoneType' object has no attribute 'get'
+            error_route = None
+
+        if error_route and not self.should_remove_error_route(error_route):
+            form_dict = form_dict.copy()
+            form_dict.pop(error_route, None)
+
+        return form_dict
+
+    @tenant_hookable
+    def save(self, form_dict):
+        """
+        Common Save implementation. Session data keys are same as route names
+        Applicant page: applicant_form
+        Vehicle/Finance page: vehicle_form
+        Lenders page: lenders_form
+        and so on...
+        e.g. applicant_data = form_dict['applicant_form']
+
+        *** Consolidates all form saves across views. This is first cut
+        refactoring. Need further improvements in actual create/update
+        API methods ***
+        """
+        if self.deal.is_spot_contract:
+            # Save applicant marital status
+            applicant_form = form_dict.get('applicant_form')
+
+            if not applicant_form.get('marital_status_code'):
+                customer_sensitive = self.deal.applicant.customer_detail.customer_sensitive
+                applicant_form['marital_status_code'] = customer_sensitive.marital_status_code if customer_sensitive else None
+
+            if self.deal.has_coapplicant:
+                # Save co-applicant marital status
+                co_applicant_form = form_dict.get('co_applicant_form')
+
+                if not co_applicant_form.get('marital_status_code'):
+                    customer_sensitive = self.deal.coapplicant.customer_detail.customer_sensitive
+                    co_applicant_form['marital_status_code'] = customer_sensitive.marital_status_code if customer_sensitive else None
+
+        form_dict = self._get_form_dict_for_save(form_dict)
+
+        # pre-compute all necessary variables for the manager
+        # from entities manager does not have access to such as
+        # POST data or sessions
+        # TODO: refactor the credit app saving logic
+        #       where it does not depend on external resources
+        try:
+            lender_deal_update_indicator = self.session_helper.session.get('lender_deal_update', False)
+            customer_updated_indicator = self.session_helper.session.get('customer_updated_indicator', 'N')
+            payment_call_changed = self.session_helper.session.get('payment_call_changed', False)
+        except AttributeError:
+            lender_deal_update_indicator = None
+            customer_updated_indicator = 'N'
+            payment_call_changed = False
+
+        extra = {
+            'edit_vehicle': (
+                self.request.common.get(constants.REDIRECTED_FROM_KEY, '') == constants.EDIT_VEHILCE_FORM_TEXT),
+            'new_vehicle': (
+                self.request.dtsession
+                .get(constants.EDIT_VEHICLE_KEY, {})
+                .get(constants.DEALJACKET_EDIT_VEHICLE_KEY)),
+            'new_deal': (
+                constants.HTTP_POST_NEW_TEXT in self.request.POST),
+            'update_deal': (
+                constants.HTTP_POST_UPDATE_TEXT in self.request.POST),
+            'edit_application_id': (
+                bool(self.request.dtsession
+                     .get(constants.APPLICATION_KEY, {})
+                     .get('edit_application_id'))),
+            'lender_deal_update': lender_deal_update_indicator,
+            'customer_updated_indicator': customer_updated_indicator
+        }
+
+        # TODO(mikew) This passes several `django.utils.functional.__proxy__`s
+        # TODO(mikew) to the manager, which should need know nothing about them.
+        # TODO(mikew) Delete the progress tracker (which contains these)?
+        form_dict, deal, new_dealjacket = self.credit_app_manager.save(
+            form_dict, self.deal, self.get_new_cc_id(), extra
+        )
+        # cleanup
+        if new_dealjacket:
+            self.request.context_data['dealjacket_id'] \
+                = self.dealjacket_id \
+                = new_dealjacket.deal_jacket_id
+            self.deal = new_dealjacket.active_deal
+            self.request.context_data['deal_id'] \
+                = self.deal_id \
+                = self.deal.deal_id
+
+        if all((constants.VEHICLE_FORM_KEY in form_dict,
+                self.deal.payment_call_indicator == constants.PAYMENT_CALL_INDICATOR_YES,
+                self._form_data.get('vehicle_form', {}).get('make_id'))):
+            self.request.dtsession[constants.PAYMENT_CALL_UPDATE_KEY] = \
+                constants.PAYMENT_CALL_INDICATOR_YES
+
+        if extra['edit_vehicle']:
+            self.request.common[constants.REDIRECTED_FROM_KEY] = None
+            if constants.EDIT_VEHICLE_KEY in self.request.dtsession:
+                del self.request.dtsession[constants.EDIT_VEHICLE_KEY]
+
+        if form_dict.get('applicant_form', None):
+            cmp_manager = getManager(ComplianceManager, self.request.context_data)
+            cmp_manager.save_compliance_event(form_dict['applicant_form'].get('acquired_privacy_policy', None), FeatureEventCode.PrivacyPolicyGiven)
+
+        dj_manager = getManager(DealJacketManager, self.request.context_data)
+        dj_manager.set_payment_call_changed_indicator(self.deal, payment_call_changed)
+
+        if self.deal.is_spot_contract:
+            self._update_credit_app_document_status(new_document_status=DocumentStatusName.UPDATED,
+                                                    new_processing_status=DocProcessingStatusCode.CONTINUE)
+
+        dj_manager.session.flush()
+
+        return form_dict
+
+    def _update_credit_app_document_status(self, new_document_status, new_processing_status):
+        """
+        Calls the doc center service manager to update credit application according to the
+        provided status.
+        Process will skip if updating same new_processing_status.
+
+        Args:
+            new_document_status(string): document status to be updated.
+            new_processing_status(string): document processing status to be updated.
+
+        Returns:
+            None
+        """
+        try:
+            contract_manager = getManager(ContractManager, self.context)
+            credit_application = contract_manager.get_document(self.dealjacket_id, doc_type="credit_application")
+
+            if credit_application and credit_application['processing_status_cd'] != new_processing_status:
+                payload = json.dumps({
+                    'new_document_status': new_document_status,
+                    'new_processing_status': new_processing_status
+                })
+                doc_center_manager = getManager(DocCenterServiceManager, self.context)
+                doc_center_manager.update_documents_status_by_document_index_id(
+                    credit_application.get('document_index_id'),
+                    payload
+                )
+        except Exception as exception:
+            log.error("DigiCon: Credit Application document status update failed with error {} "
+                      "Deal Jacket Id={}".format(exception, self.dealjacket_id),
+                      extra=self.request.context_data)
+
+    def get_compare_with_value(self):
+        """Return value to check for clearing session on re-entry"""
+        return self.deal_id
+
+    def get_cc_id(self):
+        """returns cc_id of applicant from the current deal"""
+        for deal_customer in self.deal.customers:
+            if deal_customer.deal_applicant_type_code == constants.APPLICANT_TYPE_APPLICANT:
+                return deal_customer.cc_id
+
+    def get_coapp_cc_id(self):
+        """returns co app cc_id of applicant from the current deal"""
+        for deal_customer in self.deal.customers:
+            if deal_customer.deal_applicant_type_code == constants.APPLICANT_TYPE_COAPPLICANT:
+                return deal_customer.cc_id
+
+    def force_complete_validation_on_save(self):
+        """
+        Returns True if the application is opened in Edit mode
+        """
+        return True if self.request.dtsession.get('application') and \
+            self.request.dtsession.get('application').get('edit_application_id') else False
+
+    def show_compliance_alerts(self):
+        """
+        Currently one type of compliance alert is shown in the credit app. CompliancePopupMixin handles logic.
+        """
+        if self.request.session['CMN'].get('compliance_subscription') and not self.compliance_alert_called:
+            self.compliance_alert_called = True
+            url = reverse('ca_compliance_modal_view', args=[self.context['dealjacket_id'],
+                                                            self.context['deal_id']])
+            self.show_privacy_policy_alert(self.request, url, self.context['dealjacket_id'])
+
+
+class BaseReadOnlyView(CreditAppSessionMixin, InvalidateSessionMixin, TemplateResponseMixin, BaseView):
+    """This view handles the read only feature of Credit App"""
+
+    should_redirect_to_error_page = False
+    session_key = constants.APPLICATION_KEY
+    session_clear_key = constants.DEAL_ID_KEY
+    compare_with_arg = constants.DEAL_ID_KEY
+
+    def get(self, request, *args, **kwargs):
+        """get method for base view only page"""
+        return self.view_only_application(request, args, kwargs)
+
+    @property
+    def dealer_subscription_manager(self):
+        return getManager(DealerSubscriptionManager, self.request.context_data)
+
+    def get_salary_type(self, request, dealjacket_customer):
+        """
+        Given a DealJacket Customer it returns the correct salary type name.
+        For example if dealjacket customer has salary_type_code u'A', the
+        salary type returned is Annually.
+        """
+        reference_manager = getManager(ReferenceManager, request.context_data)
+        # Business Applicants have no customer_sensitive attribute so check it.
+        customer_sensitive = getattr(dealjacket_customer, 'customer', None) and \
+            getattr(dealjacket_customer.customer, 'customer_sensitive', None)
+
+        if customer_sensitive and customer_sensitive.salary_type_code:
+            return reference_manager.get_salary_type_name(dealjacket_customer.customer.customer_sensitive
+                                                          .salary_type_code)
+        return None
+
+    def get_spouse_salary_type(self, request, deal_customer_spouse):
+        """
+        Takes in a DealJacket customer spouse and returns the salary type name
+        """
+        reference_manager = getManager(ReferenceManager, request.context_data)
+        return reference_manager.get_salary_type_name(deal_customer_spouse[0].salary_type_code) if deal_customer_spouse\
+            else None
+
+    def view_only_application(self, request, *args, **kwargs):
+        """
+        Rendered when deal jacket is view only
+        """
+        custmanager = getManager(CustomerManager, request.context_data)
+        djmanager = getManager(DealJacketManager, request.context_data)
+        dealjacket = djmanager.get_dealjacket(request.context_data["deal_jacket_id"])
+        self.dealjacket_id = dealjacket.deal_jacket_id
+        self.deal = deal = dealjacket.active_deal
+
+        self.trigger_session_repopulation()
+
+        app_spouse_salary_type = None
+        if deal.applicant.deal_customer_spouse:
+            app_spouse_salary_type = self.get_spouse_salary_type(request, deal.applicant.deal_customer_spouse)
+
+        co_applicant_salary_type = None
+        co_app_spouse_salary_type = None
+        show_marital_status_co_app = None
+        if deal.has_coapplicant:
+            co_applicant_salary_type = self.get_salary_type(request, deal.coapplicant.dealjacket_customer)
+            co_app_spouse_salary_type = self.get_spouse_salary_type(request, deal.coapplicant.deal_customer_spouse)
+            # only show the coapp marital status if they are from Wisconsin and are not the applicant's spouse.
+            co_app_in_spouse_req_state = custmanager.check_applicant_in_cp_state(deal.coapplicant, spouse_req_states_only=True)
+            show_marital_status_co_app = co_app_in_spouse_req_state and not deal.coapplicant.party_relationship_code == 'S'
+
+        if constants.APPLICATION_KEY in self.request.dtsession:
+            if 'lender_deal_update' in self.request.dtsession[constants.APPLICATION_KEY]:
+                del self.request.dtsession[constants.APPLICATION_KEY]['lender_deal_update']
+            if 'customer_updated_indicator' in self.request.dtsession[constants.APPLICATION_KEY]:
+                del self.request.dtsession[constants.APPLICATION_KEY]['customer_updated_indicator']
+            self.request.session.modified = True
+
+        is_data_entry_allowed = True
+        if self.dealer_subscription_manager.is_dealer_contract_subscribed():
+            is_data_entry_allowed = djmanager.is_data_entry_allowed(feature_code=FeatureCode.CreditDecision)
+        else:
+            is_data_entry_allowed = self.deal.status.name not in ('Contract Complete', 'Contract In Transit')
+
+        base_contract_dec_mgr = getManager(BaseContractDecisionManager, request.context_data)
+        contracts = base_contract_dec_mgr.get_contract(self.deal.dealer_code, self.deal.deal_jacket_id, self.deal.deal_id, cp_id=None, query_obj=False)
+
+        # for a lender user - after dealer impersonation - need to fetch login lender specific app
+        filtered_deal_apps = deal.recent_credit_apps
+        if self.request.context_data.get('dealer_impersonation_mode', False):
+            filtered_deal_apps = [app for app in deal.recent_credit_apps if app.cp_id == self.request.context_data['partner_code']]
+
+        context = {constants.TEXT_HEADER_KEY: constants.VIEW_CREDIT_APP_TEMPLATE_HEADER,
+                   constants.DEAL_KEY: deal,
+                   constants.DEALJACKET_ID_KEY: dealjacket.deal_jacket_id,
+                   'route_name_with_error': self.session_helper.session.get('error_on_route'),
+                   'show_edit_link': self.session_helper.session.get('error_on_route') is None and is_data_entry_allowed,
+                   'condition_choices': {k: v for k, v in CONDITION_CHOICES},
+                   'suffix': dict(Suffix.choices()),
+                   'applicant_salary_type': self.get_salary_type(request, deal.applicant.dealjacket_customer),
+                   'co_applicant_salary_type': co_applicant_salary_type,
+                   'app_spouse_salary_type': app_spouse_salary_type,
+                   'co_app_spouse_salary_type': co_app_spouse_salary_type,
+                   'show_marital_status_applicant': custmanager.check_applicant_in_cp_state(deal.applicant, spouse_req_states_only=True),
+                   'show_marital_status_co_app': show_marital_status_co_app,
+                   'contract_on_deal': bool(contracts),
+                   'filtered_deal_apps': filtered_deal_apps}
+
+        self.template_name = 'credit_app/' + constants.VIEW_APPLICATION_TEMPLATE_NAME
+        return self.render_to_response(context)
+
+    def should_repopulate_session(self):
+        """
+        Custom overwrite for repopulate session on this view to accomodate custom flows affecting this view
+
+        Normally session is repopulated when:
+
+        * DJ is switched so DJ ID collision occurs and session is cleared
+        * Session has no data related to DJ so it needs to be populated
+
+        As a result of those, session is **NOT** repopulated when:
+
+        * User navigates from one of the wizard pages to the application page.
+          In that case DJ ID is the same and session alraedy has data about the DJ
+          hence session is not cleared.
+
+        That brings us to the special cases. We have some flows where user prefills all
+        of the wizard pages and yet the user bypasses the application view.
+        For example when importing preapproval app, all data is inserted and user is nagivated
+        directly to the applicant wizard page. While doing that couple of things happen:
+
+        * When navigating first to the applicant page, session is repopulated
+        * Since session data is never populated for the page you are on,
+          applicant page data is not repopulated
+        * Assuming any other wizard page contains errors, ``error_on_route`` within
+          session will then point to that other page regardless if the error is also
+          present on the applicant page since its session was never repopulated.
+
+        Now the issue happens if the user will navigate to the application view without
+        fixing the error on the applicant page. Since application view is within the same DJ,
+        session information will be preserved but at that point error page will point to the
+        wrong error page. To solve that we need to flush session information on application page
+        whenever error is present within the session regardless if session data is already loaded
+        for the same DJ since we have no guarantee that the session information will be up to date.
+        This does incur some performance penalty however by only flushing session when errors
+        are present, in most cases it should not impact users in any special way.
+
+        Returns:
+            (bool) if the session should be cleared for the applciation view
+                considering all logic from base classes as well as special flow cases
+                for application view.
+        """
+        should_repopulate = super(BaseReadOnlyView, self).should_repopulate_session()
+
+        if should_repopulate:
+            return should_repopulate
+
+        if self.session_helper.session.get('error_on_route'):
+            return True
+
+        return should_repopulate

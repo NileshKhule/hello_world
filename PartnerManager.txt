@@ -1,0 +1,1403 @@
+from dtplatform.common.fusion.partner_manager import PartnerManager
+
+
+
+# -*- coding: utf-8 -*-
+"""
+dealer_partner_manager provides APIs to get partners and  partner settings
+"""
+import base64
+import itertools
+from itertools import chain
+from warnings import warn
+
+import simplejson as json
+import six
+from dateutil import parser
+from sqlalchemy import and_, asc
+from sqlalchemy.orm import contains_eager, joinedload
+from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.sql import func
+
+from platform_utils.utils.dt_datetime import get_utc_datetime
+from platform_utils.utils.functools import guard
+
+from dtplatform.common.base_manager import BaseManager, getManager
+from dtplatform.common.constants import SubfeatureCode
+from dtplatform.common.credit_app import constants as ca_constants
+from dtplatform.common.decisions import constants as decision_constants
+from dtplatform.conf import settings
+from dtplatform.core import constants
+from dtplatform.core.caching_manager import caching
+from dtplatform.core.models.classic.decision_codes import DecisionCodes
+from dtplatform.core.models.cp.dealer_partner import DealerPartner
+from dtplatform.core.models.cp.feature_certificate import FeatureCertificate
+from dtplatform.core.models.cp.partner import Partner
+from dtplatform.core.models.cp.partner_feature_connection import PartnerFeatureConnection
+from dtplatform.core.models.cp.partner_json_subfeature import PartnerJsonSubfeature
+from dtplatform.core.models.cp.partner_profile import PartnerProfile
+from dtplatform.core.models.cp.rbp_supported_score_model import RBPSupportedScoreModel
+from dtplatform.core.models.reference import (
+    ConnectionEnvironment,
+    Feature,
+    Subfeature,
+)
+from dtplatform.utils import dt_json
+
+
+PARTNER_TYPE = "BUREAU"
+
+
+class PartnerManager(BaseManager):
+
+    cache_pattern = settings.CACHE_PATTERN_PARTNER
+
+    """
+    Partner class has various APIs for supporting information related
+    Partner entity in DT.
+    """
+    def get_contract_feature_status_code(self, decision_code, cp_id, previous_feature_code=None):
+        json_settings = self.get_partner_subfeature_setting(cp_id, SubfeatureCode.CREDIT_DECISIONS)
+
+        feature_status_code = json_settings.get('decision_codes', {}).get('C', {}).get(
+            decision_code, decision_constants.DecisionStatusCode.PendingDecisionCode)
+
+        # In case of cancel we need to set feature status code according to previous feature status
+        if previous_feature_code and feature_status_code == decision_constants.DecisionStatusCode.CancelDecisionCode:
+            feature_status_code = decision_constants.DIGI_CON_CANCEL_FEATURE_STATUS_MAPPING\
+                .get(previous_feature_code, decision_constants.DecisionStatusCode.PendingDecisionCode)
+        return feature_status_code
+
+    def get_partners_for_dealer(self, partner_type=None, status_code=None):
+        """Get a list of Partner objects associated with the current
+        dealer.  Optionally filter by partner type code & status code.
+
+        :param partner_type: string indicating partner type.
+            Possible values include:
+                AGENCY
+                AMP
+                BUREAU
+                DMS
+                LENDER
+                TPP
+                VTP
+        :returns: list of results.
+
+        Written to address deficiencies in the other 17 implementations
+        of this feature.
+        """
+        dealer_code = self.context['dealer_code']
+        criteria = {
+            "DealerPartner": [DealerPartner.dealer_code == dealer_code],
+        }
+
+        if status_code:
+            criteria['DealerPartner'].append(DealerPartner.status_code == status_code)
+
+        if partner_type:
+            criteria.update({
+                "Partner": [Partner.partner_type_code == partner_type,
+                            Partner.partner_status_code == 'ACTV']
+            })
+
+        spec = {
+            "selection": [Partner],
+            "join": [DealerPartner]
+        }
+
+        query = self.get(criteria, spec)
+
+        return query.order_by(func.lower(Partner.long_name))
+
+    def has_own_verification_engine(self, partner_id):
+        """
+         check whether lender has verification engine or not.
+        Args:
+            partner_id(str): Partner Id
+
+        Returns:
+            It will return True if lender have it's own verification engine otherwise False
+        """
+        # TODO for now we don't have any setting so returning True always.
+        return True
+
+    def get_partner_legacy_id(self, partner_id):
+        """Get the legacy_id for a given partner, given the
+        context's fusion product code.
+        :param partner_id: Partner's cpid
+        :returns: legacy id or None
+        """
+        try:
+            return self.get_partner_profile_by_cp_id(partner_id).legacy_id
+        except NoResultFound:
+            self.log.error(
+                "get_partner_legacy_id could not find a PartnerProfile for {}"
+                .format(partner_id)
+            )
+
+        return None
+
+    def does_support_elite2_0(self, lender_id):
+        """
+         check whether lender support elite 2.0 or not
+        Args:
+            lender_id(str): Lender Id
+
+        Returns:
+            It will return True if lender support elite 2.0 otherwise False
+        """
+        return False if constants.DEFAULT_TENANT_CODE == self.context.get('tenant_code') else True
+
+    """
+    Here be dragons.
+
+    http://10.134.8.13:8080/browse/DTPRJ-13870
+    """
+
+    def get_partners_by_dealer_code(self, dealer_code, partner_type=None, fusion_prod_code=None):
+        """Returns the tuple list of Partner and PartnerProfile for the given the dealer
+        Args:
+            dealer_code (int):
+            partner_type (str): Optional partner type
+            fusion_prod_code (str): Optional fusion prod code
+        Returns:
+            List of (Partner, PartnerProfile) tuples
+        """
+        if not dealer_code:
+            raise ValueError('Invalid Dealer Code')
+
+        partner_ids = self.get_dealer_partner_ids(dealer_code, partner_type, fusion_prod_code)
+
+        if partner_ids:
+            return self.get_partner_by_ids(partner_ids, fusion_prod_code=fusion_prod_code)
+
+    def get_partners_by_dealer_codes(self, dealer_codes, partner_type=None, partner_objects=False):
+        """
+        Returns the tuple list of Partner objects for the given the dealer
+        code list in the following format (PARTNERID,PARTNERLONGNAME).
+
+        This method is used in the App Status page left filter to display
+        the Lenders list selection
+
+        Args:
+            dealer_codes (list): List of dealer codes
+            partner_type (Optional(str)): Partner Type Code like `Lender`, `Agency`
+            partner_objects (Optional(bool)): False by default. Change to True if you
+                want Partner objects to be returned instead of SqlAlchemy KeyTuples having
+                only (Partner.parnter_id, Partner.long_name)
+
+        Returns:
+            Partner objects if `partner_objects` is True
+            (Partner.parnter_id, Partner.long_name) if `partner_objects` is False.
+        """
+        if not dealer_codes:
+            raise ValueError('Invalid Dealer Code')
+
+        if partner_type is None:
+            criteria = {"DealerPartner":
+                        [DealerPartner.dealer_code.in_(dealer_codes)]}
+        else:
+            criteria = {"Partner":
+                        [Partner.partner_type_code == partner_type,
+                         Partner.partner_status_code == 'ACTV'],
+                        "DealerPartner":
+                        [DealerPartner.status_code == 'A',
+                         DealerPartner.dealer_code.in_(dealer_codes)]}
+
+        spec = {"selection": [Partner.partner_id, Partner.long_name],
+                "join": [DealerPartner]}
+
+        if partner_objects:
+            spec = {"selection": [Partner],
+                    "join": [DealerPartner]}
+
+        query = self.get(criteria, spec)
+
+        # TODO this causes additional query which we should avoid and instead
+        # TODO return consistent datatype - always return a list via .all()
+        # TODO which could be empty or raise NoResultsFound exception
+        if query:
+            if partner_objects:
+                query = query.order_by(Partner.long_name)
+            else:
+                query = (query
+                         .group_by(Partner.partner_id, Partner.long_name)
+                         .order_by(Partner.long_name))
+            return query.all()
+
+        return None
+
+    @caching
+    def get_dealer_partner_ids(self, dealer_code, partner_type=None, fusion_prod_code=None):
+        """
+        Return partner IDs (with specified partner type & status code) associated
+        with a dealer.
+        @returns a list of partner ids
+        """
+        # TODO: Return List Partner Model instance so we can reuse this in lot of places.
+        dealer_code = dealer_code or self.context['dealer_code']
+        fusion_prod_code = fusion_prod_code or self.context.get('fusion_prod_code')
+        user_type = self.context.get('user_type', '')
+        partner_code = self.context.get('partner_code')
+
+        filter_criteria = [
+            DealerPartner.dealer_code == dealer_code,
+            Partner.partner_status_code == 'ACTV',
+            DealerPartner.status_code == 'A',
+            DealerPartner.fusion_product_code == fusion_prod_code
+        ]
+
+        if user_type == constants.LENDER_USER_TYPE:
+            if not partner_code:
+                return []
+            filter_criteria.append(Partner.partner_id == partner_code)
+
+        if partner_type:
+            filter_criteria.append(Partner.partner_type_code == partner_type)
+
+        partner_ids = (
+            self.session
+                .query(Partner.partner_id)
+                .join(DealerPartner)
+                .filter(*filter_criteria)
+                .all()
+        )
+
+        return list(itertools.chain(*partner_ids))
+
+    @caching(vary_by=("tenant_code", "user_type"))
+    def get_dealer_partners(self, dealer_code, fusion_prod_code=None):
+        """
+        Returns list of active dealer partners
+        Each Partner instance will contain pre-loaded partner profile and json subfeature data
+
+        Args:
+            dealer_code (str): dealer code
+            fusion_prod_code (str): fusion prod code or None, e.g. DTCOM
+
+        Returns:
+            List of Partner objects
+        """
+        fusion_prod_code = fusion_prod_code or self.context['fusion_prod_code']
+        clauses = [
+            DealerPartner.status_code == 'A',
+            DealerPartner.dealer_code == dealer_code,
+            DealerPartner.fusion_product_code == fusion_prod_code
+        ]
+        # TODO: why 2 queries to just figure out the active partners for a dealers? need to refactor this
+        partners = self.session.query(DealerPartner).filter(*clauses).all()
+        partner_ids = [p.partner_id for p in partners]
+
+        query = self.session.query(Partner).filter(Partner.partner_type_code == ca_constants.LENDER_TEXT,
+                                                   Partner.partner_status_code == 'ACTV').\
+            options(joinedload("partner_json_subfeatures"),
+                    joinedload("partner_json_subfeatures.ref_subfeature"),
+                    joinedload("partner_profiles"))
+
+        if ((self.context.get('user_type', '') == constants.LENDER_USER_TYPE) or
+                (self.context.get('dealer_impersonation_mode', False))):
+            # User with LENDER_USER_TYPE should see only related lender
+            partner_code = self.context.get('partner_code', None)
+            if partner_code:
+                query = query.filter(Partner.partner_id == partner_code)
+            else:
+                return []
+        else:
+            query = query.filter(Partner.partner_id.in_(partner_ids))
+
+        return query.all()
+
+    @caching
+    def get_only_partner_by_id(self, partner_id):
+        """ Returns the partner by only querying the Partner model """
+        if not partner_id:
+            raise ValueError('Partner id is empty!')
+
+        partner = self.session.query(Partner).get(partner_id)
+        if partner:
+            return partner
+
+        raise NoResultFound("Specified Partner({}) not found".format(partner_id))
+
+    def get_only_partner_by_ids(self, partner_ids):
+        """
+        Method to return the Partner info for the give list of partner id's
+
+        Args:
+            partner_ids (List)
+
+        Returns:
+            List: Partner Info
+        """
+        if not partner_ids:
+            raise ValueError('Partner ID list is empty!')
+
+        # Use the cached get_only_partner_by_id
+        return sorted(
+            [self.get_only_partner_by_id(i) for i in partner_ids],
+            key=lambda partner: partner.long_name.lower()
+        )
+
+    def try_get_lender(self, cp_or_partner_id):
+        """Tries to load lender either by partner id or legacy id"""
+
+        partner_id = guard(lambda: int(cp_or_partner_id), against=(ValueError,))
+        if partner_id:
+            return guard(lambda: self.get_only_partner_by_id(partner_id), against=(ValueError, NoResultFound))
+
+        return guard(lambda: self.get_partner_by_legacy_id(cp_or_partner_id), against=(NoResultFound,))
+
+    @caching
+    def get_partner_by_ids(self, partner_ids_list, fusion_prod_code=None):
+        """
+        Returns the List partners for the partner ids
+        Makes a list (ids_not_in_cache_list) of partner Ids not present in
+        cache, and make a single DB call to fetch all the Partners for the
+        partner_ids in the list.
+        Instead of a list of tuple, it only needs to pass a list of partner ids
+        such as: [100002052, 113430059]
+
+        Can't join with partner_profile since partner_id is only part of the
+        primary keys in partner_profile, so get the fusion_prod_cd to get an
+        unique partner for each partner_id
+
+        Added fusion_prod_code as an optional argument to allow access to lenders
+        other than what is set in the session context.
+
+        Args:
+            partner_ids_list (list): List of partner IDs (each element is a scalar)
+            fusion_prod_code (string): Optional Fusion prod code
+        Returns:
+            List of partners
+        """
+        if len(partner_ids_list) == 0:
+            raise ValueError('Partner ID list is empty!')
+
+        # get fusion product code from context in base manager
+        if fusion_prod_code:
+            fusion_prod_cd = fusion_prod_code
+        else:
+            fusion_prod_cd = self.context.get('fusion_prod_code') \
+                if self.context.get('fusion_prod_code') \
+                else self.context.get('tenant_code')
+
+        criteria = {
+            "Partner": [Partner.partner_id.in_(partner_ids_list),
+                        Partner.partner_status_code == 'ACTV'],
+        }
+        # when called by proxy functions
+        if fusion_prod_cd:
+            criteria.update({
+                "PartnerProfile": [PartnerProfile.fusion_prod_cd == fusion_prod_cd]
+            })
+
+        spec = {"selection": [Partner, PartnerProfile],
+                "join": [PartnerProfile]}
+        query = self.get(criteria, spec)
+
+        return query.all() if query else None
+
+    def get_partner_time_zone(self, partner_id):
+        """Returns partner json decision settings for a given partner_id
+        Result is cached (via get_partner_setting being cached.)
+        Args:
+            partner_id : partner to get settings dict for
+        """
+        settings_json_dict = self.get_partner_subfeature_setting(
+            partner_id, SubfeatureCode.CREDIT_DECISIONS)
+        return settings_json_dict.get('time_zone', 'EST')
+
+    def get_partner_programs(self, partner, program_data, version=1):
+        """
+        method returns a Dict of eligible partner programs and if programs required.
+        sample return value : {'programs':[{'program_name':'prg1', 'program_value':'val1'}, ...
+                                    ..{'program_name':'prg_n', 'program_value':'val_n'}],
+                               'program_required': 'yes
+                               }
+        Any logic to determine eligible partner programs goes here
+        """
+        partner_programs = {}
+        partner_json = self.get_partner_subfeature_setting(partner.partner_id, SubfeatureCode.CREDIT_APP)
+        if 'programs' in partner_json:
+            programs = []
+            for prg in partner_json.get('programs'):
+                program = {'program_name': prg.get('name'), 'program_value': prg.get('value')}
+                programs.append(program)
+            partner_programs['programs'] = programs
+            # TODO (Macie): when doing an analysis of the keys available under
+            # the CA subfeature JSON on QA1 on 06/21/2017, I found no
+            # "program_required" key, but rather only a "programrequired" key.
+            # How is this code working?  Does it need to change?
+            partner_programs['program_required'] = partner_json.get('program_required')
+        return partner_programs
+
+    def get_partner_dealupdate_status(self, partner_id, version=1):
+        """
+        method returns dealupdate status and dealupdate eligible default flag
+        """
+        partner_json = self.get_partner_subfeature_setting(partner_id, SubfeatureCode.DEAL_UPDATE)
+        if 'dealupdate' in partner_json:
+            dealupdate_list = partner_json.get('dealupdate')
+            dealupdate_status = dealupdate_list.get('dealupdate_status')
+            dealupdate_eligible_default = dealupdate_list.get('dealupdate_eligibility_default')
+        else:
+            dealupdate_status = 'I'
+            dealupdate_eligible_default = 'N'
+
+        return dealupdate_status, dealupdate_eligible_default
+
+    def get_partner_amount_financed_threshold(self, partner_id):
+        """
+        Get financed threshold amount for a partner
+        """
+        partner_dict = self.get_partner_subfeature_setting(partner_id, SubfeatureCode.CREDIT_DECISIONS)
+        threshold = partner_dict.get('decision_settings', {}).get('C', {}) .get('amount_financed_threshold')
+        try:
+            threshold = int(threshold)
+        except (ValueError, TypeError):
+            threshold = None
+        return threshold
+
+    def is_edocs_enable(self, cp_id):
+        """
+        It will tell partner is support edoc or not
+
+        Args:
+            cp_id(int): cp id
+        Returns:
+            bool: True if partner is support edocs otherwise False
+        """
+        partner_settings = self.get_partner_subfeature_setting(cp_id, SubfeatureCode.DIGITAL_DOCUMENT_SERVICE)
+        return bool(partner_settings)
+
+    def is_partner_credit_connection(self, partner_id):
+        """
+        Check if partner is credit connection partner
+
+        Args:
+            partner_id (int): Partner ID (e.g. ``cp_id``) of partner to check)
+
+        Notes:
+            no need to cache this function.  It calls `get_partner_subfeature_setting`
+            which calls `get_partner_subfeature_json` which is cached already.
+
+        Returns:
+            (bool) if partner is credit connection partner
+        """
+        common_setting = self.get_partner_subfeature_setting(partner_id, SubfeatureCode.COMMON)
+        return bool(common_setting.get('ccdealerid'))
+
+    @caching
+    def get_partners_by_subfeature(self, subfeature_code):
+        """
+        Fetch all the partners which have a corresponding subfeature setting
+        record.
+
+        Args:
+            subfeature_code (str): Subfeature Code (REFERENCE.REF_SUBFEATURE) like `CD`, `PQ`.
+
+        Returns:
+            List of Partners
+        """
+        return (
+            self.session
+                .query(Partner)
+                .join(PartnerJsonSubfeature)
+                .options(contains_eager(Partner.partner_json_subfeatures))
+                .filter(PartnerJsonSubfeature.subfeature_code == subfeature_code,
+                        PartnerJsonSubfeature.tenant_code == self.context['fusion_prod_code'],
+                        Partner.partner_status_code == 'ACTV')
+                .order_by(asc(Partner.long_name))
+                .all()
+        )
+
+    def is_per_funded_lender(self, cp_id):
+        """
+        Lenders we only bill when we receive the contract decision with FUND or BOOK not the time of submission.
+
+        Args:
+          cp_id (int): partner identifier
+
+        Notes:
+            no need to cache this function.  It calls `get_partner_subfeature_setting`
+            which calls `get_partner_subfeature_json` which is cached already.
+
+        Returns:
+            bool: True if per funded lender else False
+        """
+        billing_setting = self.get_partner_subfeature_setting(cp_id, SubfeatureCode.BILLING)
+        return bool(billing_setting.get('per_funded'))
+
+    @caching
+    def get_partner_subfeature_json(self, partner_id, subfeature_code):
+        """
+        Get the JSON setting for the spefified partner and subfeature code.
+
+        Args:
+            partner_id: ID of the Partner to look up settings for.
+            subfeature_code: the subfeature to fetch settings for.
+
+        Returns:
+            (str) partner json subfeature record as a JSON string for a
+            given subfeature.  Partner (lender, etc) settings related to one
+            subfeature.
+        """
+        tenant_code = self.context['tenant_code']
+
+        instance = self.query(PartnerJsonSubfeature).get((partner_id, subfeature_code, tenant_code))
+
+        if instance and instance.partner_json_text:
+            return instance.partner_json_text
+
+        return "{}"
+
+    @caching
+    def get_all_partners_subfeature_json(self, subfeature_code):
+        """
+        Get JSON settings for all partners which have a record for the specified
+        subfeature code.
+
+        Args:
+            subfeature_code: the subfeature to fetch all partner's settings for.
+
+        Returns:
+            (dict) {'<partner_id>': '<partner_json>', ...}
+            Where all partners containing settings for the specified subfeature
+            are included in the dict.
+            * keys are partner_ids (cp_ids)
+            * values are the loaded JSON value associated with the given
+              subfeature code and with the partner specified in the key.
+        """
+        tenant_code = self.context['tenant_code']
+
+        json_query = self.query(PartnerJsonSubfeature).filter(
+            PartnerJsonSubfeature.subfeature_code == subfeature_code,
+            PartnerJsonSubfeature.tenant_code == tenant_code)
+        partner_json_subfeatures = json_query.all()
+
+        partner_settings = {}
+        for pjs in partner_json_subfeatures:
+            key = pjs.partner_id
+            if pjs and pjs.partner_json_text:
+                value = pjs.partner_json_text
+            else:
+                value = "{}"
+            partner_settings[key] = value
+
+        return partner_settings
+
+    def get_partner_subfeature_setting(self, partner_id, subfeature_code):
+        """
+        Get the setting dictionary (decoded JSON) for the spefified partner
+        and subfeature code.
+
+        Args:
+            partner_id: ID of the Partner to look up settings for.
+            subfeature_code: the subfeature to fetch settings for.
+
+        Returns:
+            (dict) partner json subfeature record loaded into a dict for a
+            given subfeature.  Partner (lender, etc) settings related to one
+            subfeature.
+        """
+        partner_json_text = self.get_partner_subfeature_json(partner_id, subfeature_code)
+        return self._subfeature_json_to_dict(partner_json_text, subfeature_code, partner_id)
+
+    def get_all_partners_subfeature_settings(self, subfeature_code):
+        """
+        Get setting dictionary (decoded JSON) for all partners which have
+        a record for the specified subfeature code.
+
+        Args:
+            subfeature_code: the subfeature to fetch settings for.
+
+        Returns:
+            (dict) {'<partner_id>': '<partner_settings_dict>', ...}
+            Where all partners containing settings for the specified subfeature
+            are included in the dict.
+            * keys are partner_ids (cp_ids)
+            * values are the setting dictionary (decoded JSON) associated with
+              the given subfeature code and with the partner specified in the
+              key.
+        """
+        partner_jsons = self.get_all_partners_subfeature_json(subfeature_code)
+        partner_settings = {partner_id: self._subfeature_json_to_dict(pjson, subfeature_code, partner_id)
+                            for partner_id, pjson in partner_jsons.items()}
+        return partner_settings
+
+    def _subfeature_json_to_dict(self, subfeature_json, subfeature_code, partner_id):
+        partner_settings = {}
+
+        try:
+            partner_settings = dt_json.loads(subfeature_json, object_hook=None)
+        except json.decoder.JSONDecodeError:
+            log_message = 'Invalid json for'
+            self._log_partner_json_setting_error(log_message,
+                                                 partner_id,
+                                                 subfeature_code)
+        except TypeError:
+            log_message = 'No partner settings for'
+            self._log_partner_json_setting_error(log_message,
+                                                 partner_id,
+                                                 subfeature_code)
+
+        if subfeature_code == SubfeatureCode.CREDIT_DECISIONS:
+            # HACK: This code was originally written Aug 2015 by asirinaidu-paidi
+            # and unfortunately it needs to remain in place.
+            # Add extra decision codes for contract
+            decision_codes = partner_settings.get("decision_codes", {})
+            contract_decision_codes = decision_codes.get("C", {})
+            contract_decision_codes.update(decision_constants.DecisionCode.EXTRA_CODES)
+            decision_codes["C"] = contract_decision_codes
+            partner_settings["decision_codes"] = decision_codes
+
+        return partner_settings
+
+    def get_partner_profile_by_legacy_id(self, legacy_id, fusion_prod_cd=None):
+        """
+        Returns the  PartnerProfile object for the legacy_id
+        """
+        if not legacy_id or not isinstance(legacy_id, six.string_types):
+            raise ValueError('legacy_id cannot be None')
+
+        fusion_prod_cd = fusion_prod_cd or self.context.get('fusion_prod_code') or self.context.get('tenant_code')
+
+        return self._get_partner_profile_by_legacy_id(legacy_id, fusion_prod_cd)
+
+    @caching
+    def _get_partner_profile_by_legacy_id(self, lgcy_id, fusion_prod_cd):
+        """
+        Internal function for caching purposes
+        Returns the  PartnerProfile object for the lgcy_id
+        """
+        try:
+            return self.session.query(PartnerProfile).filter(
+                PartnerProfile.legacy_id == lgcy_id,
+                PartnerProfile.fusion_prod_cd == fusion_prod_cd
+            ).one()
+        except NoResultFound:
+            raise NoResultFound('Specified PartnerProfile({fusion_prod_cd}:{lgcy_id}) does not exist'.format(
+                fusion_prod_cd=fusion_prod_cd or "<no fusion_prod_cd provided>",
+                lgcy_id=lgcy_id
+            ))
+
+    def get_partner_profile_by_cp_id(self, cp_id, fusion_prod_cd=None):
+        """
+        Returns the  PartnerProfile object for the cp_id and fusion_prod_cd
+        """
+        fusion_prod_cd = fusion_prod_cd or self.context.get('tenant_code') or self.context.get('fusion_prod_code')
+
+        return self._get_partner_profile_by_cp_id(cp_id, fusion_prod_cd)
+
+    @caching
+    def _get_partner_profile_by_cp_id(self, cp_id, fusion_prod_cd):
+        """
+        Internal function for caching purposes
+        returns PartnerProfile using cp_id and fusion_prod_cd
+        """
+        partner_profile = self.query(PartnerProfile).get((cp_id, fusion_prod_cd))
+
+        if partner_profile is None:
+            raise NoResultFound('Specified PartnerProfile({fusion_prod_cd}:{cp_id}) does not exist'.format(
+                fusion_prod_cd=fusion_prod_cd, cp_id=cp_id
+            ))
+
+        return partner_profile
+
+    def load_partner_settings(self, partner_json_setting_list):
+        """
+        Check for the partner_json_settings_rules_dict in the cache, if not
+        found loads the partner setting information from DB into cache for
+        each filter element (trans_type/payment call/restrictions), stores
+        it to cache and returns the partner_json_settings_cache_dict
+
+        Args:
+            partner_json_setting_list (list): List of partner json settings
+
+        """
+        partner_json_settings_cache_dict = {}
+
+        for partner_json_setting in partner_json_setting_list:
+
+            if partner_json_setting.partner_json_text is None:
+                log_message = 'No partner settings for'
+                self._log_partner_json_setting_error(log_message,
+                                                     partner_json_setting.partner_id,
+                                                     SubfeatureCode.CREDIT_APP)
+                continue
+
+            partner_json_setting_json = partner_json_setting.partner_json_text
+            try:
+                partner_json_setting_dict = json.loads(partner_json_setting_json)
+            except json.decoder.JSONDecodeError:
+                log_message = 'Invalid json for'
+                self._log_partner_json_setting_error(log_message,
+                                                     partner_json_setting.partner_id,
+                                                     SubfeatureCode.CREDIT_APP)
+                partner_json_setting_dict = {}
+            except TypeError:
+                log_message = 'No partner settings for'
+                self._log_partner_json_setting_error(log_message,
+                                                     partner_json_setting.partner_id,
+                                                     SubfeatureCode.CREDIT_APP)
+                partner_json_setting_dict = {}
+
+            # code to read the payment call support from partner setting,
+            # and add it to cache dict
+            if partner_json_setting_dict.get('paymentcallsupported', '') == 'yes':
+                partner_json_settings_cache_dict.setdefault(
+                    'paymentcallsupported', []
+                ).append(partner_json_setting.partner_id)
+
+            # code to read the trans types from partner setting,
+            # and add it to cache dict
+            if 'transtypes' in partner_json_setting_dict:
+                trans_type_list = partner_json_setting_dict.get('transtypes')
+
+                for trans_type in trans_type_list:
+
+                    prod_types_list = [trans_type.get('prodtype', '')]
+                    veh_types_list = [trans_type.get('vehicletype', '')]
+                    credit_types_list = [trans_type.get('credittype', '')]
+                    loan_types_list = [trans_type.get('loantype', '')]
+
+                    if prod_types_list[0] == 'all':
+                        prod_types_list = ['retail', 'lease', 'balloon']
+
+                    if veh_types_list[0] == 'all':
+                        veh_types_list = constants.VEHICLE_TYPES
+
+                    if credit_types_list[0] == 'all':
+                        credit_types_list = constants.CREDIT_TYPES
+
+                    # if loan_type is blank, it is considered as all
+                    if loan_types_list[0] in ['all', '']:
+                        loan_types_list = ['auto', 'rv', 'marine', 'motorcycle']
+
+                    keys_iterables = itertools.product(prod_types_list,
+                                                       veh_types_list,
+                                                       credit_types_list,
+                                                       loan_types_list)
+                    for keys in keys_iterables:
+                        trans_type_cache_key = \
+                            'trans_type_' + \
+                            keys[0] + '_' + \
+                            keys[1] + '_' + \
+                            keys[2] + '_' + \
+                            keys[3]
+
+                        partner_json_settings_cache_dict.setdefault(
+                            trans_type_cache_key, []
+                        ).append(partner_json_setting.partner_id)
+
+        return partner_json_settings_cache_dict
+
+    def _log_partner_json_setting_error(self, message, partner_id, subfeature_code):
+        """ Logs an error when trying to retrieve partner json settings
+        Args:
+            message (str): Message to be displayed in log
+            partner_id (int): Lenders partner id
+            subfeature_code (str): Lender setting sub feature code
+        """
+        partner_profile = self.get_partner_profile_by_cp_id(partner_id)
+        context_dict = {'partner_id': partner_id,
+                        'sub_feature_id': subfeature_code,
+                        'legacy_id': partner_profile.legacy_id}
+        self.context.push(context_dict)
+        self.log.error("{} Partner --> {} | Sub Feature --> {}"
+                       .format(message, partner_profile.legacy_id, subfeature_code))
+        self.context.pop()
+
+    def get_legacy_ids_by_partner_ids(self, partner_ids_list):
+        """
+        This method returns legacy ids for the passed partner_ids list
+        """
+
+        if partner_ids_list is None or len(partner_ids_list) == 0:
+            raise ValueError("Passed partner id list is empty")
+
+        partners_list = self.get_partner_by_ids(partner_ids_list)
+
+        try:
+            return [partner.partner_profile.legacy_id
+                    for partner in partners_list
+                    if partner.partner_profile]
+
+        except AttributeError:
+            return [partner.PartnerProfile.legacy_id
+                    for partner in partners_list
+                    if partner.PartnerProfile]
+
+    def get_partner_by_legacy_id(self, legacy_id):
+        """
+        This method returns Partner the passed legacy_id
+        Again, this method will not work anymore since PartnerProfile
+        has three primary keys
+        """
+        try:
+            return self.get_partner_profile_by_legacy_id(legacy_id).partner
+        except NoResultFound:
+            msg = "No partner found for legacy id: {}"
+            self.log.error(msg.format(legacy_id))
+        return
+
+    def get_partner_connection(self, partner_id=None, feature_code=None, subfeature_code=None):
+        """
+        Returns the List partners connection information.
+
+        Args:
+            partner_id (Optional[int]): Standard fusion partner id
+            feature_code (Optional([str])): our standard reference feature code (e.g. 'CA')
+            subfeature_code (Optional[str, list, tuple]):  Either a single or multiple subfeature codes
+
+        Returns:
+            (list) of ``PartnerFeatureConnection`` instances matching the searched criteria
+        """
+        if not partner_id and not feature_code and not subfeature_code:
+            raise ValueError('Must pass atleast partner_id or feature code or subfeature_code to get_partner_connection')
+
+        if partner_id and not isinstance(partner_id, list):
+            partner_id = [partner_id]
+
+        tenant_code = self.context.get('fusion_prod_code') or self.context.get('tenant_code')
+        if not tenant_code:
+            raise ValueError('Tenant code not available in manager context.')
+
+        clauses = []
+
+        if partner_id:
+            clauses += [
+                PartnerFeatureConnection.partner_id.in_(partner_id),
+                PartnerFeatureConnection.tenant_code == tenant_code,
+            ]
+
+        if feature_code:
+            clauses += [
+                Feature.feature_code == feature_code,
+                Feature.tenant_code == tenant_code,
+            ]
+
+        if subfeature_code:
+            if isinstance(subfeature_code, (tuple, list)):
+                subfeature_clause = Subfeature.subfeature_code.in_(subfeature_code)
+            else:
+                subfeature_clause = Subfeature.subfeature_code == subfeature_code
+
+            clauses += [
+                subfeature_clause,
+                Subfeature.tenant_code == tenant_code,
+            ]
+
+        query = (
+            self.session
+            .query(PartnerFeatureConnection)
+            .filter(*clauses)
+            .join(Subfeature, Feature)
+        )
+        return query.all()
+
+    def get_dealer_code(self, partner_dlr_id, partner_id):
+        """
+        Returns the dt dealer code associated with partner
+        dealer id and partner id
+        """
+
+        criteria = {"DealerPartner":
+                    [DealerPartner.partner_id == partner_id,
+                     DealerPartner.partner_dealer_id == partner_dlr_id]}
+
+        spec = {"selection": [DealerPartner.dealer_code]}
+
+        query = self.get(criteria, spec)
+
+        dealer_partner = query.first() if query else None
+
+        if dealer_partner is None:
+            raise ValueError('Specified Dealer(%s) does not exist'
+                             % partner_dlr_id)
+
+        return dealer_partner
+
+    def get_bureau_partners(self):
+        """
+        Returns the List of Bureau partners like
+        121111111, 121111112 and 121111113.
+        """
+        query = self.get({"Partner":
+                          [Partner.partner_type_code == PARTNER_TYPE]},
+                         {"selection":
+                          [Partner]})
+
+        if query:
+            query = query.order_by(Partner.long_name)
+
+        bureau_partners = query.all()
+
+        return bureau_partners
+
+    def get_bureau_partner_model_name(self, model_code, bureau_partner_id):
+        """ Get model name corresponding to model code
+
+        Args:
+            model_code (str): RBP model code
+            bureau_partner_id (int): Bureau partner id
+
+        Returns:
+            Model name of corresponding model code
+        """
+        partner_model_names = self.get_bureau_models_by_partner(bureau_partner_id)
+
+        # 1.If Model code is not present in the database we need to return "model code" as it is.
+        # 2.If Model code value is empty in XML it self, Then we need to return empty string.
+        return partner_model_names.get(model_code, model_code)
+
+    def get_bureau_partner_model_id(self, model_name, bureau_partner_id=None):
+        """ Get model id corresponding to model name
+
+        Args:
+            model_name (str): RBP model name
+            bureau_partner_id (int): Bureau partner id
+
+        Returns:
+            Model id of corresponding model name
+        """
+        partner_model_names = self.get_bureau_models_by_partner(bureau_partner_id)
+        if model_name:
+            for model_id, score_model_name in partner_model_names.items():
+                if score_model_name.replace(' ', '').upper() == model_name.replace(' ', '').upper():
+                    return model_id
+
+        return
+
+    @caching
+    def get_all_rbp_models(self):
+        """ Gets all RBP score models from the RBP table
+
+        Returns:
+            List of results from RBP table
+
+        """
+        return self.session.query(RBPSupportedScoreModel).all()
+
+    def get_bureau_models_by_partner(self, bureau_partner_id=None):
+        """ Get model name dictionary by bureau partner id
+
+        If bureau partner id is empty then return all RBP models
+
+        Args:
+            bureau_partner_id: Bureau partner id
+
+        Return:
+            A dictionary with key as model id and value as model name
+        """
+        partner_model_name_list = []
+        rbp_models = self.get_all_rbp_models()
+        if bureau_partner_id:
+            partner_model_name_list = {model.model_id: model.model_name for model in rbp_models
+                                       if model.partner_id == bureau_partner_id}
+        else:
+            partner_model_name_list = {model.model_id: model.model_name for model in rbp_models}
+
+        return partner_model_name_list
+
+    @caching
+    def get_filtered_partners(self, name=None):
+        """
+        Returns tuple of partner id and partner full name filtered by using
+        case-insensitive partial match (aka ILIKE clause) of partner name.
+
+        Args:
+            name (str) : partial partner name which lender must contain
+        """
+        # not all partners have long name for whatever reason
+        # so we exclude them
+        # also exclude partners who have partner_type_code set as null
+        filters = [
+            Partner.long_name != None,  # noqa
+            Partner.partner_type_code != None,  # noqa
+            Partner.partner_status_code == 'ACTV',
+        ]
+
+        if name is not None:
+            filters.append(Partner.long_name.ilike('%{}%'.format(name.lower())))
+
+        return self.session.query(
+            Partner.partner_id, Partner.long_name
+        ).filter(
+            *filters
+        ).order_by(Partner.long_name).all()
+
+    def get_split_routing_partner_config(self, partner_id, feature_code,
+                                         subfeature_code, routing_criteria):
+        """
+        Method is responsible of retrieving partner connection information from CP.PARTNER_CONFIG table.
+        There are two scenarios where connection information can be directly retrieved based on cp_id or
+        split routing where a lender chooses to send information to another lender based on certain routing criteria
+        Args:
+            partner_id(int): Partner Id
+            feature_code(string): Feature code
+            subfeature_code(string): Sub Feature code
+            routing_criteria(string): Routing Criteria to perform split routing
+        Returns:
+            Partner connection details are returned in object partner_config
+        """
+        is_split_routing = False
+        try:
+            env = getattr(settings, 'PARTNER_CONFIG_ENV_NAME', 'PROD')
+            partner_config = self.get_partner_config(env, partner_id, feature_code, subfeature_code).all()
+            if partner_config and partner_config[0].connection_settings_json and routing_criteria:
+                is_split_routing = True
+                orig_partner_setting = partner_config[0].partner_json_text
+                routing_partner_code = dt_json.loads(partner_config[0].connection_settings_json, object_hook=None)\
+                    .get('connection', {}).get(routing_criteria)
+                if routing_partner_code:
+                    routing_partner_id = self.get_partner_profile_by_legacy_id(routing_partner_code).partner_id
+                    partner_config = self.get_partner_config(env, routing_partner_id, feature_code, subfeature_code).all()
+
+            result_in_list = map(list, partner_config)
+            partner_config = [{desired_name: queried_value for desired_name, queried_value
+                               in zip(constants.partner_config_field_names, x)} for x in result_in_list]
+            if is_split_routing:
+                partner_config[0]['partner_subfeature_json'] = orig_partner_setting
+
+        except ValueError:
+            self.log.error("Error while retrieving split routing partner connection details")
+            raise
+        return partner_config
+
+    def get_partner_config(self, environment, partner_id, feature_code=None, subfeature_code=None):
+        """
+        The new implementation of get_partner_config_query(). This method works with the new schema.
+
+        Returns partner configuration for a specific partner in a specific
+        environment, if feature_code and subfeature_code are provided, returns a single record,
+        otherwise returns all of the configs for a partner.
+
+        Args:
+            environment: dt deployment environement (DEV, QA, PROD)
+            partner_id: cp_id
+            feature_code: partner config feature_code
+            subfeature_code: partner config subfeature code
+        """
+        environment = environment or getattr(settings, 'PARTNER_CONFIG_ENV_NAME')
+
+        if not partner_id:
+            raise ValueError("Must pass valid partner id!")
+        try:
+            ConnectionEnvironment.get(environment)
+        except NoResultFound:
+            raise ValueError('Connection environment code passed is not supported!')
+
+        tenant_code = self.context.get('tenant_code', None)
+        if not tenant_code:
+            raise ValueError('Tenant code not available in manager context.')
+
+        criteria = {}
+        if feature_code:
+            criteria["Feature"] = [Feature.feature_code == feature_code]
+
+        if subfeature_code:
+            criteria["Subfeature"] = [Subfeature.subfeature_code == subfeature_code,
+                                      Subfeature.tenant_code == tenant_code]
+
+        spec = {"selection": [Subfeature.subfeature_code,
+                              Subfeature.subfeature_name,
+                              Feature.feature_code,
+                              Feature.feature_name,
+                              PartnerFeatureConnection.partner_id,
+                              PartnerFeatureConnection.tenant_code,
+                              PartnerFeatureConnection.connection_environment_code,
+                              PartnerFeatureConnection.feature_participation_status_code,
+                              PartnerFeatureConnection.data_delivery_protocol_code,
+                              PartnerFeatureConnection.connection_address,
+                              PartnerFeatureConnection.port_number,
+                              PartnerFeatureConnection.username,
+                              PartnerFeatureConnection.password,
+                              PartnerFeatureConnection.connection_endpoint_name,
+                              PartnerFeatureConnection.activate_date,
+                              PartnerFeatureConnection.deactivate_date,
+                              PartnerFeatureConnection.primary_transfer_data_format,
+                              PartnerFeatureConnection.secondary_transfer_data_format,
+                              PartnerFeatureConnection.enable_certificate_validation_indicator,
+                              PartnerFeatureConnection.attach_certificate_indicator,
+                              PartnerFeatureConnection.connection_max_number,
+                              PartnerFeatureConnection.form_variable_name,
+                              PartnerFeatureConnection.external_partner_reference_id,
+                              PartnerFeatureConnection.content_type_header,
+                              PartnerFeatureConnection.custom_header,
+                              PartnerFeatureConnection.connection_settings_json,
+                              PartnerJsonSubfeature.partner_json_text],
+                "join": [Feature]}
+
+        query = self.get(criteria, spec)
+        query = query.join(PartnerFeatureConnection, and_(
+            Subfeature.subfeature_code == PartnerFeatureConnection.subfeature_code,
+            Subfeature.tenant_code == PartnerFeatureConnection.tenant_code,
+            PartnerFeatureConnection.partner_id == partner_id,
+            PartnerFeatureConnection.connection_environment_code == environment
+        ))
+        query = query.outerjoin(PartnerJsonSubfeature, and_(
+            Subfeature.subfeature_code == PartnerJsonSubfeature.subfeature_code,
+            Subfeature.tenant_code == PartnerJsonSubfeature.tenant_code,
+            PartnerFeatureConnection.partner_id == PartnerJsonSubfeature.partner_id
+        ))
+
+        return query
+
+    def get_partner_certificate(self, environment, subfeature_code, partner_id):
+        """
+        Returns partner certificate for a specific partner in a specific
+        environment. Returns a single record,
+
+        :param1 environment: dt deployment environment (DEV, QA, PROD)
+        :param2 subfeature_code: partner config subfeature code
+        :param3 partner_id: cp_id
+        """
+        environment = environment or getattr(settings, 'PARTNER_CONFIG_ENV_NAME')
+
+        if not partner_id:
+            raise ValueError('Must pass valid partner id!')
+        try:
+            ConnectionEnvironment.get(environment)
+        except NoResultFound:
+            raise ValueError('Connection environment code passed is not supported!')
+
+        tenant_code = self.context.get('tenant_code', None)
+        if not tenant_code:
+            raise ValueError('Tenant code not available in manager context.')
+
+        if not subfeature_code:
+            raise ValueError('Must pass valid Subfeature code!')
+
+        criteria = {"FeatureCertificate": [FeatureCertificate.partner_id == partner_id,
+                                           FeatureCertificate.subfeature_code == subfeature_code,
+                                           FeatureCertificate.tenant_code == tenant_code,
+                                           FeatureCertificate.connection_environment_code == environment]}
+
+        spec = {"selection": [FeatureCertificate.client_certificate_im]}
+        try:
+            cert = base64.b64encode(self.get(criteria, spec).one()[0])
+        except NoResultFound:
+            raise ValueError('No certificate found.')
+
+        return cert
+
+    def get_partner_timestamp(self, partner_legacy_id, timestamp):
+        """Converts a timestamp to one in the specified partner's timezone.
+        Args:
+            partner_legacy_id (str): the legacy ID of the partner
+            timestamp (str): the timestamp that we want to convert
+        Returns:
+            timestamp (datetime.datetime) in the timezone for the specified partner
+        """
+        partner_profile = self.get_partner_profile_by_legacy_id(partner_legacy_id)
+        partner_time_zone = self.get_partner_time_zone(partner_profile.partner_id)
+        partner_timestamp = get_utc_datetime(parser.parse(timestamp), partner_time_zone)
+
+        return partner_timestamp
+
+    @caching
+    def get_partner_id_partner_legacy_id_mapping_for_partners(self):
+        """Get a dictionary mapping the partner ID to the partner legacy ID for all partners in PartnerProfile.
+        Returns:
+            Dictionary mapping partner ID to partner legacy ID for all partners.
+        """
+        partner_query = self.session.query(PartnerProfile.partner_id, PartnerProfile.legacy_id).filter(PartnerProfile.fusion_prod_cd == self.context['tenant_code'])
+        partners = {partner_id: partner_legacy_id
+                    for (partner_id, partner_legacy_id) in partner_query.all()}
+
+        return partners
+
+    def _does_partner_support_feature(self, legacy_id, app_contract_indicator):
+        """
+        Private utility method for checking if partner supports particular feature
+        by checking decision codes table.
+
+        .. warning::
+            This function should be used together with DTC DB (e.g. classic DB)
+        """
+        return bool(
+            self.session
+            .query(DecisionCodes)
+            .filter_by(lender_id=legacy_id,
+                       app_contract_ind=app_contract_indicator)
+            .count()
+        )
+
+    def does_partner_support_credit(self, legacy_id):
+        """
+        Check if partner supports credit applications
+
+        .. warning::
+            This function should be used together with DTC DB (e.g. classic DB).
+            To do that you can adjust connection_key::
+
+                context = self.context.copy()
+                context.push({'connection_key': 'DTC'})
+                manager = self.__class__(context)
+                manager.does_partner_support_credit(111)
+
+            Note that manager needs to reinstantiated since we only connect to DB
+            in managers ``__init__``.
+
+        Args:
+            legacy_id (str): Partner 3-character legacy ID
+
+        Returns:
+            (bool) if partner supports credit applications
+        """
+        return self._does_partner_support_feature(legacy_id=legacy_id, app_contract_indicator='A')
+
+    def does_partner_support_contract(self, legacy_id):
+        """
+        Check if partner supports contract applications
+
+        .. warning::
+            This function should be used together with DTC DB (e.g. classic DB).
+            To do that you can adjust connection_key::
+
+                context = self.context.copy()
+                context.push({'connection_key': 'DTC'})
+                manager = self.__class__(context)
+                manager.does_partner_support_contract(111)
+
+            Note that manager needs to reinstantiated since we only connect to DB
+            in managers ``__init__``.
+
+        Args:
+            legacy_id (str): Partner 3-character legacy ID
+
+        Returns:
+            (bool) if partner supports contract applications
+        """
+        return self._does_partner_support_feature(legacy_id=legacy_id, app_contract_indicator='C')
+
+    def get_all_partners(self, active_only=False):
+        """
+        Return **ALL** partners stored in DB joined with partner profiles.
+
+        .. warning::
+            This method as the name suggests, **RETURNS ALL PARTNERS**
+            so if you use this method, you should have a very good reason
+            to do so. If you don't, **DO NOT USE IT**.
+        """
+        filters = [PartnerProfile.fusion_prod_cd == self.context['fusion_prod_code']]
+
+        if active_only:
+            filters.append(Partner.partner_status_code == 'ACTV')
+
+        return (
+            self.session
+            .query(Partner)
+            .join(PartnerProfile)
+            .filter(*filters)
+        )
+
+    def get_all_profiles(self, active_only=False):
+        """
+        Return **ALL** partner profiles stored in DB eagerly joined with partners.
+
+        .. warning::
+            This method as the name suggests, **RETURNS ALL PARTNER PROFILES**
+            so if you use this method, you should have a very good reason
+            to do so. If you don't, **DO NOT USE IT**.
+        """
+        filters = [PartnerProfile.fusion_prod_cd == self.context['fusion_prod_code']]
+
+        if active_only:
+            filters.append(Partner.partner_status_code == 'ACTV')
+
+        return (
+            self.session
+            .query(PartnerProfile)
+            .join(Partner)
+            .options(contains_eager(PartnerProfile.partner))
+            .filter(*filters)
+        )
+
+# TODO the following are old proxy functions, will be removed once all references
+# are removed, as well as the tests on these proxy functions.
+
+
+def get_partners_by_dealer_code(dealer_code, partner_type=None):
+    """
+    Returns the List of Partner objects for the given the dealer code.
+    """
+    warn(
+        'This function is deprecated. '
+        'Please use PartnerManager.get_partners_by_dealer_code() instead.',
+        DeprecationWarning
+    )
+
+    manager = getManager(PartnerManager, {'dealer_code': dealer_code})
+    partners = manager.get_partners_by_dealer_code(dealer_code, partner_type)
+    if partners:
+        return [i.Partner for i in partners]
+    return partners
+
+
+def get_partners_by_dealer_codes(dealer_codes, partner_type=None):
+    """
+    Returns the tuple list of Partner objects for the given the dealer code
+    list in the following format (PARTNERID,PARTNERLONGNAME).
+
+    param dealer_codes: List of dealer codes
+
+    This method is used in the App Status page left filter to display the Lenders list selection
+    """
+    warn(
+        'This function is deprecated. '
+        'Please use PartnerManager.get_partners_by_dealer_codes() instead.',
+        DeprecationWarning
+    )
+
+    manager = getManager(PartnerManager, {})
+    return manager.get_partners_by_dealer_codes(dealer_codes, partner_type)
+
+
+def get_dealer_partner_ids(dealer_code, partner_type=None):
+    """
+    Returns the List with tuples of only active partner Ids associated with the dealer.
+    """
+    warn(
+        'This function is deprecated. '
+        'Please use PartnerManager.get_dealer_partner_ids() instead.',
+        DeprecationWarning
+    )
+
+    manager = getManager(PartnerManager, {'dealer_code': dealer_code})
+    return manager.get_dealer_partner_ids(dealer_code, partner_type)
+
+
+def get_partner_by_ids(partner_ids_tuple_list):
+    """
+    Returns the List partners for the partner ids
+    Makes a list (ids_not_in_cache_list) of partner Ids not present in cache,
+    and make a single DB call to fetch all the Partners for the partner_ids in
+    the list.
+    """
+    warn(
+        'This function is deprecated. '
+        'Please use PartnerManager.get_partner_by_ids() instead.',
+        DeprecationWarning
+    )
+
+    manager = getManager(PartnerManager, {})
+    partners = manager.get_partner_by_ids(list(chain(*partner_ids_tuple_list)))
+    if partners:
+        return [i.Partner for i in partners]
+    return partners
+
+
+def get_dealer_code(partner_dlr_id, partner_id):
+    """
+    Returns the dt dealer code associated with partner dealer id and partner id
+    """
+    warn(
+        'This function is deprecated. '
+        'Please use PartnerManager.get_dealer_code() instead.',
+        DeprecationWarning
+    )
+
+    manager = getManager(PartnerManager, {})
+    return manager.get_dealer_code(partner_dlr_id, partner_id)

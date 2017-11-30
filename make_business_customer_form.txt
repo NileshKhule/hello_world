@@ -1,0 +1,1332 @@
+from common.dealjacket.forms import make_business_customer_form
+
+
+# -*- coding: utf-8 -*-
+"""
+Forms for the dealjacket app.
+"""
+from __future__ import absolute_import, print_function, unicode_literals
+from collections import defaultdict
+from copy import deepcopy
+
+import fuzzy
+import simplejson as json
+from crispy_forms.bootstrap import FormActions
+from crispy_forms.helper import FormHelper
+from crispy_forms.layout import HTML, Div, Field, Fieldset, Layout, Submit
+from django import forms
+from django.core.validators import EMPTY_VALUES, RegexValidator
+from django.urls import reverse
+from django.utils.safestring import mark_safe
+from django.utils.translation import ugettext_lazy as _
+
+from dt_django_base.forms.base import BaseForm
+from dt_django_base.forms.fields import (
+    DateOfBirth,
+    NumericField,
+    PhoneNumberField,
+    ProgressTracker,
+    SocialSecurityField,
+)
+from dt_django_base.forms.widgets import TextInputOptional
+from dt_django_base.views.messaging import warning
+from dt_django_summit.forms.applicant_save import BaseCustomerSaveForm
+from dt_django_summit.forms.customer import (
+    BaseAddressForm,
+    BaseBusinessForm,
+    BaseDriverLicenseForm,
+    BaseNameForm,
+    PhoneForm,
+)
+from platform_utils.utils.functools import cache_property
+from platform_utils.utils.obj_utils import get_attr_chained
+
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.constants import COMPLIANCE_FEATURE, MATERIAL_CODES
+from dtplatform.common.contract.constants import (
+    CONTRACT_FEATURE_CODE_CON,
+    CONTRACT_FEATURE_STATUS_CODE_NEW,
+)
+from dtplatform.common.credit_bureau import constants as cb_constants
+from dtplatform.common.credit_bureau.base_credit_bureau_manager import BaseBureauManager
+from dtplatform.common.credit_bureau.parsers import constants as cb_parser_constants
+from dtplatform.common.decisions.constants import (
+    CONTRACT_FEATURE_CODE,
+    DTCOM_EXCLUDE_DEAL_STATUSES,
+    FeatureEventCode,
+)
+from dtplatform.common.fusion.dealer_subscription_manager import DealerSubscriptionManager
+from dtplatform.core.constants import TRUTH
+from dtplatform.core.dealjacket_event_manager import DealJacketEventManager
+from dtplatform.core.models.reference import (
+    DealStatus,
+    DealType,
+    Feature,
+    FeatureStatus,
+    PartyRelationship,
+    USState,
+)
+from dtplatform.core.usermanager import UserManager
+from dtplatform.core.ymmt_manager import YMMTManager
+from dtplatform.notification.notification_manager import Notification
+from dtplatform.utils.dt_json import follow_keys
+
+from common.credit_app.forms import BaseSpotForm
+from common.forms.constants import (
+    APP_COAPP_SAME_SSN,
+    BUSINESS_SSN_RE_ENTER,
+    ID_VERIFICATION_NONE,
+    ID_VERIFICATION_OFAC_ONLY,
+    ID_VERIFICATION_REDFLAG_OFAC,
+)
+from common.forms.validations import ApplicantFormValidations
+from utils.forms.layouts import (
+    address_layout,
+    common_asset_type_layout,
+    employment_layout,
+    housing_layout,
+    name_layout,
+    previous_address_layout,
+    previous_employment_layout,
+    primary_phone_layout,
+    secondary_phone_layout_field,
+)
+from utils.forms.ymmt import ChromeYMMTForm
+
+
+ZIPCODELOOKUP_URL = "core/zipcode/"
+IS_BUSINESS_CHOICES = (('N', 'Individual'), ('Y', 'Business'))
+ADD_COAPPLICANT_CHOICES = (('J', 'Joint Applicant'), ('C', 'Co-Signer/Guarantor'), ('N', 'None'))
+CREDCO_SUBSCRIBER_NAME = "CRD"
+TRANSUNION_KEY_NAME = "TransUnion"
+SUBSCRIBER_NAME_KEY_NAME = "subscribername"
+COAPPLICANT_CHOICES = [[True, 'Yes'], [False, 'No']]
+CONDITION_CHOICES = [['NEW', 'New'], ['USED', 'Used'], ['DEMO', 'Demo'],
+                     ['CERT', 'Certified']]
+ID_VERIFICATION_CHOICES = ((ID_VERIFICATION_NONE, _('None')), (ID_VERIFICATION_REDFLAG_OFAC, _('Run Red Flags/OFAC')), (ID_VERIFICATION_OFAC_ONLY, _('OFAC only')))
+ID_VERIFICATION_CHOICES_BUSINESS = ((ID_VERIFICATION_NONE, _('None')), (ID_VERIFICATION_OFAC_ONLY, _('OFAC only')))
+TRANSMISSION_CHOICES = [('', ''), ('Automatic', 'Automatic'), ('Manual', 'Manual')]
+
+
+same_address_field = forms.BooleanField(
+    label='Same as applicant address',
+    required=False,
+    widget=forms.CheckboxInput(attrs={
+        'data-copyvalues-src': ','.join([
+            '#id_applicant_address_0',
+            '#id_applicant_address_1',
+            '#id_applicant_address_2',
+            '#id_applicant_address_3',
+            '#id_applicant_address_4',
+        ]),
+        'data-copyvalues-dest': ','.join([
+            '#id_line_1_address',
+            '#id_line_2_address',
+            '#id_city',
+            '#id_us_state_code',
+            '#id_zip_code',
+        ]),
+        'data-dependent-fields': ','.join([
+            '#id_line_1_address',
+            '#id_line_2_address',
+            '#id_city',
+            '#id_us_state_code',
+            '#id_zip_code',
+        ]),
+    })
+)
+
+
+class ComplianceSubscriptionMixin(object):
+    """ Mixin to check for connected dealers compliance subscription """
+
+    @cache_property
+    def dealer_subscription_manager(self):
+        """
+        Get `DealerSubscriptionManager`.
+        """
+        context_data = self.request.context_data if getattr(self, 'request', '') else self.context_data
+        return getManager(DealerSubscriptionManager, context_data)
+
+    def is_deal_jacket_event_present(self, event_code, dealjacket_id):
+        """ Retrieves boolean value whether or not the DJ event is present """
+        djem = getManager(DealJacketEventManager, self.request.context_data)
+        return djem.does_specific_event_exist(dealjacket_id, event_code)
+
+    def _check_subscription_from_session(self, material_codes):
+        """Internal method to check product subscription based on the material code
+
+        Args:
+            material_codes(list): List of material codes
+        Returns:
+            True or False
+        """
+        if getattr(self, 'request', '') and self.request.session:
+            return set(material_codes).issubset(self.request.session['CMN'].get('subscriptions', []))
+        else:
+            return self.dealer_subscription_manager.is_subscribed_product(self.context_data.get('dealer_code'),
+                                                                          material_codes)
+
+    @property
+    def is_dealer_compliance_subscribed(self):
+        """Retrieves boolean value whether or not connected dealer has full compliance subscription."""
+        return self._check_subscription_from_session(MATERIAL_CODES.get('CMP'))
+
+    @property
+    def is_dealer_compliance_lite_subscribed(self):
+        """Retrieves boolean value whether or not connected dealer has compliance lite subscription."""
+        return self._check_subscription_from_session(MATERIAL_CODES.get('RF'))
+
+    @property
+    def is_dealer_subscribed_for_risk_fraud_index(self):
+        """Retrieves boolean value whether or not connected dealer has subscribed for Fraud Index Meter."""
+        return self._check_subscription_from_session(MATERIAL_CODES.get('RFI'))
+
+
+class ComplianceAlertMixin(ComplianceSubscriptionMixin):
+    """ Mixin to check for alerts for views for compliance """
+
+    def show_warning_cbauth(self, dealjacket_id, request):
+        """Shows warning for CB Auth
+
+        Args:
+            deal_jacket_id: The deal jacket id
+            request: Request object of the view
+
+        Returns:
+            none
+        """
+        if not self.is_deal_jacket_event_present(FeatureEventCode.CreditBureauAuthorizationEvent, dealjacket_id) \
+           and not self.is_deal_jacket_event_present(FeatureEventCode.CBAUTHManuallyCompletedCode, dealjacket_id):
+            popup_url = reverse('credit_bureau_auth_form', args=[dealjacket_id])
+            cb_auth = Notification('0248').get()["message"]
+            cb_auth_full_html = ('{cb_auth_message}'
+                                 '<a class=\"request-generalmodal\" '
+                                 'data-toggle=\"modal\" '
+                                 'href=\"#request_general_modal\" '
+                                 'data-content= \"{popup_url}\"> '
+                                 'See Details</a>'.format(cb_auth_message=cb_auth,
+                                                          popup_url=popup_url))
+            warning(request, mark_safe(cb_auth_full_html))
+
+    def show_privacy_policy_alert(self, view_request, url, deal_jacket_id):
+        """Defines the business rules under which the privacy_policy_alert will be shown"""
+        if self.is_deal_jacket_event_present(FeatureEventCode.CreditAppSaveCode, deal_jacket_id) \
+                and all([not self.is_deal_jacket_event_present(FeatureEventCode.PrivacyPolicyGiven, deal_jacket_id),
+                         not self.is_deal_jacket_event_present(FeatureEventCode.PrivacyPolicyManuallyCompletedCode,
+                                                               deal_jacket_id)]):
+            # If the privacy policy event and privacy policy manually marked complete event
+            # does not exist but the credit app saved event exists - show alert.
+            # The general modal is called here and added to the warning link.
+            # Data-content is set to the URL of the form that will be called.
+            warning_message = Notification('0250').get()["message"]
+            pp_popup_url = ('{warning_message}<a id=\"pp modal\" '
+                            'class=\"request-generalmodal\" '
+                            'data-toggle=\"modal\" '
+                            'href=\"#request_general_modal\" '
+                            'data-content=\"{popup_url}\"> '
+                            'See Details</a>').format(warning_message=warning_message,
+                                                      popup_url=url)
+
+            warning(view_request, mark_safe(pp_popup_url))
+
+    def show_warning_cbrbp(self, dealjacket_id, request, rbp_link):
+        """Shows warning for CB RBP Document to print
+
+        Args:
+            deal_jacket_id: The deal jacket id
+            request: Request object of the view
+            link: Boolean
+
+        Returns:
+            none
+        """
+        if not self.is_deal_jacket_event_present(FeatureEventCode.RBPNoticeCompleteCode, dealjacket_id) and rbp_link:
+            rbp_print_url = Notification('0310').get()["message"].format(dealjacket_id).replace("\\", "")
+            warning(request, mark_safe(rbp_print_url))
+
+    def show_warning_adverse_action(self, dealjacket_id, request):
+        """Shows warning for CB Adverse Action Document to print
+
+        Args:
+            deal_jacket_id: The deal jacket id
+            request: Request object of the view
+            link: Boolean
+            score: Score Model
+
+        Returns:
+            none
+        """
+
+        if not self.is_deal_jacket_event_present(FeatureEventCode.AdverseActionNoticePrintedCode, dealjacket_id) and self.is_deal_jacket_event_present(FeatureEventCode.CreditBureauBureauRequestedCode, dealjacket_id):
+            adverse_action = Notification('0374').get()["message"]
+            adverse_action_url = '<a id=\"id_add_notice_link\" data-toggle=\"modal\" href="" data-content=\"/dealjackets/{}/adverse_action/\"> Print Adverse Action</a>'.format(
+                dealjacket_id)
+            adverse_action_text = adverse_action + adverse_action_url
+            warning(request, mark_safe(adverse_action_text))
+
+    def show_warning_score_details(self, request, credit_bureau_responses):
+        """Shows warning for CB Scores
+
+        Args:
+            request: Request object of the view
+            credit_bureau_responses (dict): dictionary mapping a bureau name and its respective CreditBureauResponse
+
+        Returns:
+            none
+        """
+        def remove_startswith(main_str, substring):
+            """Remove a string from the beginning of another string and returns the new string.
+            Args:
+                main_str (str): the string from which we will be removing a designated substring
+                substring (str): the string to remove in the main string
+            Returns:
+                New string with substring removed from the beginning of it if found; returns same string if not found.
+            """
+            return main_str.replace(substring, '', 1) if main_str.startswith(substring) else main_str
+
+        def convert_list_to_unordered_list_html(list_items):
+            """Return the HTML for an unordered list from a list only if the number of items is greater than 1.
+            Args:
+                list_items(list): list of elements
+            Returns:
+                HTML string representing an unordered list for all elements in list_items if list_items has more than
+                one item; else, return the first element only.
+            """
+            if len(list_items) == 1:
+                return list_items[0]
+            else:
+                ul_html = '<ul>{elements}</ul>'
+                elements = ''.join(['<li>{element}</li>'.format(element=e) for e in list_items])
+                return ul_html.format(elements=elements)
+
+        for bureau_provider in ['equifax', 'experian', 'transunion']:
+            if credit_bureau_responses.get(bureau_provider) and credit_bureau_responses[bureau_provider].error_message_text:
+                bureau_err_msg_text = credit_bureau_responses[bureau_provider].error_message_text
+                bureau_err_msg_tokens = bureau_err_msg_text.split('\n')
+                if len(bureau_err_msg_tokens) > 1:
+                    warn_msg = '{} Error Messages {}'.format(bureau_provider.title(),
+                                                             convert_list_to_unordered_list_html(bureau_err_msg_tokens))
+                else:
+                    warn_msg = '{} Error Message: {}'.format(bureau_provider.title(),
+                                                             credit_bureau_responses[bureau_provider].error_message_text)
+                warning(request, mark_safe(warn_msg))
+
+        base_bureau_manager = getManager(BaseBureauManager, self.request.context_data)
+        cb_subscr_info = base_bureau_manager.get_bureau_subscription_info_dict(self.request.context_data['dealer_code'])
+        cb_subscrb_name = cb_subscr_info.iteritems().next()[1][cb_constants.SUBSCRIBERNAME_KEY]
+
+        # Shows Credco-specific errors on the UI
+        if cb_subscrb_name in cb_constants.SUBSCRIPTION_PROVIDERS_CREDCO:
+            # The Credco error message will be the same for all of the bureaus, so pick any one of them
+            cb_resp = get_attr_chained(credit_bureau_responses.values(), [0])
+            cb_raw_response_json_str = get_attr_chained(cb_resp,
+                                                        ['cb_response_raw', 'credit_bureau_response_json_tx'],
+                                                        '{}')
+            if cb_raw_response_json_str:
+                cb_raw_response_json = json.loads(cb_raw_response_json_str)
+                cb_err_message_dict_list = follow_keys(cb_raw_response_json,
+                                                       cb_parser_constants.CRD_ERROR_MESSAGE_KEYCHAIN, [])
+                credco_err_dict_list = filter(lambda d: d.get(cb_parser_constants.CRD_SOURCE_TYPE) == cb_parser_constants.CRD_SOURCE_TYPE_CREDCO, cb_err_message_dict_list)
+                credco_err_dict = get_attr_chained(credco_err_dict_list, [0])
+                if credco_err_dict:
+                    # Make sure to remove the "Error" text from the beginning of all Credco error messages.
+                    credco_err_msg_list_filtered = [remove_startswith(remove_startswith(msg, 'Error: '), 'Error:')
+                                                    for msg in credco_err_dict['_Text']]
+                    credco_error_msg = convert_list_to_unordered_list_html(credco_err_msg_list_filtered)
+                    warn_msg = 'Credco Error Message: {}'.format(credco_error_msg)
+                    if len(credco_err_msg_list_filtered) > 1:
+                        warn_msg = 'Credco Error Messages {}'.format(credco_error_msg)
+                    warning(request, mark_safe(warn_msg))
+
+
+class BaseDealJacketListFilterForm(BaseForm):
+
+    """Filter form for the dealjacket list page."""
+
+    def __init__(self, user, *args, **kwargs):
+        super(BaseDealJacketListFilterForm, self).__init__(*args, **kwargs)
+
+        user_manager = getManager(UserManager, {
+            'user_code': user.user_code,
+            'dealer_code': self.context_data.get('dealer_code')
+        })
+
+        current_user = user_manager.get_current_user_with_dealers()
+        dealership_choices = [
+            (dealer.dealercode, dealer.dealername)
+            for dealer in current_user.dealers
+        ]
+
+        dealer_users = user_manager.get_dealer_active_users()
+        dealership_user_choices = [("", "Select",)] + [
+            (dealer_user.user_code, '%s, %s' % (dealer_user.last_name, dealer_user.first_name))
+            for dealer_user in dealer_users
+        ]
+
+        self.fields['dealer_code'].choices = dealership_choices
+        self.fields["modified_user_code"].choices = dealership_user_choices
+        self.fields['deal_type'].choices = DealType.choices()
+        self.fields['deal_status_code'].choices = self._get_deal_status_choices(*DTCOM_EXCLUDE_DEAL_STATUSES)
+        self.fields['alert_value'].choices = self._get_alert_value_choices(
+            self.context_data.get('compliance_subscription'))
+
+    def _get_deal_status_choices(self, *exclude_deal_statuses):
+        """
+        :return: list of deal status with grouping
+        """
+        deal_status_grouped = defaultdict(list)
+        for feature_status in FeatureStatus.all(self.context_data['tenant_code']).itervalues():
+            deal_status = DealStatus.get((feature_status.deal_status_code, feature_status.tenant_code))
+            feature_name = Feature.get((feature_status.feature_code, feature_status.tenant_code)).feature_name
+            feature_code = Feature.get((feature_status.feature_code, feature_status.tenant_code)).feature_code
+            # Excluding Compliance from List
+            if feature_name != COMPLIANCE_FEATURE:
+                # If deal status is not present under particular feature then continue
+                if (deal_status.deal_status_code, deal_status.deal_status_name) not in deal_status_grouped[feature_name]\
+                        and deal_status.deal_status_code not in exclude_deal_statuses \
+                        and not all([deal_status.deal_status_code == CONTRACT_FEATURE_STATUS_CODE_NEW,
+                                     feature_code == CONTRACT_FEATURE_CODE_CON]):
+                        deal_status_grouped[feature_name].append((deal_status.deal_status_code,
+                                                                  deal_status.deal_status_name))
+                elif deal_status.deal_status_code in exclude_deal_statuses and feature_code != CONTRACT_FEATURE_CODE:
+                    deal_status_grouped[feature_name].append((deal_status.deal_status_code,
+                                                              deal_status.deal_status_name))
+        if 'HIDDEN' not in exclude_deal_statuses:
+            deal_status_grouped[Feature.get(('DJ', 'DTCOM')).feature_name].append(('HIDDEN', 'Hidden'))
+        # Sort deal status under their respective feature alphabetically
+        result = [(key, sorted(value, key=lambda x: x[1])) for key, value in deal_status_grouped.items()]
+        # Sort Feature name alphabetically
+        return [('', 'Select')] + sorted(result, key=lambda x: x[0])
+
+    def _get_alert_value_choices(self, subscribed_to_compliance):
+        """
+        Returns proper alert choices based upon compliance subscription status
+        Args:
+            subscribed_to_compliance:
+
+        Returns:
+            Alert choices.
+        """
+        base_alert_choices = [("All", "All"), ("CDE", "Credit Decision Expired"), ("CTS", "Contract Suspended")]
+        if subscribed_to_compliance:
+            base_alert_choices.append(("AANR", "Adverse Action Recommended"))
+            return base_alert_choices
+        else:
+            return base_alert_choices
+
+    created = forms.ChoiceField(
+        label="Created",
+        choices=[("", "Select")] + [
+            (1, "Today"),
+            (3, "3 days"),
+            (7, "7 days",),
+            (30, "30 days",),
+        ]
+    )
+    deal_type = forms.MultipleChoiceField(
+        label="Type",
+        widget=forms.CheckboxSelectMultiple()
+    )
+    deal_status_code = forms.ChoiceField(
+        label="Status",
+    )
+    dealer_code = forms.MultipleChoiceField(
+        label="Dealerships",
+        widget=forms.CheckboxSelectMultiple()
+    )
+    modified_user_code = forms.ChoiceField(
+        label="User"
+    )
+    alert_value = forms.MultipleChoiceField(
+        label="Alerts",
+        widget=forms.CheckboxSelectMultiple(attrs={'id': 'alert_value'})
+    )
+
+
+class DealJacketListSortForm(BaseForm):
+    """Implement a simple sort based on data in the DealJacket model."""
+    sort_by = forms.ChoiceField(
+        label="Sort By",
+        choices=[
+            ('created_timestamp|desc', 'Newest'),
+            ('created_timestamp|asc', 'Oldest'),
+        ],
+    )
+
+    @classmethod
+    def valid_fields(cls):
+        """Return a list of valid fields for this form."""
+        choices = [v.choices for k, v in cls.base_fields.iteritems()
+                   if k == 'sort_by'][0]
+        return set([choice[0].split('|')[0] for choice in choices])
+
+
+class BaseCreateDealJacketCustomerForm(ApplicantFormValidations,
+                                       BaseNameForm,
+                                       PhoneForm,
+                                       BaseDriverLicenseForm,
+                                       BaseCustomerSaveForm,
+                                       ComplianceSubscriptionMixin):
+
+    """
+    Form for processing customer data.
+    """
+    request_bureau = forms.TypedChoiceField(
+        coerce=lambda x: bool(int(x)),
+        label=_("Request Bureau"),
+        choices=((1, "Yes"), (0, "No")),
+        widget=forms.RadioSelect(),
+        initial=0,
+        required=False
+    )
+    id_verification = forms.ChoiceField(
+        label=_("ID Verification"),
+        required=True,
+        choices=ID_VERIFICATION_CHOICES,
+        initial=ID_VERIFICATION_NONE,
+        widget=forms.RadioSelect()
+    )
+    is_business = forms.ChoiceField(
+        label="",
+        choices=IS_BUSINESS_CHOICES,
+        initial='N',
+        widget=forms.RadioSelect()
+    )
+    cc_id = forms.IntegerField(required=False, widget=forms.HiddenInput())
+    tax_id = SocialSecurityField(
+        label=_("Social Security Num."),
+        required=False
+    )
+    birth_date = DateOfBirth()
+    email_address = forms.EmailField(
+        label=_("E-mail Address"),
+        required=False,
+        max_length=50,
+        widget=TextInputOptional()
+    )
+    bureaus = forms.MultipleChoiceField(
+        label="Provider",
+        choices=[],
+        widget=forms.CheckboxSelectMultiple,
+        required=False
+    )
+    merge_bureaus = forms.BooleanField(
+        required=False,
+        label=_("Merge the bureaus I've selected into one file")
+    )
+    customer_permission = forms.BooleanField(
+        label=_(
+            """I have customer permission to pull a credit report or
+            otherwise had a permissable purpose to do so."""
+        ),
+        required=False
+    )
+    has_coapplicant = forms.ChoiceField(
+        label=_("Add Co-Applicant?"),
+        initial=False,
+        required=False,
+        choices=COAPPLICANT_CHOICES,
+        widget=forms.RadioSelect())
+
+    coapplicant_tax_id = forms.CharField(required=False,
+                                         widget=forms.HiddenInput())
+
+    def __init__(self, *args, **kwargs):
+        edit_mode = kwargs.pop("Edit_Mode", False)
+        unmasked_birth_date = kwargs.pop("unmasked_birth_date", '')
+        super(BaseCreateDealJacketCustomerForm, self).__init__(*args, **kwargs)
+        self.unmasked_birth_date = unmasked_birth_date
+
+        # bureau choices are dynamic based on an individual
+        # dealer's subscription to various credit bureaus
+        dealer_code = kwargs.pop('dealer_code', '')
+        if not dealer_code:
+            dealer_code = self.context_data['dealer_code']
+        self.helper = FormHelper()
+        self.call_required_validation = False
+        merge_bureaus_show_hide = ""
+        request_bureau_hide = ""
+        has_coapplicant = ""
+        id_verification = ""
+
+        if not edit_mode:
+            manager = getManager(BaseBureauManager, self.context_data)
+            bureau_subscriptions = manager.get_bureau_subscription_info_dict(dealer_code)
+            request_bureau_hide = "request_bureau"
+            has_coapplicant = 'has_coapplicant'
+            merge_bureaus_show_hide = "merge_bureaus"
+            self.fields['request_bureau'].required = True
+            if len(bureau_subscriptions) == 0:
+                request_bureau_hide = ""
+                self.fields['request_bureau'].required = False
+            bureau_choices = [
+                (v["name"].lower()[:2], v["name"],)
+                for k, v in bureau_subscriptions.iteritems()
+            ]
+            self.fields["bureaus"].choices = sorted(bureau_choices, key=lambda tup: tup[1])
+            self.helper.add_input(Submit('_continue_', 'Continue'))
+            if bureau_subscriptions:
+                for bureau_subscription in bureau_subscriptions:
+                    if bureau_subscriptions[bureau_subscription][SUBSCRIBER_NAME_KEY_NAME] != CREDCO_SUBSCRIBER_NAME:
+                        merge_bureaus_show_hide = ""
+
+        if edit_mode:
+            self.fields['is_business'].widget = forms.HiddenInput()
+            self.fields['tax_id'] = SocialSecurityField(is_edit=True, label='Social Security Num.', required=False)
+        if not kwargs.get('initial', {}):
+            self.fields['tax_id'].masked = False
+
+        # self.fields['birth_date'].widget. = TextInputOptional()
+        self.fields['birth_date'].widget.attrs["placeholder"] = "optional"
+        del self.fields['employment_status_code'].widget.attrs[
+            "data-optionally-req"]
+        self.helper.form_class = 'form-horizontal'
+        self.helper.attrs = {'data-validate': 'true', 'autocomplete': 'off'}
+        self.helper.error_text_inline = False
+        if self.is_dealer_compliance_subscribed or self.is_dealer_compliance_lite_subscribed:
+            id_verification = "id_verification"
+        else:
+            self.fields['id_verification'].required = False
+
+        self.helper.layout = Layout(
+            Div(
+                HTML('<h4>{{ text_header }}</h4>'),
+                Div(css_class="divider"),
+                Fieldset(
+                    'Applicant Information',
+                    'cc_id',
+                    Div(
+                        'is_business',
+                        css_class="app-type"
+                    ),
+                    request_bureau_hide,
+                    id_verification,
+                    deepcopy(name_layout),
+                    deepcopy(address_layout),
+                    deepcopy(self.get_primary_phone_layout()),
+                    'email_address',
+                    'tax_id',
+                    has_coapplicant,
+                    'coapplicant_tax_id',
+                ),
+                Div(css_class="divider"),
+                Fieldset(
+                    '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#addl_info">Additional Information</a>',
+                    Div(
+                        secondary_phone_layout_field,
+                        'birth_date',
+                        deepcopy(housing_layout),
+                        'drivers_license',
+                        'drivers_license_us_state_code',
+                        css_class="collapse",
+                        id="addl_info",
+                    ),
+
+                ),
+                Div(
+                    Div(css_class="divider"),
+                    Fieldset(
+                        '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#prev_add_info">Previous Address Information</a>',
+                        Div(
+                            deepcopy(previous_address_layout),
+                            css_class="collapse",
+                            id="prev_add_info"
+                        )
+                    ),
+                    css_class="prev_address hide"
+                ),
+                Div(css_class="divider"),
+                Fieldset(
+                    '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#empl_info">Employment Information</a>',
+                    Div(
+                        deepcopy(employment_layout),
+                        css_class="collapse",
+                        id="empl_info"
+                    ),
+                ),
+                css_class="panel"
+            ),
+            FormActions(
+                Submit('_save_', '{{ action_type }}', css_class='btn-primary'),
+            )
+        )
+        if not edit_mode:
+            self.helper.layout[0].append(
+                Div(
+                    Div(css_class="divider"),
+                    Fieldset(
+                        'Bureaus',
+                        Div(
+                            Field(
+                                'bureaus',
+                                template='dt_form_layouts/forms/bureauselection.html'
+                            ),
+                            Field(
+                                merge_bureaus_show_hide,
+                                'combine',
+                            ),
+                            css_class="collapse",
+                            id="bureau-request"
+                        ),
+                        data_target="#bureau-request"
+                    ),
+                    css_class="bureau"
+                )
+            )
+        else:
+            # This is being removed from AHFC layout. Please adjust pop if
+            # you are appending another div to this form.
+            self.helper.layout[0].append(
+                Div(
+                    Div(css_class="divider"),
+                    Fieldset(
+                        '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#prev_employment_info">Previous Employment Information</a>',
+                        'Previous Employment Information',
+                        Div(
+                            deepcopy(previous_employment_layout),
+                            'current_employed_total_months',
+                            css_class="collapse",
+                            id="prev_employment_info"
+                        )
+                    ),
+                    css_class="prev_employment hide"
+                )
+            )
+
+    def clean(self):
+        cleaned_data = super(BaseCreateDealJacketCustomerForm, self).clean()
+        request_bureau = cleaned_data.get("request_bureau")
+        id_verification = cleaned_data.get("id_verification")
+        tax_id = cleaned_data.get("tax_id")
+        bureaus = cleaned_data.get("bureaus")
+        has_coapplicant = cleaned_data.get("has_coapplicant")
+        coapplicant_tax_id = cleaned_data.get("coapplicant_tax_id")
+        if tax_id and (tax_id == coapplicant_tax_id):
+            self._errors["tax_id"] = self.error_class([APP_COAPP_SAME_SSN])
+        if (not tax_id) and id_verification == ID_VERIFICATION_REDFLAG_OFAC and "tax_id" not in self._errors:
+            self._errors["tax_id"] = self.error_class(["SSN is required for Red Flags."])
+            del cleaned_data["tax_id"]
+
+        if request_bureau:
+            # check to see if tax_id already has errors from running
+            # the base field clean method. both of these checks are
+            # needed as cleaned_data["tax_id"] will be cleared out
+            # if it's either a missing required or invalid data entry.
+            # this feels a bit hacky though
+            if (not tax_id) and ("tax_id" not in self._errors):
+                self._errors["tax_id"] = self.error_class(["SSN is required."])
+                del cleaned_data["tax_id"]
+            if (not bureaus) and (has_coapplicant == "False"):
+                self._errors["bureaus"] = self.error_class(
+                    ["A bureau selection is required."]
+                )
+                del cleaned_data["bureaus"]
+
+        return cleaned_data
+
+    def get_primary_phone_layout(self):
+        """Retrieve the primary_phone_layout"""
+        return primary_phone_layout
+
+
+class BaseCreateDealNoteForm(BaseForm):
+
+    """Form for creating deal notes."""
+    title_text = forms.CharField(
+        max_length=50,
+        widget=TextInputOptional(),
+        required=False)
+
+    note_text = forms.CharField(
+        max_length=500,
+        required=True,
+        widget=forms.Textarea())
+
+
+class BaseCoapplicantForm(ApplicantFormValidations,
+                          BaseNameForm,
+                          PhoneForm,
+                          BaseDriverLicenseForm,
+                          BaseCustomerSaveForm,
+                          ComplianceSubscriptionMixin):
+
+    """Form for processing coapplicant data."""
+    bureau_requested = False
+    cc_id = forms.IntegerField(
+        required=False,
+        widget=forms.HiddenInput(),
+    )
+    tax_id = SocialSecurityField(
+        label=_('Social Security Num.'),
+        required=False,
+    )
+    applicant_address = forms.CharField(
+        required=False,
+        widget=forms.MultipleHiddenInput())
+    birth_date = DateOfBirth()
+    ssn_changed = forms.BooleanField(
+        widget=forms.HiddenInput(),
+        required=False,
+    )
+    applicant_tax_id = forms.CharField(
+        required=False,
+        widget=forms.HiddenInput()
+    )
+    email_address = forms.EmailField(
+        label=_("E-mail Address"),
+        required=False,
+        max_length=50,
+        widget=TextInputOptional()
+    )
+    bureaus = forms.MultipleChoiceField(
+        label="Provider",
+        choices=[],
+        widget=forms.CheckboxSelectMultiple,
+        required=False,
+    )
+    merge_bureaus = forms.BooleanField(
+        required=False,
+        label=_("Merge the bureaus I've selected into one file"),
+    )
+    combine = forms.BooleanField(
+        required=False,
+        label=_("Combine Applicant and Co-Applicant (Spouse Only) files"),
+    )
+    customer_permission = forms.BooleanField(
+        label=_(
+            """I have customer permission to pull a credit report or
+            otherwise had a permissible purpose to do so."""
+        ),
+        required=False,
+    )
+    party_relationship_code = forms.ChoiceField(
+        label=_("Relationship"),
+        required=False,
+        widget=forms.Select()
+    )
+    id_verification = forms.ChoiceField(
+        label=_("ID Verification"),
+        required=True,
+        initial=ID_VERIFICATION_NONE,
+        choices=ID_VERIFICATION_CHOICES,
+        widget=forms.RadioSelect(attrs={
+            "data-optionally-req": "#id_tax_id",
+            "data-req-val": ID_VERIFICATION_REDFLAG_OFAC,
+        })
+    )
+
+    def __init__(self, *args, **kwargs):
+        bureau_requested = kwargs.pop('bureau_requested', False)
+        unmasked_birth_date = kwargs.pop("unmasked_birth_date", '')
+        super(BaseCoapplicantForm, self).__init__(*args, **kwargs)
+        self.unmasked_birth_date = unmasked_birth_date
+        dealer_code = kwargs.pop('dealer_code', '')
+        if not dealer_code:
+            dealer_code = self.context_data['dealer_code']
+
+        self.call_required_validation = False
+        merge_bureaus_show_hide = ""
+        combine_show_hide = ""
+        party_relationship = ""
+        id_verification = ""
+        if self.is_dealer_compliance_subscribed or self.is_dealer_compliance_lite_subscribed:
+            id_verification = "id_verification"
+        else:
+            self.fields['id_verification'].required = False
+
+        self.bureau_requested = bureau_requested
+
+        manager = getManager(BaseBureauManager, self.context_data)
+        bureau_subscriptions = manager.get_bureau_subscription_info_dict(dealer_code)
+
+        bureau_choices = [
+            (v["name"].lower()[:2], v["name"],)
+            for v in bureau_subscriptions.values()
+        ]
+        self.fields["bureaus"].choices = sorted(bureau_choices, key=lambda tup: tup[1])
+
+        if bureau_requested:
+            relationship_choices = deepcopy(list(PartyRelationship.choices(add_empty=True)))
+            relationship_choices.remove((u'C', PartyRelationship.get("C").party_relationship_name))
+            relationship_choices.remove((u'D', PartyRelationship.get("D").party_relationship_name))
+            self.fields['party_relationship_code'].choices = relationship_choices
+
+            merge_bureaus_show_hide = "merge_bureaus"
+            combine_show_hide = "combine"
+            if bureau_subscriptions:
+                for bureau_subscription in bureau_subscriptions:
+                    if bureau_subscriptions[bureau_subscription][SUBSCRIBER_NAME_KEY_NAME] != CREDCO_SUBSCRIBER_NAME:
+                        merge_bureaus_show_hide = ""
+                        # TODO: check if relationship is spouse
+                        combine_show_hide = ""
+            party_relationship = "party_relationship_code"
+            self.fields['tax_id'].widget.attrs["placeholder"] = ""
+            self.fields['tax_id'].required = True
+
+        if kwargs.get('initial') and not kwargs.get('initial').get('tax_id'):
+            self.fields.get('tax_id').masked = False
+        self.fields['birth_date'].widget.attrs["placeholder"] = "optional"
+        self.helper = FormHelper()
+        self.helper.form_class = 'form-horizontal'
+        self.helper.attrs = {'data-validate': 'true'}
+        self.helper.error_text_inline = False
+
+        self.helper.layout = Layout(
+            Div(
+                HTML('<h4>{{ text_header }}</h4>'),
+                Div(css_class="divider"),
+                Fieldset(
+                    'Co-Applicant Information',
+                    'cc_id',
+                    id_verification,
+                    'applicant_address',
+                    party_relationship,
+                    deepcopy(name_layout),
+                    'same_address',
+                    deepcopy(address_layout),
+                    deepcopy(self.get_primary_phone_layout()),
+                    'email_address',
+                    Field('ssn_changed'),
+                    Field('applicant_tax_id'),
+                    Field(
+                        'tax_id',
+                        data_ssntrim="true"
+                    )
+                ),
+                Div(css_class="divider"),
+                Fieldset(
+                    '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#addl_info">Additional Information</a>',
+                    Div(
+                        secondary_phone_layout_field,
+                        'birth_date',
+                        deepcopy(housing_layout),
+                        'drivers_license',
+                        'drivers_license_us_state_code',
+                        css_class="collapse",
+                        id="addl_info",
+                    )
+                ),
+                Div(
+                    Div(css_class="divider"),
+                    Fieldset(
+                        '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#prev_add_info">Previous Address Information</a>',
+                        Div(
+                            deepcopy(previous_address_layout),
+                            css_class="collapse",
+                            id="prev_add_info"
+                        )
+                    ),
+                    css_class="prev_address hide"
+                ),
+                Div(css_class="divider"),
+                Fieldset(
+                    '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#empl_info">Employment Information</a>',
+                    Div(
+                        deepcopy(employment_layout),
+                        css_class="collapse",
+                        id="empl_info"
+                    )
+                ),
+                # This is being removed from AHFC layout. Please adjust pop if
+                # you are appending another div to this form.
+                Div(
+                    Div(css_class="divider"),
+                    Fieldset(
+                        '<a href="javascript:void(0)" class="collapsible collapsed" data-toggle="collapse" data-target="#prev_empl_info">Previous Employment Information</a>',
+                        Div(
+                            deepcopy(previous_employment_layout),
+                            'current_employed_total_months',
+                            id="prev_empl_info"
+                        )
+                    ),
+                    css_class="prev_employment hide"
+                ),
+                css_class="panel"
+            ),
+            FormActions(
+                Submit('submit', '{{action_type}}', css_class='btn-primary'),
+            ),
+        )
+        if bureau_requested:
+            self.helper.layout[0].append(
+                Div(
+                    Div(css_class="divider"),
+                    Fieldset(
+                        'Bureaus',
+                        Div(
+                            Field(
+                                'bureaus',
+                                template='dt_form_layouts/forms/bureauselection.html'
+                            ),
+                            Field(
+                                merge_bureaus_show_hide,
+                                combine_show_hide,
+                            ),
+                            css_class="collapse",
+                            id="bureau-request"
+                        ),
+                        data_target="#bureau-request"
+                    ),
+                    css_class="bureau"
+                )
+            )
+
+    same_address = same_address_field
+
+    def clean(self):
+        # print "validation in DJ: ", self.__dict__
+        cleaned_data = super(BaseCoapplicantForm, self).clean()
+        tax_id = cleaned_data.get("tax_id")
+        bureaus = cleaned_data.get("bureaus")
+        applicant_tax_id = self.cleaned_data.get("applicant_tax_id")
+        id_verification = cleaned_data.get("id_verification")
+        if tax_id and (tax_id == applicant_tax_id):
+            self._errors["tax_id"] = self.error_class([APP_COAPP_SAME_SSN])
+        if (not tax_id) and id_verification == ID_VERIFICATION_REDFLAG_OFAC and "tax_id" not in self._errors:
+            self._errors["tax_id"] = self.error_class(["SSN is required for Red Flags."])
+            del cleaned_data["tax_id"]
+
+        if self.bureau_requested:
+            # check to see if tax_id already has errors from running
+            # the base field clean method. both of these checks are
+            # needed as cleaned_data["tax_id"] will be cleared out
+            # if it's either a missing required or invalid data entry.
+            # this feels a bit hacky though
+            if (not tax_id) and ("tax_id" not in self._errors):
+                self._errors["tax_id"] = self.error_class(["SSN is required."])
+                del cleaned_data["tax_id"]
+            if not bureaus:
+                self._errors["bureaus"] = self.error_class(
+                    ["A bureau selection is required."]
+                )
+                del cleaned_data["bureaus"]
+
+        return cleaned_data
+
+    def get_primary_phone_layout(self):
+        """ Retrieve the primary_phone_layout """
+        return primary_phone_layout
+
+
+class BaseManageVehicleForm(ChromeYMMTForm):
+    """ Form class from AddVehicle and EditVehicle View's. """
+    def __init__(self, product_type=None, *args, **kwargs):
+        super(BaseManageVehicleForm, self).__init__(*args, **kwargs)
+        self.fields['year_id'].required = True
+        self.fields['make_id'].required = True
+        self.fields['model_id'].required = True
+        self.fields['trim_id'].required = True
+        self.fields['transmission_type_name'].required = False
+
+        condition_type = None
+        if self.data.get('condition_type'):
+            condition_type = self.data.get('condition_type').upper()
+        elif self.initial.get('condition_type'):
+            condition_type = self.initial.get('condition_type').upper()
+
+        ymmt_manager = getManager(YMMTManager, self.context_data)
+        # product_type can be None in case of Ajax field validations.
+        if product_type and condition_type:
+            year_choices = ymmt_manager.find_filtered_years(product_type, condition_type)
+        else:
+            year_choices = ymmt_manager.find_years()
+
+        if self.fields['year_id']:
+            # Set year choices to current year + previous 6 years
+            # Specific only to AHFC
+            year_choices = [('', '')] + [(year, year) for year in year_choices]
+            self.fields['year_id'].choices = year_choices
+            self.fields['product_type'] = forms.CharField(
+                widget=forms.HiddenInput(),
+                required=False,
+                initial=product_type
+            )
+
+    condition_type = forms.ChoiceField(label=_("Condition"),
+                                       initial='NEW',
+                                       required=False,
+                                       choices=CONDITION_CHOICES,
+                                       widget=forms.RadioSelect())
+
+    transmission_type_name = forms.ChoiceField(label=_("Transmission"),
+                                               choices=TRANSMISSION_CHOICES,
+                                               required=False,
+                                               help_text="optional",
+                                               widget=forms.Select())
+
+
+class BaseEditCoapplicantForm(BaseCoapplicantForm,):
+    """ Form for processing edit coapplicant data. """
+    def __init__(self, *args, **kwargs):
+        super(BaseEditCoapplicantForm, self).__init__(*args, **kwargs)
+
+        # This isn't the right way to do this!
+        # If anything, just change the validators!
+        if not kwargs['initial']['ssn_changed']:
+            # else allow ***-**-1234 format
+            self.fields['tax_id'] = SocialSecurityField(is_edit=True, label='Social Security Num.', required=False)
+
+
+def make_business_customer_form(edit_mode="c", base_business_form_class=BaseBusinessForm):
+    """
+    Dynamically create business customer form class for all tenants.
+
+    Args:
+        edit_mode (str) : either 'c' for create, 'e' for edit, 'a' for edit in application mode.
+        base_business_form_class (type) : custom base business form class from which the
+            created form class will inherit to get base business customer fields
+    """
+    if edit_mode not in ['c', 'e', 'a']:
+        raise ValueError("The edit_mode param muse be one of 'c', 'e', or 'a'.")
+
+    class BusinessCustomerForm(base_business_form_class,
+                               BaseAddressForm,
+                               BaseCustomerSaveForm,
+                               ComplianceSubscriptionMixin,
+                               BaseSpotForm):
+        """Form for creating a business customer."""
+
+        id_verification = forms.ChoiceField(
+            label=_("ID Verification"),
+            required=True,
+            initial=ID_VERIFICATION_NONE,
+            choices=ID_VERIFICATION_CHOICES_BUSINESS,
+            widget=forms.RadioSelect()
+        )
+
+        is_business = forms.ChoiceField(
+            label="",
+            choices=IS_BUSINESS_CHOICES,
+            initial='Y',
+            widget=forms.RadioSelect())  # attrs={'style': 'display:none;'}))
+
+        cc_id = forms.IntegerField(
+            required=False,
+            widget=forms.HiddenInput())
+
+        def __init__(self, *args, **kwargs):
+            self._errors = None
+            user_type = kwargs.pop('user_type', '')
+            super(BusinessCustomerForm, self).__init__(*args, **kwargs)
+
+            if edit_mode in ['e', 'a']:
+                self.fields['is_business'].widget = forms.HiddenInput()
+                # take copy of attrs on HondaBusinessCustomerForm's business_tax_id_number
+                disabled_attrs = self.fields['business_tax_id_number'].widget.attrs.copy()
+                self.fields['business_tax_id_number'] = SocialSecurityField(is_individual=False,
+                                                                            label='Tax ID',
+                                                                            required=True,
+                                                                            data_mask_input='**-***9999')
+                for key, value in disabled_attrs.items():
+                    if key not in self.fields['business_tax_id_number'].widget.attrs:
+                        self.fields['business_tax_id_number'].widget.attrs[key] = value
+                del self.fields['business_tax_id_number'].widget.attrs["placeholder"]
+
+            # if there is no initial data form is most likely used as part of form submission
+            # and so there is possibility there are errors on the form in which case when
+            # form will be rendered back to the user, if the field is allowed to be masked
+            # original user input will be lost hence we cant mask form values on POST
+            # similar alteration is done in BaseApplicantForm for individual forms
+            # TODO this whole masking approach is very bad and should be refactored
+            # TODO ideally initial data should be passed to the form all the time
+            # TODO its not an expensive operation for us since form initial data is stored
+            # TODO in session so not that much overhead
+            # TODO but that will allow for MUCH simpler implementation
+            # TODO where the field masks the value for rendering purposes
+            # TODO and on submissions normalizes to regular value from passed initial data
+            # TODO no need for js, views, form.clean, form.__init__ and field to be involved
+            if not self.initial and 'business_tax_id_number' in self.fields:
+                self.fields['business_tax_id_number'].masked = False
+
+            if edit_mode == 'a':
+                # TODO: it is my goal to be able to only set the 'required' and
+                # 'widget' of each bank field.  However, doing so has the
+                # side-effect of stopping all normal validation including
+                # max_length!  No idea why.
+                '''self.fields['bank_name'].required = True
+                del self.fields['bank_name'].widget.attrs["placeholder"]
+                self.fields['bank_account_1'].required = True
+                del self.fields['bank_account_1'].widget.attrs["placeholder"]
+                self.fields['bank_contact_name'].required = True
+                del self.fields['bank_contact_name'].widget.attrs["placeholder"]
+                self.fields['current_bank_phone'].required = True
+                del self.fields['current_bank_phone'].widget.attrs["placeholder"]
+                '''
+
+                self.fields['bank_name'] = forms.CharField(
+                    label=_('Bank Name'),
+                    max_length=20,
+                    required=True,
+                    validators=[
+                        RegexValidator(r'^[a-zA-Z0-9\-\' \/\(\)&^$#@!?,\.:;_+=|~*]*$')
+                    ],
+                    widget=forms.TextInput())
+
+                self.fields['bank_account_1'] = NumericField(
+                    label=_('Checking Account No.'),
+                    min_length=5,
+                    max_length=15,
+                    required=True,
+                    widget=forms.TextInput())
+
+                self.fields['bank_contact_name'] = forms.CharField(
+                    label=_('Bank Rep.'),
+                    max_length=30,
+                    validators=[RegexValidator(r'^[a-zA-Z\-\' ]*$')],
+                    required=True,
+                    widget=forms.TextInput())
+
+                self.fields['current_bank_phone'] = PhoneNumberField(
+                    label=_('Bank Rep. Phone'),
+                    required=True,
+                    widget=forms.TextInput(attrs={"data-mask-input": "(999) 999-9999"}))
+
+            self.helper = FormHelper()
+            self.helper.form_class = 'form-horizontal'
+            self.helper.attrs = {'data-validate': 'true'}
+            self.helper.error_text_inline = False
+
+            if '_save_' in self.data or self.data.get('has_coapplicant') in TRUTH:
+                # TRUTH includes all possible values for boolean value "True"
+                self.fields['bank_name'].required = False
+                self.fields['bank_name'].widget = TextInputOptional()
+                self.fields['bank_account_1'].required = False
+                self.fields['bank_account_1'].widget = TextInputOptional()
+                self.fields['bank_contact_name'].required = False
+                self.fields['bank_contact_name'].widget = TextInputOptional()
+                self.fields['current_bank_phone'].required = False
+                self.fields['current_bank_phone'].widget = TextInputOptional()
+
+            id_verification = ""
+            if self.is_dealer_compliance_subscribed or self.is_dealer_compliance_lite_subscribed:
+                id_verification = "id_verification"
+            else:
+                self.fields['id_verification'].required = False
+
+            header_html = HTML('{% include "credit_app/includes/header.html" %}')
+
+            self.helper.layout = Layout(
+                Div(
+                    header_html,
+                    ProgressTracker(),
+                    Div(
+                        Fieldset(
+                            'Business Information',
+                            'cc_id',
+                            Div(
+                                'is_business',
+                                css_class="app-type"
+                            ),
+                            id_verification,
+                            'business_tax_id_number',
+                            'business_name',
+                            'previous_business_name',
+                            deepcopy(address_layout),
+                            Div(
+                                'current_business_phone',
+                                HTML('<span class="help-inline disclosure-link"><a href="#1" rel="popover" class="disclosure">Important Disclosure</a></span>'),
+                                Div(
+                                    HTML('You consent to receive autodialed, pre-recorded and artificial voice '
+                                         'telemarketing and sales calls and text messages from or on behalf of dealer (or any '
+                                         'financing source to which dealer assigns my contract) at the telephone number(s) '
+                                         'provided in this credit application, including any cell phone numbers. You '
+                                         'understand that this consent is not a condition of purchase or credit.'),
+                                    id="disclosure_content",
+                                    css_class="hide"
+                                ),
+                                id='div_business_phone'
+                            ),
+                            'business_established_date',
+                            'incorporation_us_state_code',
+                            'financial_statement_code',
+                            'employee_count',
+                            'bank_name',
+                            'bank_account_1',
+                            'bank_contact_name',
+                            'current_bank_phone'
+                        ),
+                    ),
+                    css_class="panel"
+                ),
+            )
+            if edit_mode in ['c', 'e']:
+                self.helper.layout.append(
+                    FormActions(
+                        Submit('_save_', '{{action_type}}', css_class='btn-primary'),
+                    )
+                )
+            if edit_mode in ['a', ]:
+                self.helper.layout[0][2].insert(
+                    0, Fieldset(
+                        'Co-Applicant',
+                        'has_coapplicant',
+                        'coapplicant_disabled'
+                    )
+                )
+
+                asset_type_layout = self.get_asset_type_layout()
+                index = 0
+                if asset_type_layout:
+                    index = 1
+                    # TODO Subclass Layout to allow easy modifying/searching for
+                    # objects witihn the layout.
+                    self.helper.layout[0][2].insert(
+                        1,
+                        deepcopy(asset_type_layout)
+                    )
+                self.helper.layout[0][2][index].append(
+                    Div(css_class="divider")
+                )
+                self.helper.layout.append(
+                    FormActions(*self._setup_form_actions(user_type))
+                )
+
+        def _setup_form_actions(self, user_type):
+            """Setup the list of form actions for the entire page.
+            Args:
+                user_type (str): the user type code of the user logged in ('D', 'L', 'C')
+            Returns:
+                List of form actions.
+            """
+            return [Submit('_continue_', 'Continue'), Submit('_save_', 'Save', css_class="btn-gray")]
+
+        def get_asset_type_layout(self):
+            return common_asset_type_layout
+
+        def clean(self):
+            cleaned_data = super(BusinessCustomerForm, self).clean()
+
+            if not cleaned_data.get('business_tax_id_number') in EMPTY_VALUES:
+                if cleaned_data.get('previous_business_name', '') and \
+                        fuzzy.nysiis(cleaned_data.get('business_name', '')) != fuzzy.nysiis(cleaned_data.get('previous_business_name', '')):
+                    self._errors["business_tax_id_number"] = self.error_class([_(BUSINESS_SSN_RE_ENTER)])
+            self.validate_state(cleaned_data, 'incorporation_us_state_code')
+            return cleaned_data
+
+    return BusinessCustomerForm
+
+
+class BaseDealerListFilterForm(BaseForm):
+
+    def __init__(self, *args, **kwargs):
+        super(BaseDealerListFilterForm, self).__init__(*args, **kwargs)
+
+        self.fields['state_code'].choices = ([("", "Select")] +
+                                             list(USState.choices()))
+
+    state_code = forms.ChoiceField(
+        label="State",
+    )
+
+    search_query = forms.CharField(
+        label="Search by Id or Name",
+    )
+
+
+class BaseDealPromptForm(BaseForm):
+
+    """A form for the deal prompt page."""
+
+    def __init__(self, *args, **kwargs):
+        super(BaseDealPromptForm, self).__init__(*args, **kwargs)

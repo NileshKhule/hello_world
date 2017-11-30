@@ -1,0 +1,49 @@
+from platform_utils.utils.obj_utils import get_attr_chained
+
+
+"""
+This module should contain any reusable utility for actions on objects.
+"""
+
+from __future__ import absolute_import
+from functools import partial
+
+import six
+
+
+def get_attr_chained(obj, chain, default=None):
+    """Intelligently returns the attribute of an object for a list chain.
+    Usage:
+        To get the value of deal.applicant.customer_detail.first_name, do
+        get_attr_chained(deal, ['applicant', 'customer_detail', 'first_name'])
+        If deal, applicant, or customer_detail is None, None will be returned without further lookups in the chain.
+    Args:
+        obj (object): beginning object in the attribute lookup
+        chain (list): list of strings representing the attributes to be looked up
+    Returns:
+        Final value of attribute lookup or None if any value in the attribute lookup is None
+    """
+
+    def get_attr_special(val, attrib, default_val=None):
+        """Used to get the attribute (or index) of the current value in the reduce iteration.
+        Args:
+            val (object): Current accumulated value in the reduce iteration.
+            attrib (object): element in the chain iterable.
+        Returns:
+            Value for val's attrib if present; None otherwise
+        """
+        if val is not None:
+            # Take care of the case in which a value in the chain is a list or tuple
+            # Exclude namedtuples
+            if isinstance(val, list) or (isinstance(val, tuple) and type(val) == 'tuple'):
+                if isinstance(attrib, six.integer_types):
+                    if attrib in range(len(val)):
+                        val = val[attrib]
+                        return val
+            else:
+                val = getattr(val, attrib, None)
+                return val
+        return default_val
+
+    get_attr_special_with_default = partial(get_attr_special, default_val=default)
+    return six.moves.reduce(get_attr_special_with_default, chain, obj)

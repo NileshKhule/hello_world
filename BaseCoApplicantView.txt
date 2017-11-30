@@ -1,0 +1,170 @@
+from common.credit_app.coapplicant.views import BaseCoApplicantView
+
+
+# -*- coding: utf-8 -*-
+"""
+Credit Application - Co Applicant View
+"""
+from platform_utils.utils.mapper import multi_level_getattr
+
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.fusion.customermanager import CustomerManager
+
+from common.credit_app import constants
+from common.credit_app.coapplicant.forms import BaseCoApplicantForm
+from common.credit_app.utils import push_initial_data_to_session
+from common.credit_app.views import BaseCreditAppView
+from common.mixins.data_entry import LockCreditAppDataEntryPages
+from common.views.ajax_form_view import AjaxFieldValidationFormView
+from utils.views.generic.lock import DealJacketLockMixin, DealjacketAccessMixin
+
+
+class BaseCoApplicantView(LockCreditAppDataEntryPages, DealJacketLockMixin, DealjacketAccessMixin, BaseCreditAppView,
+                          AjaxFieldValidationFormView):
+
+    """Co Applicant View Class"""
+
+    form_class = BaseCoApplicantForm
+    template_name = 'credit_app/coapplicant.html'
+    next_route_name = constants.VEHICLE_ROUTE_NAME
+    previous_route_name = constants.APPLICANT_ROUTE_NAME
+
+    def get_form(self, form_class=None):
+        """
+        Returns the instance of the form class.
+        This method is added to set Applicant SSN required for validation.
+        """
+        if form_class is None:
+            form_class = self.get_form_class()
+        kwargs = self.get_form_kwargs()
+        if form_class is BaseCoApplicantForm:
+            self.unmask_coapplicant_form_fields(kwargs)
+
+        return form_class(**kwargs)
+
+    def unmask_coapplicant_form_fields(self, kwargs):
+        """
+        Method to unmask the masked co-applicant form fields, and add them to kwargs dict.
+        :param kwargs:
+        :return:
+        """
+        if constants.APPLICATION_KEY in self.request.dtsession.keys():
+            ccm = getManager(CustomerManager, self.request.context_data)
+            applicant_form_dict = self.request.dtsession[constants.APPLICATION_KEY].get(
+                constants.APPLICANT_FORM_KEY, {})
+            co_applicant_form_dict = self.request.dtsession[constants.APPLICATION_KEY].get(
+                constants.COAPPLICANT_FORM_KEY, {})
+
+            unmasked_birth_date = co_applicant_form_dict.get('birth_date', '')
+            if not unmasked_birth_date:
+                unmasked_birth_date = ccm.get_app_coapp_dob(
+                    self.request.context_data.get('deal_jacket_id'),
+                    self.request.context_data.get('deal_id'),
+                    app_type='C')
+            kwargs['unmasked_birth_date'] = unmasked_birth_date
+
+            tax_id = applicant_form_dict.get('tax_id', applicant_form_dict.get('business_tax_id_number', ''))
+            if tax_id:
+                if '*' in tax_id:
+                    kwargs['applicant_ssn'] = ccm.get_app_coapp_ssn(
+                        self.request.context_data.get('deal_jacket_id'),
+                        self.request.context_data.get('deal_id'),
+                        app_type='A')
+                else:
+                    kwargs['applicant_ssn'] = applicant_form_dict.get(
+                        'tax_id', applicant_form_dict.get('business_tax_id_number', ''))
+
+    def get_models(self):
+        """
+        Return list of sql alchemy models wrapped in model class
+        """
+        ccm = getManager(CustomerManager, self.request.context_data)
+        return ccm.get_models_for_coapplicant_from_deal(
+            deal=self.deal
+        )
+
+    def get_context_data(self, **kwargs):
+        context = super(BaseCoApplicantView, self).get_context_data(**kwargs)
+        context[constants.TEXT_HEADER_KEY] = constants.CREDIT_APP_COAPPLICANT_TEMPLATE_HEADER
+        context[constants.BASE_TEMPLATE_KEY] = constants.BASE_DEALJACKET_TEMPLATE_NAME
+        context[constants.ENABLE_ADDRESS_COPY_KEY] = True
+        return context
+
+    def get_initial(self):
+        """Return applicant address for same as address checkbox"""
+        if self.request.method == 'POST':
+            return
+        initial = super(BaseCoApplicantView, self).get_initial()
+
+        try:
+            if self.request.dtsession.get(constants.APPLICATION_KEY):
+                applicant_form_dict = self.request.dtsession.get(
+                    constants.APPLICATION_KEY)[constants.APPLICANT_FORM_KEY]
+                if applicant_form_dict[constants.IS_BUSINESS_KEY] == constants.IS_BUSINESS_YES:
+                    initial[constants.BUSINESS_APPLICANT_KEY] = constants.IS_BUSINESS_YES
+
+                if constants.MARITAL_STATUS_CODE_KEY in applicant_form_dict:
+                    initial[constants.APPLICANT_MARITAL_STATUS_CODE_KEY] = applicant_form_dict.get(
+                        constants.MARITAL_STATUS_CODE_KEY)
+
+                initial[constants.APPLICANT_ADDRESS_KEY] = [
+                    applicant_form_dict.get(constants.LINE_1_ADDRESS_KEY) or u'',
+                    applicant_form_dict.get(constants.LINE_2_ADDRESS_KEY) or u'',
+                    applicant_form_dict.get(constants.CITY_KEY) or u'',
+                    applicant_form_dict.get(constants.US_STATE_CODE_KEY) or u'',
+                    applicant_form_dict.get(constants.ZIP_CODE_KEY) or u''
+                ]
+
+        except KeyError:
+            applicant = self.deal.applicant.customer_detail
+            if applicant.is_business == constants.IS_BUSINESS_YES:
+                initial[constants.BUSINESS_APPLICANT_KEY] = constants.IS_BUSINESS_YES
+            initial[constants.APPLICANT_ADDRESS_KEY] = [
+                multi_level_getattr(applicant, 'current_address.line_1_address', default=None) or '',
+                multi_level_getattr(applicant, 'current_address.line_2_address', default=None) or '',
+                multi_level_getattr(applicant, 'current_address.city', default=None) or '',
+                multi_level_getattr(applicant, 'current_address.us_state_code', default=None) or '',
+                multi_level_getattr(applicant, 'current_address.zip_code', default=None) or ''
+            ]
+
+        if not initial.get('cc_id') and self.deal.coapplicant:
+            initial['cc_id'] = self.deal.coapplicant.cc_id
+
+        # Pass the deal status for swapping tax id to masekd field
+        ccm = getManager(CustomerManager, self.request.context_data)
+        if ccm.get_app_coapp_ssn(
+                self.request.context_data.get('deal_jacket_id'),
+                self.request.context_data.get('deal_id'),
+                app_type='C'):
+            initial['deal_status'] = True
+
+        # set previous last name
+        if 'last_name' in initial:
+            initial['previous_last_name'] = initial['last_name']
+
+        # CreditScore model stores the score as 'credit_score' but our form uses 'customer_credit_score'
+        # This will make sure the value from the db appears on the Co Applicant page.
+        if initial.get('credit_score', None):
+            initial['custom_credit_score'] = initial.pop('credit_score')
+
+        initial['spot_con_in'] = self.deal.spot_contract_indicator
+
+        push_initial_data_to_session(self.deal, self.session_helper, initial, constants.COAPPLICANT_ROUTE_NAME)
+        return initial
+
+    def form_continue(self, form, **kwargs):
+        """
+        This method sets cc_id in dtsession
+        """
+        applicant_form = self.request.dtsession.get(constants.APPLICATION_KEY).get(constants.APPLICANT_FORM_KEY)
+        app_us_state_code = applicant_form.get(constants.US_STATE_CODE_KEY, '')
+        coapp_us_state_code = self.request.POST.get(constants.US_STATE_CODE_KEY, '')
+        party_relation_code = self.request.POST.get(constants.PARTY_RELATIONSHIP_CODE_KEY)
+        if (((app_us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN and applicant_form.get(constants.MARITAL_STATUS_CODE_KEY)
+              in (constants.MARITAL_STATUS_CODE_MARRIED, constants.MARITAL_STATUS_CODE_SEPARATED)) or
+             (coapp_us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN and
+              self.request.POST.get(constants.MARITAL_STATUS_CODE_KEY) in (constants.MARITAL_STATUS_CODE_MARRIED, constants.MARITAL_STATUS_CODE_SEPARATED))) and
+                party_relation_code != constants.PARTY_RELATIONSHIP_CODE_SPOUSE):
+            self.next_route_name = constants.WISCONSIN_SPOUSE_ROUTE_NAME
+
+        return super(BaseCoApplicantView, self).form_continue(form, **kwargs)

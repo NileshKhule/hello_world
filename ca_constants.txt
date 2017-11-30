@@ -1,0 +1,354 @@
+from dtplatform.common.credit_app import constants as ca_constants
+
+
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import, print_function, unicode_literals
+
+from platform_utils.utils.enum import Enum
+
+from dtplatform.common.constants import FeatureStatusCode
+from dtplatform.core import constants as coreconstants
+
+
+class VehicleType(Enum):
+    C = 'Motorcycle', 'Motorcycle'
+    A = 'Auto', 'Auto'
+    SNOWM = 'Snowmobile', 'Snowmobile'
+    ATVEH = 'ATV', 'All Terrain Vehicle'
+
+
+DEALER_CODE_KEY = 'dealer_code'
+DEAL_ID_KEY = 'deal_id'
+DEAL_SOURCE_CODE = 'deal_source_code'
+DEALER_ID_KEY = "dealer_id"
+PARTNER_ID_KEY = 'partner_id'
+APP_ID_KEY = 'app_id'
+PARTNER_LEGACY_ID = "dt_lender_id"
+LENDER_TEXT = 'LENDER'
+ELIGIBLE_LENDERS_LIST_KEY = 'eligible_lenders_list'
+LENDER_ERRORS_KEY = 'lender_errors_dict'
+ELIGIBLE_LENDERS_KEY = 'elg_lenders'
+INELIGIBLE_LENDERS_KEY = 'in_elg_lenders'
+HAS_PRESELECT_ELIGIBLE_LENDERS_KEY = 'has_preselect_eligible_lenders'
+TRANSACTION_TYPE_KEY = coreconstants.TRANSACTION_TYPE_KEY
+RESTRICTIONS_KEY = 'restrictions'
+LEGACY_ID = 'legacy_id'
+CHECK_ARGS = 'check_args'
+REASON_TEXT = 'reason'
+CUST_CREDIT_KEY = 'custcredit'
+CC_DEALER_ID = 'ccdealerid'
+BUSINESS_GUARANTOR = 'guarantor'
+COAPPLICANT = 'coapplicant'
+APPLICANT_DATA_KEYCHAIN = ["dt_application", "deal_data", "applicant_data", "applicant"]
+SIGNER_TYPE_FOR_BUSINESS_COAPP = 'B'
+TRUNCATE_COMMENTS = 'trunccomments'
+CONDITIONAL_ROUTING = 'conditional_routing'
+APPSUB_LOAN_LEASE = 'appsub_loan_lease'
+PRIME_TEXT = 'prime'
+SUBPRIME_TEXT = 'subprime'
+DECISION_STATUS_BOOKED = 'BOOK'
+
+SUCCESS_MESSAGE = 'Credit application has been successfully pushed to {}.'
+ERROR_MESSAGE = 'Something went wrong while pushing credit application to {}'
+
+CREDIT_APP_ACK_LIST = [FeatureStatusCode.Transmitting, FeatureStatusCode.Pending]
+CONTRACT_ACK_LIST = [FeatureStatusCode.ContractPendingVerification, FeatureStatusCode.Submit]
+
+FEATURE_STATUS_CODE_CONTRACT_EXPORTED = 'XPORT'
+FEATURE_STATUS_CODE_CONTRACT_TERMINATED = 'TERM'
+
+DEAL_STATUS_CANCELLED = 'CCANC'
+CONTRACT_DECISION_TEMPLATE = 'decisions/contract_details_print.html'
+CREDIT_DECISION_TEMPLATE = 'decisions/details_print.html'
+# toolkit_tables.partner_pgm.prod_typ_cd is of length 1
+DEAL_LEASE = coreconstants.DEAL_LEASE
+DEAL_RETAIL = coreconstants.DEAL_RETAIL
+DEAL_BALLOON = coreconstants.DEAL_BALLOON
+PROGRAM_ROUTING_DEAL_TYPES = (DEAL_LEASE, DEAL_RETAIL, DEAL_BALLOON)
+DEAL_TYPE_KEY_LEASE = 'LEAS'
+DEAL_TYPE_KEY_RETAIL = 'RETL'
+DEAL_TYPE_KEY_BALLOON = 'BALL'
+DEAL_TYPES = {DEAL_TYPE_KEY_LEASE: "lease", DEAL_TYPE_KEY_RETAIL: "retail", DEAL_TYPE_KEY_BALLOON: "balloon"}
+DEAL_TYPES_VALUES = coreconstants.DEAL_TYPES_VALUES
+COMMUNITY_STATE_NO = 'no'
+COMMUNITY_STATE_KEY = 'comu_state'
+COMMUNITY_STATE = 'community_state'
+OPT_OUT_KEY = 'opt_out'
+APPLICANT_STATE_KEY_KEY = 'applicant_state_key'
+OPT_OUT_NO = 'no'
+REQUEST_DATE_KEY = 'request_date'
+SPOT_KEY = "spot"
+SPOT_YES = "yes"
+SPOT_NO = "no"
+USER_NAME_KEY = "app_submitted_user_name"
+USER_ID = "app_submitted_user_id"
+APP_TYPE_KEY = "app_type"
+TYPE_KEY = "type"
+BUSINESS_TEXT = 'business'
+YEARS_IN_BUSINESS_KEY = "years_in_business"
+PERSONAL_TEXT = "personal"
+CREDIT_TYPE_KEY = "credit_type"
+JOINT_TEXT = "joint"
+CONDITION_KEY = "condition"
+INDIVIDUAL_TEXT = "individual"
+VEHICLE_TYPE_KEY = "vehicle_type"
+TRADE_KEY = "trade"
+TRADE_YES = 'yes'
+TRADE_NO = 'no'
+LOAN_TYPE_KEY = "loan_type"
+AUTO_TEXT = "auto"
+MOTORCYCLE_TEXT = "motorcycle"
+NON_AUTO_TEXT = "nonauto"
+PAYMENT_CALL_INDICATOR_NO = 'N'
+PAYMENT_CALL_INDICATOR_YES = 'Y'
+PASS_THRU_HIDDEN_INDICATOR = 'pass_thru_hidden'
+PASS_THRU_HIDDEN_INDICATOR_YES = 'Y'
+PAYMENT_CALL_NO = 'no'
+PAYMENT_CALL_YES = 'yes'
+PAYMENT_CALL_KEY = "payment_call"
+PAYMENT_CALL_PARTNER_SUPPORT_KEY = "paymentcallsupported"
+PRODUCT_TYPE_KEY = "product_type"
+PROGRAM_ROUTING_IND_KEY = "program_routing_ind"
+PROGRAM_ROUTING_IND_PASS = "pass"
+NEWAPPLICATION_TEXT = "newapplication"
+UPDATEPAYMENTCALL_TEXT = "updatepaymentcall"
+DEALUPDATE_TEXT = "dealupdate"
+LENDER_ID_KEY = "lender_id"
+LENDER_DEALER_ID_KEY = "lender_dealer_id"
+DESTINATION_TYPE_QUEUE = "queue"
+REGB_NO = 'no'
+REGB_YES = 'yes'
+DISCLOSER_REGB = 'R'
+DISCLOSER_COMMUNITY_STATE = 'C'
+COMMUNITY_STATE_YES = 'yes'
+REGB_KEY = 'regb'
+REGB = 'regb'
+TERM_COUNT_KEY = 'term_count'
+ESTIMATED_FINANCED_AMOUNT_KEY = 'estimated_financed_amount'
+DT_APP_ID_KEY = 'dt_app_id'
+ACK_TEXT = 'ack'
+DOCUMENT_INDEX_KEY = 'document_index_ids'
+LENDER_APP_ID_KEY = 'lender_app_id'
+CA_SHORT_ID_KEY = 'ca_short_id'
+TAX_ID_KEY = 'tax_id'
+DEAL_APPLICANT_TYPE_CODE_COAPP = 'C'
+NOTIFICATION_CODE_LIST = ('0150', '0180', '0130', '0219')
+PARTNER_FILTER_CRITERIAS = [PRODUCT_TYPE_KEY, CONDITION_KEY, CREDIT_TYPE_KEY, LOAN_TYPE_KEY]
+DEALER_LOGON_ID = "dealer_logon_id"
+ERROR_DESCRIPTION = "err_description"
+
+MAKE_KEY = 'make'
+CONDITION_NEW = 'N'
+CONDITION_USED = 'U'
+CONDITION_DEMO = 'D'
+CONDITION_CERT = 'C'
+CONDITION_ALL = 'A'
+CONDITION_TYPES = (CONDITION_NEW, CONDITION_USED, CONDITION_DEMO, CONDITION_CERT)
+
+APPLICATION_INDIVIDUAL = 'I'
+APPLICATION_JOINT = 'J'
+APPLICATION_INDIVIDUAL_BUSINESS = 'B'
+APPLICATION_JOINT_BUSINESS = 'j'
+
+APPLICATION_TYPES = (APPLICATION_INDIVIDUAL, APPLICATION_JOINT,
+                     APPLICATION_INDIVIDUAL_BUSINESS, APPLICATION_JOINT_BUSINESS)
+VEHICLE_CONDITION_KEY_NEW = 'new'
+VEHICLE_CONDITION_KEY_USED = 'used'
+VEHICLE_CONDITION_KEY_OLD = 'old'
+VEHICLE_CONDITION_KEY_DEMO = 'demo'
+
+# Note that Certified vehicles are just a special case of used vehicles and certified is not stored as a separate code
+# in REFERENCE.REF_VEH_CONDTN. However, any code that uses deal.buy_vehicle.condition_type for a Certified vehicle will
+# receive the CERT value
+VEHICLE_CONDITION_KEY_CERT = 'cert'
+VEHICLE_CONDITION_DICT = {VEHICLE_CONDITION_KEY_NEW: CONDITION_NEW,
+                          VEHICLE_CONDITION_KEY_USED: CONDITION_USED,
+                          VEHICLE_CONDITION_KEY_DEMO: CONDITION_DEMO,
+                          VEHICLE_CONDITION_KEY_CERT: CONDITION_CERT}
+PRODUCT_TYPE_PR_DICT = {DEAL_TYPE_KEY_RETAIL: DEAL_RETAIL,
+                        DEAL_TYPE_KEY_LEASE: DEAL_LEASE, DEAL_TYPE_KEY_BALLOON: DEAL_BALLOON}
+PRODUCT_TYPE_REVERSE_LOOKUP = {DEAL_TYPE_KEY_RETAIL: DEAL_RETAIL,
+                               DEAL_TYPE_KEY_LEASE: DEAL_LEASE, DEAL_TYPE_KEY_BALLOON: DEAL_BALLOON}
+ALL = 'A'  # Used in Program Routing
+PROGRAM_ROUTING_YES = 'Y'
+PROGRAM_STATUS_ACTIVE = 'A'
+
+# PDF Template Names
+COMMON_PDF_BASE = 'dtplatform.core.doccenter.pdf.dtcom.'
+COMMON_IND_JOINT_PDF = COMMON_PDF_BASE + 'DTCOMIndividualPdfConfig'
+INDIVIDUAL_NO_COAPPLICANT = COMMON_PDF_BASE + 'DTCOMIndividualNoCoappPdfConfig'
+COMMON_BUSINESS_PDF = COMMON_PDF_BASE + 'DTCOMBusinessPdfConfig'
+BUSINESS_PDF_NO_GUARANTOR = COMMON_PDF_BASE + 'DTCOMBusinessNoGuarantorPdfConfig'
+COMMON_PDF_COAPPLICANT_PAGE = 2
+
+# Motorcycle PDF Template Names
+MOTORCYCLE_COMMON_BUSINESS_PDF = COMMON_PDF_BASE + 'DTCOMMotorcycleBusinessPdfConfig'
+MOTORCYCLE_PERSONAL_PDF = COMMON_PDF_BASE + 'DTCOMMotorcyclePersonalPdfConfig'
+
+DT_ACK_TEXT = "dt_ack"
+
+CAP_COST_KEY = "cap_cost"
+
+TRUTH = (
+    'True',
+    'true',
+    'TRUE',
+    True,
+)
+
+DATA_SINGLE_PAGE_CA_KEY = 'single_page_ca'
+DATA_APPLICANT_KEY = coreconstants.DATA_APPLICANT_KEY
+DATA_COAPPLICANT_KEY = coreconstants.DATA_COAPPLICANT_KEY
+DATA_HAS_COAPPLICANT_KEY = coreconstants.DATA_HAS_COAPPLICANT_KEY
+DATA_VEHICLE_KEY = coreconstants.DATA_VEHICLE_KEY
+DATA_WISCONSIN_SPOUSE_KEY = coreconstants.DATA_WISCONSIN_SPOUSE_KEY
+DATA_COMMENTS_KEY = coreconstants.DATA_COMMENTS_KEY
+
+DATA_PRODUCT_TYPE_KEY = PRODUCT_TYPE_KEY
+DATA_CONDITION_TYPE_KEY = coreconstants.DATA_CONDITION_TYPE_KEY
+DATA_SIGNER_TYPE_CODE_KEY = coreconstants.DATA_SIGNER_TYPE_CODE_KEY
+DATA_ESTIMATED_FINANCED_AMOUNT = 'estimated_financed_amount'
+DATA_ESTIMATED_MONTHLY_PAYMENT_KEY = 'estimated_monthly_payment'
+DATA_ESTIMATED_PAYMENT_KEY = 'estimated_monthly_payment'
+DATA_PAYMENT_CALL_INDICATOR_KEY = 'payment_call_indicator'
+DATA_ROUTE_NAME_KEY = coreconstants.ROUTE_NAME_KEY
+DATA_DEAL_EDIT_KEY = 'deal_edit'
+CHANGES_KEY = coreconstants.CHANGES_KEY
+TRANS_ERR_IN = 'Y'
+
+SESSION_ROUTE_NAMES = (
+    DATA_SINGLE_PAGE_CA_KEY,
+    DATA_APPLICANT_KEY,
+    DATA_COAPPLICANT_KEY,
+    DATA_VEHICLE_KEY,
+    DATA_WISCONSIN_SPOUSE_KEY,
+    coreconstants.CONTRACT_APPLICANT_KEY,
+    coreconstants.CONTRACT_COAPPLICANT_KEY,
+    coreconstants.CONTRACT_VEHICLE_KEY,
+    coreconstants.CONTRACT_FINANCE_KEY,
+)
+
+# list of all fields in finance section of V&F page
+VNF_LDU_ELIGIBLE_FIELDS = ['accident_health_insurance_amount',
+                           'acquisition_fee_amount',
+                           'back_end_fee_amount',
+                           'cash_down_amount',
+                           'cash_sell_price_amount',
+                           'credit_life_insce_am',
+                           'estimated_monthly_payment',
+                           'front_end_fee_amount',
+                           'gap_insce_am',
+                           'invoice_amount',
+                           'lien_holder_number',
+                           'make_custom',
+                           'make_id',
+                           'model_custom',
+                           'model_id',
+                           'monthly_payment_amount',
+                           'msrp_amount',
+                           'odometer_number',
+                           'rebate_amount',
+                           'requested_apr_rate',
+                           'sales_tax_amount',
+                           'term_count',
+                           'title_and_license_amount',
+                           'trade_in',
+                           'trade_in_make_custom',
+                           'trade_in_model_custom',
+                           'trade_in_trim_custom',
+                           'trade_in_value_amount',
+                           'trade_in_vehicle_make_id',
+                           'trade_in_vehicle_model_id',
+                           'trade_in_vehicle_trim_id',
+                           'trade_in_vehicle_year_id',
+                           'trade_in_year_custom',
+                           'trim_custom',
+                           'trim_id',
+                           'warranty_amount',
+                           'year_custom',
+                           'year_id']
+
+VNF_LDU_ELIGIBLE_AMOUNT_FIELDS = ['credit_life_insce_am',
+                                  'estimated_monthly_payment',
+                                  'gap_insce_am',
+                                  'odometer_number',
+                                  'requested_apr_rate',
+                                  'term_count']
+
+
+MaritalStatusCode = coreconstants.MaritalStatusCode
+PartyRelationshipCode = coreconstants.PartyRelationshipCode
+StateProvinceCode = coreconstants.StateProvinceCode
+
+
+CP_STATES = coreconstants.CP_STATES
+SUPPORTING_DOCS_PROD_TYP = {'RETL': 'R', 'LEAS': 'L', 'BALL': 'B'}
+
+PARTNER_FILTER_DICT = {'product_type': 'prodtype',
+                       'condition': 'vehicletype',
+                       'credit_type': 'credittype',
+                       'loan_type': 'loantype'}
+
+PARTNER_TRANSTYPE_DICT = {'retail': 'Retail',
+                          'lease': 'Lease',
+                          'balloon': 'Balloon',
+                          'ind': 'Individual',
+                          'indbus': 'Business',
+                          'bus': 'Business',
+                          'joint': 'Joint',
+                          'jointbus': 'Joint Business',
+                          'new': 'New',
+                          'old': 'Used',
+                          'demo': 'Demo',
+                          'cert': 'Certified',
+                          'auto': 'Auto',
+                          'rv': 'RV',
+                          'marine': 'Marine'}
+
+GENERIC_INELIGIBLE_LENDER_ERR_MSG = 'Credit application is not supported by this lender'
+TRANSTYPE_INELIGIBLE_LENDER_ERR_MSG = 'credit applications are not supported by this lender'
+PN_AUTHORIZATION_KEY = 'pn_authorization'
+
+
+class BillingMaterialCode(object):
+    RegularCA = 'EAPP'
+    DealUpdateCA = 'EAUP'
+    SubsequentDealUpdateCA = 'EAUS'
+    PerfundedApp = 'EAPF'  # Credit Application - Per Funded
+
+
+class TransTypeCredit(object):
+    Individual = 'ind'
+    Business = 'bus'
+    Joint = 'joint'
+    JointBusiness = 'jointbus'
+
+
+class SalaryType(object):
+    Weekly = 'W'
+    Monthly = 'M'
+    Annually = 'A'
+    Biweekly = 'B'
+
+
+class InternetAppSource(object):
+    DRS_SOURCE = 'DRS'
+    HONDA_SOURCE = 'AHFC'
+    FINANCE_DRIVER = 'FD'
+    DEALERTRACK = 'DTRAK'
+
+
+# Http Header converts keys separated with hyphen (-) into underscore(_)
+INTERNET_APP_SERVICE_SOURCE_KEY = 'HTTP_PARTNER_NAME'
+
+EXCLUDED_FEATURE_STATUSES_FOR_DECISIONS = (  # http://10.134.8.13:8080/browse/DTPRJ-24275
+    FeatureStatusCode.CreditDeclined,
+    FeatureStatusCode.Cancelled
+)
+
+
+class AlertMessageMappingWithStatusCode(object):
+    """Mapping for the alert message status_code with the json schema
+    """
+    mappings = {FeatureStatusCode.ContractVerificationFailed: 'error_reasons',
+                FeatureStatusCode.ContractVerificationWarning: 'warning_reasons'}

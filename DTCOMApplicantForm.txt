@@ -1,0 +1,296 @@
+from .applicant.forms import DTCOMApplicantForm
+
+
+# -*- coding: utf-8 -*-
+"""
+DTCOM Credit Application - Applicant form
+"""
+from __future__ import absolute_import, print_function, unicode_literals
+
+import simplejson as json
+from crispy_forms.layout import Layout, Submit
+from django import forms
+from django.core.validators import RegexValidator
+
+from dt_django_base.forms.base import BaseForm
+from platform_utils.utils.functools import cache_property, method_cache
+
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.constants import (
+    FeatureToggleFeatureCode,
+    FeatureToggleSubfeatureCode,
+)
+from dtplatform.common.credit_app import constants as platform_ca_constants
+from dtplatform.common.credit_app.dealer.dealer_vehicle_manager import DealerVehicleManager
+from dtplatform.core import constants
+from dtplatform.core.common_settings_manager import CommonSettingsManager
+from dtplatform.core.dealjacket_manager import DealJacketManager
+from dtplatform.core.models.reference import Country
+
+from common.credit_app import constants as credit_app_constants
+from common.credit_app.applicant.forms import BaseApplicantForm
+from dtcom.utils.forms.customer import DTCOMCustomerFormMixin
+from utils.forms.layouts import (
+    asset_type_layout,
+    common_asset_type_layout,
+    common_citizenship_layout,
+)
+
+
+class IsMotorcycleEnabledMixin(object):
+    @cache_property
+    def common_settings_manager(self):
+        return getManager(CommonSettingsManager, self.context_data)
+
+    @cache_property
+    def is_motorcycle_enabled(self):
+        motorcycle_enabled = self.common_settings_manager.check_feature_enabled(
+            FeatureToggleFeatureCode.CreditApp,
+            FeatureToggleSubfeatureCode.Motorcycle,
+            dealer_code=self.context_data['dealer_code']
+        )
+        return motorcycle_enabled
+
+    def setup_motorcycle():
+        pass
+
+    def pre_init(self, *args, **kwargs):
+        """
+        Motorcycle specific changes need to done before any init methods get called,
+        since properly rendering of the Layout object specific to motorcycle depends on
+        this setup taking place before the Layout object is initialized in
+        BaseApplicantForm, BaseCoApplicantForm.
+        """
+        super(IsMotorcycleEnabledMixin, self).pre_init(*args, **kwargs)
+        if self.is_motorcycle_enabled:
+            self.vehicle_type = 'A'
+            self.show_asset_type = False
+            self.show_citizenship = False
+            initial = kwargs.get('initial', {})
+            if initial:
+                self.vehicle_type = initial.get('vehicle_type')
+            self.setup_motorcycle()
+
+
+class DTCOMApplicantFormMixin(IsMotorcycleEnabledMixin, BaseForm):
+    citizenship_country_code = forms.ChoiceField(
+        required=False,
+        label='Country of Citizenship',
+        validators=[RegexValidator(
+            "^[a-zA-Z ]+(([\'\-][\s]?[a-zA-Z])?[a-zA-Z ]*)*$")],
+        widget=forms.Select(attrs={
+            "data-placeholder": "Select a country",
+            "data-chosen-enabled": "true"
+        })
+    )
+    vehicle_type = forms.CharField(
+        required=False,
+        widget=forms.HiddenInput(),
+    )
+
+    def _clean_citizenship(self, cleaned_data):
+        # We let dealers save even if they did not yet select citizenship.
+        vehicle_type = getattr(self, 'vehicle_type', '')
+        if '_save_' in self.data:
+            return cleaned_data  # exit if continue not clicked
+        asset_type = cleaned_data.get('asset_type')
+        if asset_type == 'A':
+            return cleaned_data
+        # App
+        if asset_type == 'C' and self.data.get('is_business') != 'Y' and self.show_citizenship:
+            self.force_required(self.cleaned_data, 'citizenship_country_code')
+        # Business with CoApp
+        elif self.show_citizenship and not self.data.get('business_name') and vehicle_type == 'C':
+            self.force_required(self.cleaned_data, 'citizenship_country_code')
+        return cleaned_data
+
+    def clean(self):
+        cleaned_data = super(DTCOMApplicantFormMixin, self).clean()
+        if self.is_motorcycle_enabled:
+            return self._clean_citizenship(cleaned_data)
+
+        return cleaned_data
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMApplicantFormMixin, self).__init__(*args, **kwargs)
+        self.fields['citizenship_country_code'].choices = self._make_country_choices()
+
+    @method_cache
+    def _get_dealer_asset_types(self):
+        dealer_vehicle_manager = getManager(DealerVehicleManager, self.context_data)
+        dealer_asset_types = dealer_vehicle_manager.get_dealer_market_types()
+        return dealer_asset_types
+
+    def setup_motorcycle(self):
+        # toggle button and citizenship are not shown for
+        # auto dealers.
+        route_name = self.context_data.get('route_name')
+
+        dealer_asset_types = self._get_dealer_asset_types()
+
+        if dealer_asset_types:
+            if route_name == credit_app_constants.COAPPLICANT_ROUTE_NAME:
+                if self.vehicle_type == 'C':
+                    self.show_citizenship = True
+
+            # Enable vehicle type radio button and country of citizenship
+            # if the motorcycle dealer sells more than one vehicle types
+            # and the application has not been submitted.
+            elif all([
+                len(dealer_asset_types) > 1,
+                'C' in dealer_asset_types
+            ]):
+                self.show_citizenship = True
+                self.show_asset_type = True
+
+            # If the dealer only sells motorcycle we dont show the toggle
+            # button.
+            elif all([
+                len(dealer_asset_types) == 1,
+                'C' in dealer_asset_types
+            ]):
+                self.show_citizenship = True
+
+    def _make_country_choices(self):
+        return [("", "")] + [(country.country_code, country.name) for country in Country.all().values()]
+
+    def get_citizenship_layout(self):
+        if self.is_motorcycle_enabled:
+            if getattr(self, 'show_citizenship', False):
+                return Layout('citizenship_country_code')
+        return common_citizenship_layout
+
+
+class DTCOMApplicantFormVehicleTypeMixin(IsMotorcycleEnabledMixin, BaseForm):
+    asset_type = forms.ChoiceField(
+        label="Select a Vehicle Type",
+        required=False,
+        choices=[('', ''), ('A', 'Auto')],
+        initial='A',
+        widget=forms.RadioSelect(attrs={
+            "class": "",
+            "data-showhide-json": json.dumps(
+                {
+                    "display_list": [
+                        {
+                            "value": ["C"],
+                            "show": ["#div_id_citizenship_country_code"]
+                        },
+                        {
+                            "value": ["A", ""],
+                            "hide": ["#div_id_citizenship_country_code"]
+                        }
+                    ]
+                }
+            )
+        }))
+
+    @cache_property
+    def deal_jacket_manager(self):
+        return getManager(DealJacketManager, self.context_data)
+
+    def _make_asset_type_choices(self, dealer_asset_types):
+        vehicle_type = platform_ca_constants.VehicleType
+        return [(i, vehicle_type[i].value) for i in dealer_asset_types if vehicle_type[i]]
+
+    def get_asset_type_layout(self):
+        if self.is_motorcycle_enabled:
+            dealer_asset_types = self._get_dealer_asset_types()
+            if dealer_asset_types:
+                self.fields['asset_type'].choices = self._make_asset_type_choices(dealer_asset_types)
+            # Most of our API's uses form as a serializer at the time
+            # of validating the data there will be no deal_jacket_id
+            # present so added the below check.
+            if self.context_data['deal_jacket_id']:
+                deal_jacket = self.deal_jacket_manager.get_dealjacket(
+                    self.context_data['deal_jacket_id']
+                )
+                for deal in deal_jacket.deals:
+                    # Means credit app has been submitted.
+                    if deal.credit_apps:
+                        self.fields['asset_type'].widget.attrs['disabled'] = True
+                        # Since we disabled the field since app is submitted we
+                        # also need to set the `data-enable` attribute to true
+                        # so we get the post data even though the field is disabled
+                        # since django usually does not send disabled field's data in
+                        # the post request.
+                        self.fields['asset_type'].widget.attrs['data-enable'] = True
+                        # If any of the deal in the dealjacket has credit apps
+                        # submitted, we disable `asset_type` and move on
+                        break
+
+            if getattr(self, 'show_asset_type', False):
+                return asset_type_layout
+
+        else:
+            self.fields['asset_type'].hidden = True
+        return common_asset_type_layout
+
+    def _clean_asset_type(self, cleaned_data):
+        # We let dealers save even if they did not yet select citizenship.
+        if '_save_' in self.data:
+            return cleaned_data  # exit if continue not clicked
+        if not self.show_asset_type and not self.show_citizenship:
+            cleaned_data['asset_type'] = 'A'
+
+        elif not self.show_asset_type and self.show_citizenship:
+            cleaned_data['asset_type'] = 'C'
+
+        elif self.show_asset_type and self.show_citizenship:
+            self.force_required(cleaned_data, 'asset_type')
+
+        return cleaned_data
+
+    def clean(self):
+        cleaned_data = super(DTCOMApplicantFormVehicleTypeMixin, self).clean()
+        if self.is_motorcycle_enabled:
+            return self._clean_asset_type(cleaned_data)
+
+        return cleaned_data
+
+
+class DTCOMApplicantForm(DTCOMCustomerFormMixin,
+                         DTCOMApplicantFormMixin,
+                         DTCOMApplicantFormVehicleTypeMixin,
+                         BaseApplicantForm):
+    """
+    DTCOM Applicant form
+    """
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMApplicantForm, self).__init__(*args, **kwargs)
+
+        del self.fields['previous_organization_name'].widget.attrs["placeholder"]
+        del self.fields['previous_occupation_name'].widget.attrs["placeholder"]
+        del self.fields['previous_work_phone_number'].widget.attrs["placeholder"]
+        del self.fields['previous_employed_years'].widget.attrs["placeholder"]
+        del self.fields['previous_employed_months'].widget.attrs["placeholder"]
+        del self.fields['previous_school'].widget.attrs["placeholder"]
+
+        self._previous_address_init()
+        self._previous_employment_init()
+
+    def _setup_form_actions(self, user_type):
+        """Setup the list of form actions for the entire page. Lender users should not see
+        the Save button.
+        Args:
+            user_type (str): the user type code of the user logged in ('D', 'L', 'C')
+        Returns:
+            List of form actions.
+        """
+        # Don't add the Save button for Lender users
+        if user_type == constants.LENDER_USER_TYPE:
+            return [Submit('_continue_', 'Continue')]
+        else:
+            return super(DTCOMApplicantForm, self)._setup_form_actions(user_type)
+
+    def clean(self):
+        """Form clean method"""
+        cleaned_data = super(DTCOMApplicantForm, self).clean()
+        if cleaned_data.get('employment_status_code') in ['O']:
+            self.force_optional(cleaned_data, 'salary', 'salary_type_code', 'current_employed_years', 'current_employed_months')
+
+        if cleaned_data.get('previous_employment_status_code') in ['O']:
+            self.force_optional(cleaned_data, 'previous_employed_years', 'previous_employed_months')
+
+        return cleaned_data
