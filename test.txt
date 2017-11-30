@@ -1,0 +1,369 @@
+C:\cygwin64\home\MTHAKELLAP\dt\dtweb\dtcom\credit_app\views.py
+
+
+# -*- coding: utf-8 -*-
+"""
+Credit Application views for DTCOM.
+"""
+import itertools
+
+import six
+from django.core.urlresolvers import reverse
+from django.http import HttpResponseRedirect
+from django.utils.datastructures import MultiValueDictKeyError
+
+from dt_django_summit.core.session_manager import SessionManager
+from platform_utils.utils.obj_utils import get_attr_chained
+
+from dtplatform.common import constants as platform_constants
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.constants import EditMode
+from dtplatform.common.credit_app import constants as ca_constants
+from dtplatform.common.credit_app.credit_app_manager import CreditAppManager
+from dtplatform.common.dtv.vehicle_options_manager import VehicleOptionsManager
+from dtplatform.common.fusion.customermanager import CustomerManager
+from dtplatform.common.fusion.partner_manager import PartnerManager
+from dtplatform.dtcom.credit_app.exceptions import CreditAppCriticalFieldMissingException
+from dtplatform.dtcom.credit_app.lender_specific_manager import LenderSpecificManager
+
+from common.credit_app import constants
+from common.credit_app.applicant.views import BaseApplicantView
+from common.credit_app.coapplicant.views import BaseCoApplicantView
+from common.credit_app.vehicle.views import BaseVehicleFinanceView
+from common.credit_app.views import BaseReadOnlyView
+from common.credit_app.wisconsin_spouse.views import BaseWisconsinSpouseView
+
+from ..dealjacket.forms import make_business_customer_form_dtcom
+from ..mixins.credit_app_session import DTCOMCreditAppControllerMixin
+from .applicant.forms import DTCOMApplicantForm
+from .coapplicant.forms import DTCOMCoApplicantForm
+from .vehicle.forms import (
+    DTCOMMotorcycleVehicleMultiForm,
+    DTCOMVehicleMultiForm,
+)
+from .wisconsin_spouse.forms import DTCOMWisconsinSpouseForm
+
+
+class ApplicantView(DTCOMCreditAppControllerMixin, BaseApplicantView):
+    """ DTCOM Applicant View"""
+
+    def get_form_class(self):
+        try:
+            if self.request.POST[constants.IS_BUSINESS_KEY] == constants.IS_BUSINESS_YES:
+                form_class = make_business_customer_form_dtcom(EditMode.APPLICATION)
+            else:
+                form_class = DTCOMApplicantForm
+        except MultiValueDictKeyError:
+            customer_manager = getManager(CustomerManager, self.request.context_data)
+            customer = customer_manager.get_models_for_customer_by_ccid(cc_id=self.get_cc_id(),
+                                                                        deal=self.deal,
+                                                                        deal_customer_attr='applicant')
+            if customer[0].model.is_business == constants.IS_BUSINESS_YES:
+                form_class = make_business_customer_form_dtcom(EditMode.APPLICATION)
+            else:
+                form_class = DTCOMApplicantForm
+
+        return form_class
+
+    def get_form(self, form_class=None):
+        if form_class is None:
+            form_class = self.get_form_class()
+        kwargs = self.get_form_kwargs()
+        if issubclass(form_class, DTCOMApplicantForm):
+            self.unmask_applicant_form_fields(kwargs)
+
+        return form_class(**kwargs)
+
+
+class CoApplicantView(DTCOMCreditAppControllerMixin, BaseCoApplicantView):
+    """ DTCOM CoApplicant View"""
+
+    def get_form_class(self):
+        return DTCOMCoApplicantForm
+
+    def get_form(self, form_class=None):
+        if form_class is None:
+            form_class = self.get_form_class()
+        kwargs = self.get_form_kwargs()
+        if issubclass(form_class, DTCOMCoApplicantForm):
+            self.unmask_coapplicant_form_fields(kwargs)
+
+        return form_class(**kwargs)
+
+    def get_initial(self):
+        initial = super(CoApplicantView, self).get_initial()
+        # We need to coapp page to have access to the selected asset in app page
+        # during post request as well.
+        if not initial:
+            initial = {}
+        dealer_chosen_asset_type = (
+            self.request.dtsession
+            .get('application', {})
+            .get('applicant_form', {})
+            .get('asset_type')
+        )
+        initial['vehicle_type'] = dealer_chosen_asset_type
+        if self.deal.has_coapplicant:
+            initial['signer_type_code'] = getattr(self.deal.coapplicant, 'signer_type_code', None)
+        return initial
+
+
+class VehicleFinanceView(DTCOMCreditAppControllerMixin, BaseVehicleFinanceView):
+    """ DTCom Vehicle Finance View"""
+
+    def _get_moto_tradeins(self):
+        motorcycle_tradeins = []
+        for deal_tradein in self.deal.deal_tradeins:
+            trade_in_year_custom = deal_tradein.tradein_vehicle.trade_in_year_custom
+            trade_in_make_custom = deal_tradein.tradein_vehicle.trade_in_make_custom
+            trade_in_model_custom = deal_tradein.tradein_vehicle.trade_in_model_custom
+            trade_in_engine_ci = deal_tradein.tradein_vehicle.vehicle.engine_displacement_cubic_inch_number
+            lien_holder_number = deal_tradein.tradein_vehicle.lien_holder_number
+            monthly_payment_amount = deal_tradein.tradein_vehicle.monthly_payment_amount
+
+            if any([
+                trade_in_year_custom,
+                trade_in_make_custom,
+                trade_in_model_custom,
+            ]):
+                motorcycle_tradeins.append({
+                    'trade_in_year_custom': trade_in_year_custom,
+                    'trade_in_make_custom': trade_in_make_custom,
+                    'trade_in_model_custom': trade_in_model_custom,
+                    'trade_in_engine_displacement_cubic_inch_number': trade_in_engine_ci,
+                    'lien_holder_number': lien_holder_number,
+                    'monthly_payment_amount': monthly_payment_amount
+                })
+
+        # session repopulation pipes data back to form for validation
+        # so we need to flatten list data into flat data so form can be validated
+        data = {
+            'tradeins': motorcycle_tradeins,
+            'tradeins-TOTAL_FORMS': len(motorcycle_tradeins),
+            'tradeins-INITIAL_FORMS': len(motorcycle_tradeins),
+        }
+        data.update({
+            'tradeins-{}-{}'.format(i[0], i[1][0]): i[1][1]
+            for i in itertools.chain(*[
+                six.moves.zip_longest([i], v.items(), fillvalue=i)
+                for i, v in enumerate(motorcycle_tradeins)
+            ])
+        })
+
+        # Make sure we set trade_in initial data correctly as its not getting
+        # populated correctly out of the box, due to session magic from edit vehicle flows.
+        if bool(motorcycle_tradeins):
+            data['trade_in'] = True
+
+        return data
+
+    def _get_trailer_data(self):
+        data = {
+            'add_trailer': False,
+        }
+
+        buy_asset = self.deal.buy_asset
+        if buy_asset and buy_asset.asset:
+            data = {
+                'add_trailer': True,
+                'asset_make': buy_asset.asset.make,
+                'asset_model': buy_asset.asset.model,
+                'asset_year': buy_asset.asset.model_year_number,
+                'asset_serial_number': buy_asset.asset.serial_number,
+                'asset_value_source': buy_asset.asset.value_source,
+                'asset_value': buy_asset.asset.msrp_amount,
+                'asset_new_used_code': buy_asset.new_used_code,
+            }
+
+        return data
+
+    def _setup_motorcycle_initial(self, initial):
+        if 'add_trailer' not in initial:
+            initial.update(self._get_trailer_data())
+
+        if 'motorcycle_tradeins' not in initial:
+            initial.update(self._get_moto_tradeins())
+
+            if self.deal.first_tradein_vehicle:
+                initial['trade_in_unpaid_balance_amount'] = self.deal.first_tradein_vehicle.unpaid_balance_amount
+
+        if self.deal.buy_vehicle:
+            initial['vehicle_type_code'] = self.deal.buy_vehicle.vehicle.vehicle_type_code
+
+        return initial
+
+    def get_initial(self):
+        initial = super(VehicleFinanceView, self).get_initial()
+        # Return initial without making any changes
+        # just like how super does.
+        if self.request.POST:
+            return initial
+        # We need to get initial vehicles options saved in the db
+        # so these are properly stored in our dtsession.
+        vom = getManager(VehicleOptionsManager, self.request.context_data)
+        initial['vehicle_options_all'] = \
+            map(VehicleOptionsManager.construct_json_from_options,
+                vom.get_all_vehicle_options(self.deal))
+        initial['vehicle_options'] = \
+            map(VehicleOptionsManager.construct_json_from_options,
+                vom.get_selected_vehicle_options(self.deal))
+        if all([
+            'asset_new_used_code' in initial,
+            not initial.get('asset_new_used_code')
+        ]):
+            initial['asset_new_used_code'] = 'NEW'
+
+        if self.is_motorcycle:
+            initial = self._setup_motorcycle_initial(initial)
+
+        return initial
+
+    def get_context_data(self, **kwargs):
+        context = super(VehicleFinanceView, self).get_context_data(**kwargs)
+        context['multiform'] = context['form']
+        context['is_motorcycle'] = self.is_motorcycle
+        context.update(getattr(context['multiform'], 'subforms', {}))
+        if self.is_motorcycle:
+            context['vehicle_form_include'] = 'credit_app/includes/motorcycle_form.html'
+        return context
+
+    def get_form_class(self):
+        """Determine if template_names is defined for current collateral type.
+        This is currently a powersports-specific feature.
+        """
+        vehicle_form = DTCOMVehicleMultiForm
+        if self.is_motorcycle:
+            vehicle_form = DTCOMMotorcycleVehicleMultiForm
+        return vehicle_form
+
+    @property
+    def asset_type(self):
+        asset_type = (
+            self.request.dtsession
+            .get('application', {})
+            .get('applicant_form', {})
+            .get('asset_type')
+        )
+        return asset_type or get_attr_chained(self, ['deal', 'asset_type'])
+
+    @property
+    def is_motorcycle(self):
+        return self.asset_type == ca_constants.VehicleType.C.name
+
+    def get_form_kwargs(self):
+        kwargs = super(VehicleFinanceView, self).get_form_kwargs()
+        kwargs.update({
+            'deal': getattr(self, 'deal', None),
+        })
+        return kwargs
+
+    def form_finish(self, form, **kwargs):
+        """
+        Submit Spot Credit Application.
+        """
+        lender_id = self.deal.credit_app[0].cp_id
+        # Get Patrner
+        partner_manager = getManager(PartnerManager, self.context)
+        lender = partner_manager.get_only_partner_by_id(lender_id)
+        self.context.push({'partner_id': lender_id,
+                           'dealjacket_id': self.dealjacket_id,
+                           'deal_id': self.deal_id,
+                           })
+
+        lender_specific_manager = getManager(LenderSpecificManager, self.request.context_data)
+        if lender_specific_manager.is_lender_specific([(lender_id, None), ]):
+            self.session_helper.session['preserve_session_on_submit'] = True
+            self.request.session.modified = True
+            self.session_helper.session[constants.SELECTED_LENDERS] = [str(lender_id), ]
+            self.session_helper.session[constants.SELECTED_LENDERS_WITH_PROGRAMS] = [(str(lender_id), None), ]
+            return HttpResponseRedirect(reverse(constants.LENDER_ADDITIONAL_ROUTE_NAME, args=[self.dealjacket_id,
+                                                                                              self.deal_id, ]))
+        else:
+            credit_app_manager = getManager(CreditAppManager, self.request.context_data)
+            try:
+                credit_app_manager.submit(self.deal,
+                                          [lender],
+                                          execute_program_routing_rules=False)
+                credit_app_manager.log_event(event_nm=platform_constants.LogEventName.SPOT_CREDIT_APP_SUBMIT_SUCCESS, **self.context)
+            except CreditAppCriticalFieldMissingException:
+                masked_session = SessionManager().mask_session(self.session_helper.session)
+                credit_app_manager.log_event(platform_constants.LogEventName.CREDIT_APP_SUBMIT_ERROR, error_message='Submit Error Session Data={session}'.format(session=masked_session), **self.request.context_data)
+                raise
+            except Exception:
+                credit_app_manager.log_event(event_nm=platform_constants.LogEventName.SPOT_CREDIT_APP_SUBMIT_ERROR, log_type='error', **self.context)
+            finally:
+                return HttpResponseRedirect(
+                    reverse('contract_funding_documents', args=[self.dealjacket_id,
+                                                                self.deal_id, lender_id]))
+
+    def _calculate_capcost(self, form):
+        """Calculates Cap Cost amount when JavaScript fails to do so.
+        Args:
+            form (Form): form that validates data sent to this view
+        """
+        capcost = (float(form.cleaned_data.get('cash_sell_price_amount', 0) or '0') -
+                   float(form.cleaned_data.get('cash_down_amount', 0) or '0') -
+                   float(form.cleaned_data.get('rebate_amount', 0) or '0') +
+                   float(form.cleaned_data.get('acquisition_fee_amount', 0) or '0') -
+                   float(form.cleaned_data.get('trade_in_value_amount', 0) or '0'))
+        form.cleaned_data['capcost'] = capcost
+
+    def _calculate_unpaid_balance_amount(self, form):
+        """Calculates unpaid balance amount if javascript fails to compute
+        Args:
+            form (Form): An Instance DTCOMVehicleFinanceForm
+        """
+        unpaid_balance_amount = (float(form.cleaned_data.get('cash_sell_price_amount', 0) or 0) +
+                                 float(form.cleaned_data.get('sales_tax_amount', 0) or 0) +
+                                 float(form.cleaned_data.get('title_and_license_amount', 0) or 0) -
+                                 float(form.cleaned_data.get('cash_down_amount', 0) or 0) +
+                                 float(form.cleaned_data.get('front_end_fee_amount', 0) or 0) -
+                                 float(form.cleaned_data.get('rebate_amount', 0) or 0) -
+                                 float(form.cleaned_data.get('trade_in_value_amount', 0) or 0))
+        form.cleaned_data['unpaid_balance_amount'] = unpaid_balance_amount
+
+    def _calculate_estimated_financed_amount(self, form):
+        """Calculates estimated financed amount if javascript fails to compute
+        Args:
+            form (Form): An Instance DTCOMVehicleFinanceForm
+        """
+        estimated_financed_amount = (float(form.cleaned_data.get('accident_health_insurance_amount', 0) or 0) +
+                                     float(form.cleaned_data.get('credit_life_insce_am', 0) or 0) +
+                                     float(form.cleaned_data.get('gap_insce_am', 0) or 0) +
+                                     float(form.cleaned_data.get('warranty_amount', 0) or 0) +
+                                     float(form.cleaned_data.get('unpaid_balance_amount', 0) or 0) +
+                                     float(form.cleaned_data.get('back_end_fee_amount', 0) or 0))
+        form.cleaned_data['estimated_financed_amount'] = estimated_financed_amount
+
+    def form_valid(self, form, *args, **kwargs):
+        # Populate finance data instead of relying on client side(browser javascript)
+        if form.cleaned_data.get('product_type') == ca_constants.DEAL_TYPE_KEY_LEASE:
+            self._calculate_capcost(form)
+
+        else:
+            self._calculate_unpaid_balance_amount(form)
+            self._calculate_estimated_financed_amount(form)
+
+        return super(VehicleFinanceView, self).form_valid(form, *args, **kwargs)
+
+    def form_continue(self, form, **kwargs):
+        # Populate finance data instead of relying on client side(browser javascript)
+        if form.cleaned_data.get('product_type') == ca_constants.DEAL_TYPE_KEY_LEASE:
+            self._calculate_capcost(form)
+
+        else:
+            self._calculate_unpaid_balance_amount(form)
+            self._calculate_estimated_financed_amount(form)
+
+        super(VehicleFinanceView, self).form_continue(form, **kwargs)
+
+        return HttpResponseRedirect(reverse(self.next_route_name, kwargs=kwargs))
+
+
+class WisconsinSpouseView(DTCOMCreditAppControllerMixin, BaseWisconsinSpouseView):
+    """ DTCom Wisconsin SpouseView View"""
+    form_class = DTCOMWisconsinSpouseForm
+
+
+class DTCOMReadOnlyView(DTCOMCreditAppControllerMixin, BaseReadOnlyView):
+    """ This view handles the read only feature of Credit App for DTCOM"""
