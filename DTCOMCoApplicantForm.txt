@@ -1,0 +1,77 @@
+from .coapplicant.forms import DTCOMCoApplicantForm
+
+
+# -*- coding: utf-8 -*-
+"""
+DTCOM Credit Application - Co Applicant form
+"""
+from crispy_forms.layout import Button, Submit
+from django import forms
+from django.conf import settings
+
+from dtplatform.core import constants
+
+from common.credit_app import constants as credit_constants
+from common.credit_app.coapplicant.forms import BaseCoApplicantForm
+from dtcom.credit_app.applicant.forms import DTCOMApplicantFormMixin
+from dtcom.utils.forms.customer import DTCOMCustomerFormMixin
+
+
+class DTCOMCoApplicantForm(DTCOMCustomerFormMixin, DTCOMApplicantFormMixin, BaseCoApplicantForm):
+    """
+    DTCOM Co Applicant form
+    """
+
+    signer_type_code = forms.ChoiceField(label=("Co-Applicant Type"),
+                                         required=False,
+                                         choices=credit_constants.BUSINESS_COAPP_TYPE_CHOICES,)
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMCoApplicantForm, self).__init__(*args, **kwargs)
+        del self.fields['previous_organization_name'].widget.attrs["placeholder"]
+        del self.fields['previous_occupation_name'].widget.attrs["placeholder"]
+        del self.fields['previous_work_phone_number'].widget.attrs["placeholder"]
+        del self.fields['previous_employed_years'].widget.attrs["placeholder"]
+        del self.fields['previous_employed_months'].widget.attrs["placeholder"]
+        del self.fields['previous_school'].widget.attrs["placeholder"]
+
+        if settings.SHOW_GUARANTOR and \
+            (self.initial.get('business_applicant') == credit_constants.IS_BUSINESS_YES or
+                self.data.get('business_applicant') == credit_constants.IS_BUSINESS_YES):
+            del self.fields['party_relationship_code']
+            self.fields['signer_type_code'].choices = credit_constants.BUSINESS_COAPP_TYPE_CHOICES
+            self.fields['signer_type_code'].required = True
+        else:
+            self.fields['signer_type_code'].widget = forms.HiddenInput()
+
+        self._previous_address_init()
+        self._previous_employment_init()
+
+        # Inserting Co-Signer field into the first fieldset of the form layout
+        self.helper.layout[0][3].insert(4, 'signer_type_code')
+
+    def _setup_form_actions(self, user_type):
+        """Setup the list of form actions for the entire page. Lender users should not see
+        the Save button.
+        Args:
+            user_type (str): the user type code of the user logged in ('D', 'L', 'C')
+        Returns:
+            List of form actions.
+        """
+
+        # Lender users should not be able to Save the application on this page
+        if user_type == constants.LENDER_USER_TYPE:
+            return [Button('_back_', 'Back', css_class="btn-gray"), Submit('_continue_', 'Continue')]
+        else:
+            return super(DTCOMCoApplicantForm, self)._setup_form_actions(user_type)
+
+    def clean(self):
+        """Form clean method"""
+        cleaned_data = super(DTCOMCoApplicantForm, self).clean()
+        if cleaned_data.get('employment_status_code') in ['O']:
+            self.force_optional(cleaned_data, 'salary', 'salary_type_code', 'current_employed_years', 'current_employed_months')
+
+        if cleaned_data.get('previous_employment_status_code') in ['O']:
+            self.force_optional(cleaned_data, 'previous_employed_years', 'previous_employed_months')
+
+        return cleaned_data

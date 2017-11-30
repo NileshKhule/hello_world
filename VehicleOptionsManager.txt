@@ -1,0 +1,1016 @@
+from dtplatform.common.dtv.vehicle_options_manager import VehicleOptionsManager
+
+
+# -*- coding: utf-8 -*-
+import operator
+from collections import OrderedDict
+
+import simplejson
+from requests import Timeout
+
+from platform_utils.utils.dt_requests import post_json
+
+from dtplatform.common.base_manager import BaseManager, getManager
+from dtplatform.conf import settings
+from dtplatform.core.dealermanager import DealerManager
+from dtplatform.core.models import Deal
+from dtplatform.core.models.dj.chrome_vehicle_options import ChromeVehicleOptions
+from dtplatform.core.ymmt_manager import YMMTManager
+
+from .constants import BOOK_TERMS_MAPPING, BOOK_TYPES
+
+
+class VehicleOptionsManager(BaseManager):
+    def __init__(self, *args, **kwargs):
+        super(VehicleOptionsManager, self).__init__(*args, **kwargs)
+
+        self.ymmt_manager = getManager(YMMTManager, self.context)
+
+    def _get_dtv_request_payload(self, trim_id, book_name):
+        """
+        Helper function to construct Python dictionary
+        to be sent to dtv as request payload.
+        """
+        book_type = BOOK_TERMS_MAPPING[BOOK_TYPES[book_name]]['json_type_attr']
+
+        return {
+            'vehicle': {
+                'Books': [
+                    OrderedDict([
+                        ("__type", book_type),
+                        ("VehicleBookKey", BOOK_TYPES[book_name]),
+                        ("Styles", [
+                            {
+                                "VehicleBookKey": trim_id,
+                                "IsSelected": True
+                            }
+                        ]),
+                        ("RetrieveOptions", False),
+                        ("RetrieveGlobalOptions", True),
+                        ("RetrieveAlgBookMapping", True),
+                        ("RetrieveHondaMapping", False)
+                    ]),
+                ]
+            }
+        }
+
+    def _get_dtv_data_from_books_request_json(self,
+                                              trim_id,
+                                              vehicle_book_keys,
+                                              **kwargs):
+        """
+        Helper function to construct Python dictionary
+        to be sent to dtv as second request payload to get data
+        from individual books.
+
+        :param: trim_id: trim of the vehicle.
+        :param: vehicle_book_keys: dict containing proper keys for nada
+                                   black book.
+        """
+        chrome_book = BOOK_TERMS_MAPPING[BOOK_TYPES['chrome']]['json_type_attr']
+        black_book = BOOK_TERMS_MAPPING[BOOK_TYPES['black']]['json_type_attr']
+        nada_book = BOOK_TERMS_MAPPING[BOOK_TYPES['nada']]['json_type_attr']
+
+        dealer = (getManager(DealerManager, self.context)
+                  .get_dealer_by_dealer_code(self.context.get('dealer_code')))
+
+        request_json = {
+            "vehicle": {
+                "Books": [
+                    OrderedDict(
+                        [
+                            ("__type", nada_book),
+                            ("VehicleBookKey", BOOK_TYPES.get('nada')),
+                            ("Styles", [
+                                {
+                                    "VehicleBookKey": trim_id,
+                                    "IsSelected": True
+                                }
+                            ]
+
+                            ),
+                            ("Vid", vehicle_book_keys.get('nada', '')),
+                            ("ValueTimePeriod", 1),
+                            ("Regions", [
+                                {
+                                    # default because state_code is nullable
+                                    "VehicleBookKey": dealer.state_code or "NY",
+                                    "IsSelected": True
+                                }
+                            ])
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("__type", black_book),
+                            ("VehicleBookKey", BOOK_TYPES.get('black')),
+                            ("Styles", [
+                                {
+                                    "VehicleBookKey": trim_id,
+                                    "IsSelected": True
+                                }
+                            ]),
+                            ("ValueTimePeriod", 1),
+                            ("BodyStyles", [
+                                {
+                                    'IsSelected': True,
+                                    'VehicleBookKey': vehicle_book_keys.get('black', ''),
+                                }
+                            ]),
+                            ("Regions", [
+                                {
+                                    # default because state_code is nullable
+                                    "VehicleBookKey": dealer.state_code or "NY",
+                                    "IsSelected": True
+                                }
+                            ])
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("__type", chrome_book),
+                            ("VehicleBookKey", BOOK_TYPES.get('chrome')),
+                            ("Styles", [
+                                {
+                                    "VehicleBookKey": trim_id,
+                                    "IsSelected": True
+                                }
+                            ]),
+                            ("ValueTimePeriod", 1),
+                            ("RetrieveGlobalOptions", True),
+                        ]
+                    ),
+                ]
+            }
+        }
+
+        # adding vin number when available because some book
+        # provide more accurate information with vin code provided
+        if kwargs.get('vin'):
+            request_json['vehicle'].update({
+                'Vin': kwargs.get('vin'),
+            })
+
+        return request_json
+
+    def _post_json_to_dtv(self, payload, trim_id, description, url=None, timeout=None):
+        """
+        Helper function to post json data to DTV.
+
+        :param: payload: request json
+        :param: trim_id: trim_id of the vehicle
+        :description: Description to be logged in case of timeout.
+        """
+
+        if not url:
+            url = settings.DATAPOWER_DTCOM_VEHICLE_OPTIONS_URL
+        if not timeout:
+            timeout = settings.DATAPOWER_DTCOM_VEHICLE_OPTIONS_TIMEOUT
+
+        try:
+            response = post_json(
+                url=url,
+                context=self.context,
+                payload=payload,
+                timeout=timeout,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Accept-Encoding': 'gzip, deflate',
+                }
+            )
+        except Timeout:
+            msg = 'DTV timed out requesting {} after {}sec using trim_id={}'
+            self.log.error(msg.format(
+                description,
+                settings.DATAPOWER_DTCOM_VEHICLE_OPTIONS_TIMEOUT,
+                trim_id,
+            ))
+            return
+
+        if response.status_code != 200:
+            msg = ('DTV request failed requesting {} using trim_id={} '
+                   'with status_code={}')
+            self.log.error(msg.format(
+                description,
+                trim_id,
+                response.status_code,
+            ))
+            return
+
+        return response
+
+    def _get_chrome_data(self, trim_id):
+        """
+        Make first call with trim id to get chrome data
+        """
+
+        request_json = simplejson.dumps(
+            self._get_dtv_request_payload(trim_id, 'chrome')
+        )
+
+        response = self._post_json_to_dtv(
+            request_json,
+            trim_id,
+            'vehicle options with book mappings'
+        )
+        return response
+
+    def get_kbb_values(self, payload, trim_id):
+        """
+
+        :param payload:
+        :param trim:
+        :return kbb data:
+        """
+        response = self._post_json_to_dtv(
+            payload,
+            trim_id,
+            'Book data request: Book Type: kelley'
+        )
+        return response
+
+    def _get_dtv_vehicle_options_and_book_mappings(self, trim_id, **kwargs):
+        """
+        Make first call to dtv to get proper vehicle book key,
+        then make second call to dtv to get data from nada and black books.
+        This function does not massage the data in any way
+        and just returns dtv results.
+
+        If timeout occurs, or error is returned by DTV,
+        ``None`` is returned.
+        Otherwise a filtered list of global options is
+        returned.
+
+        :param: trim_id: trim_id of the vehicle
+        """
+        response = self._get_chrome_data(trim_id)
+        if response is None:
+            return
+
+        book_mappings = (
+            response.json()
+            .get('RetrieveConfigurationsResult', {})
+            .get('Books', [{}])[0]
+            .get('BookMappings', [])
+        )
+
+        filtered_book_mappings = self._get_filtered_book_mappings(book_mappings)
+
+        if kwargs.get('all_data'):
+            return self._get_all_dtv_data_from_books(trim_id, filtered_book_mappings, **kwargs)
+        else:
+            return self._get_dtv_data_from_books(trim_id, filtered_book_mappings, **kwargs)
+
+    def _get_all_dtv_data_from_books(self, trim_id, book_mappings, **kwargs):
+        """
+        Get all data by making second call with proper vehicle key
+        for proper request from dtv.
+
+        :param: trim_id: trim_id of the vehicle
+        :book_mappings: Book Mappings dict received from 2nd dtv call,
+                        based off of Chromebook.
+        """
+
+        request_json_second = simplejson.dumps(
+            self._get_dtv_data_from_books_request_json(
+                trim_id,
+                self._get_vehicle_book_dict(book_mappings),
+                **kwargs
+            )
+        )
+
+        response = self._post_json_to_dtv(
+            request_json_second,
+            trim_id,
+            'book data such as conflicting and included options'
+        )
+        if response is None:
+            return
+        return response.json()
+
+    def _get_dtv_data_from_books(self, trim_id, book_mappings, **kwargs):
+        """
+        Get data by making second call with proper vehicle key
+        for proper request from dtv.
+
+        :param: trim_id: trim_id of the vehicle
+        :book_mappings: Book Mappings dict received from 2nd dtv call,
+                        based off of Chromebook.
+        """
+        response = self._get_all_dtv_data_from_books(trim_id, book_mappings, **kwargs)
+        if response is None:
+            return
+        # Make a dict with global_options, nada_options,
+        # black_book_options, and book_mappings as the keys and
+        # their corresponding data as the value.
+        data = self._make_books_dict(response)
+        return self._update_global_option_data(data)
+
+    def _make_books_dict(self, response):
+        """
+        Given response from the second dtv call,
+        return a well constructed dict with
+        nada_options, black_book_options, global_options,
+        and book_mappings.
+        """
+        books = (
+            response
+            .get('RetrieveConfigurationsResult', {})
+            .get('Books', [{}])
+        )
+        data = {}
+        for book in books:
+            if book.get('VehicleBookKey') == str(BOOK_TYPES['nada']):
+                data['nada_options'] = book.get('Options', [])
+            elif book.get('VehicleBookKey') == str(BOOK_TYPES['black']):
+                data['black_book_options'] = book.get('Options', [])
+            elif book.get('VehicleBookKey') == str(BOOK_TYPES['chrome']):
+                if book.get('GlobalOptions'):
+                    data['global_options'] = book.get('GlobalOptions', [])
+                if book.get('BookMappings'):
+                    book_mappings = book.get('BookMappings', [])
+                    filtered_book_mappings = self._get_filtered_book_mappings(book_mappings)
+                    data['book_mappings'] = filtered_book_mappings
+        return data
+
+    def _update_global_option_data(self, data):
+        """
+        Expects a dictionary with nada, black, global options
+        and book mappings.
+        This method, updates the global option with corresponding
+        data from nada option and black book options.
+        Also, it populates global option's
+        BookValues with BookValues from BlackBook and Nada
+
+        :param: data: dictionary with nada, black, global options
+                      and book_mappings.
+        """
+        for option in data['global_options']:
+            # For each option in global option,
+            # we get the correct option in the specific book_types
+            # book_mapping whose `GlobalOptionId` matches this global
+            # options `VehicleBookKey`.
+
+            nada_key = self._get_vehicle_book_key_with_global_key(
+                data['book_mappings'],
+                BOOK_TYPES['nada'],
+                int(option.get('VehicleBookKey'))
+            )
+
+            black_book_key = self._get_vehicle_book_key_with_global_key(
+                data['book_mappings'],
+                BOOK_TYPES['black'],
+                int(option.get('VehicleBookKey'))
+            )
+
+            black_book_values = []
+            nada_book_values = []
+
+            exclude_keys = ['VehicleBookKey', 'Name']
+            include_keys = [
+                'IsRequired',
+                'IsInConflict',
+                'IsDefaultEquipment',
+                'IsSelected',
+                'IsStandard',
+                'IsEnabled'
+            ]
+
+            if nada_key and black_book_key:
+                black_option = self._get_book_option_with_book_key(
+                    data['black_book_options'],
+                    black_book_key
+                )
+                nada_option = self._get_book_option_with_book_key(
+                    data['nada_options'],
+                    nada_key
+                )
+                option['DataSource'] = 'Nada & Black Book'
+
+                self._update_option_with_nada_black(
+                    option,
+                    black_option or {},
+                    nada_option or {},
+                    include_keys
+                )
+
+                if black_option:
+                    black_book_values = black_option.get('BookValues')
+                if nada_option:
+                    self._add_conflicting_included_options(
+                        data,
+                        option,
+                        nada_option,
+                        'nada'
+                    )
+                    nada_book_values = nada_option.get('BookValues')
+
+            elif nada_key:
+                nada_option = self._get_book_option_with_book_key(
+                    data['nada_options'],
+                    nada_key
+                )
+                option['DataSource'] = 'Nada'
+                if nada_option:
+                    # We need to sync global options before adding conflicting
+                    # or included options, since in the end conflicting options
+                    # need only `Name`, `id` and `preselected`
+                    self.sync_global_option(option, nada_option, exclude_keys)
+                    self._add_conflicting_included_options(
+                        data,
+                        option,
+                        nada_option,
+                        'nada'
+                    )
+                    nada_book_values = nada_option.get('BookValues')
+
+            elif black_book_key:
+                black_option = self._get_book_option_with_book_key(
+                    data['black_book_options'],
+                    black_book_key
+                )
+                option['DataSource'] = 'BlackBook'
+                if black_option:
+                    self.sync_global_option(option, black_option, exclude_keys)
+                    black_book_values = black_option.get('BookValues')
+
+            # Update Book Values
+            option['BookValues'] = black_book_values + nada_book_values
+
+        filtered_options = self._filter_global_options(data['global_options'],
+                                                       data['book_mappings'])
+        return filtered_options
+
+    def _add_conflicting_included_options(self,
+                                          data,
+                                          global_option,
+                                          book_option,
+                                          book_type):
+        """
+        This method adds Included options and Conflicting options
+        to the global option.
+        """
+        if book_option:
+            global_option['IncludedOptions'] = self._update_conflicting_or_included_options(
+                data,
+                book_option.get('IncludedOptions'),
+                BOOK_TYPES[book_type]
+            )
+            global_option['ConflictingOptions'] = self._update_conflicting_or_included_options(
+                data,
+                book_option.get('ConflictingOptions'),
+                BOOK_TYPES[book_type]
+            )
+
+    def _update_option_with_nada_black(self,
+                                       global_option,
+                                       black_option,
+                                       nada_option,
+                                       include_keys=None):
+        """
+        This method is invoked when there are both nada keys
+        and black book keys for one global option id.
+        So, we take the values from whichever options whose
+        included keys are True.
+        """
+
+        if include_keys:
+            for key in include_keys:
+                global_option[key] = any(
+                    [
+                        black_option.get(key),
+                        nada_option.get(key)
+                    ]
+                )
+        return nada_option, black_option
+
+    def _get_book_option_with_book_key(self, book_options, book_key):
+        for option in book_options:
+            if option.get('VehicleBookKey') == book_key.get('OptionCode'):
+                return option
+
+    def sync_global_option(self, global_option, book_option, exclude_keys=None):
+        """
+        Update values of global option dict with
+        those of the passed book option dict,
+        excluding the keys passed in the exclude_keys
+        list.
+        """
+
+        if not isinstance(global_option, dict):
+            raise TypeError
+        if not isinstance(book_option, dict):
+            raise TypeError
+
+        if not exclude_keys:
+            exclude_keys = []
+
+        if book_option:
+            global_option.update({k: v
+                                  for k, v in book_option.items()
+                                  if k not in exclude_keys})
+
+    def _update_conflicting_or_included_options(self,
+                                                data,
+                                                options,
+                                                veh_book_key_num):
+        """
+        This method replaces the following parameters of Nada's or BlackBook's
+        conflicting or included options with those of global options.
+
+        `VehicleBookKey`
+        `Name`.
+
+        Then it encodes the dict of the parameters and adds them to a list
+        and returns that list.
+
+        :param: data: dictionary with nada, black, global options
+                      and book_mappings.
+        :param: option: Nada or BlackBook option received from dtv.
+        :param: veh_book_key_num: Key for option in BlackBook or Nada
+        """
+        opts = []
+        if options:
+            for option in options:
+                global_name_key = self._get_global_key_name_dict_with_veh_book_key(
+                    data,
+                    veh_book_key_num,
+                    option.get('VehicleBookKey'))
+                option['Name'] = global_name_key.get('name')
+                option['VehicleBookKey'] = global_name_key.get('id')
+
+                opts.append(
+                    self.__class__.construct_json_from_data(option)
+                )
+        return opts
+
+    def _get_vehicle_book_key_with_global_key(self,
+                                              book_mappings,
+                                              veh_book_key_num,
+                                              global_option_code):
+        """
+        Given a list of book mappings, and VehicleBook number,
+        for e.g:
+            'BlackBook': 3,
+            'Nada': 11
+        global_option_code: Global corresponding option code, for which we want
+        Books Option Key.
+        """
+        for mapping in book_mappings:
+            if mapping.get('VehicleBook') == veh_book_key_num:
+                for option in mapping.get('OptionMaps'):
+                    if option.get('GlobalOptionId') == global_option_code:
+                        return option
+
+    def _get_global_option_by_global_id(self,
+                                        global_options,
+                                        global_id):
+        """
+        Given a list of global options and global_id,
+        it returns the match option with the global_id
+        """
+        for option in global_options:
+            if option.get('VehicleBookKey') == str(global_id):
+                return option
+
+    def _get_global_key_name_dict_with_veh_book_key(self,
+                                                    data,
+                                                    veh_book_key_num,
+                                                    veh_option_code):
+        """
+        Given veh_book_key_num and veh_option_code it returns a dict
+        of corresponding veh_book_key and veh_option_code in global options.
+
+        :param data: Data dict having book_mappings, global_options
+                     nada_options, and black_book_options
+        :param veh_book_key_num: VehicleBookKey defined in BOOK_TYPES
+                                 for e.g nada=11, black_book=3
+        :param veh_option_code: VehicleBookKey of the corresponding book type
+                                option. Nada and Black Book have different ids
+                                for these but they eventually map to a single
+                                GlobalOptionId in global options, through book
+                                mappings.
+        """
+        for mapping in data['book_mappings']:
+            if mapping.get('VehicleBook') == veh_book_key_num:
+                for option in mapping.get('OptionMaps'):
+                    if option.get('OptionCode') == veh_option_code:
+                        global_option_id = option.get('GlobalOptionId')
+                        global_option = self._get_global_option_by_global_id(
+                            data['global_options'],
+                            global_option_id
+                        )
+                        return dict(name=global_option.get('Name'),
+                                    id=global_option_id)
+
+    def get_vehicle_options(self, trim_id, **kwargs):
+        """
+        Get a list of vehicle options for a particular vehicle
+        matching given parameters.
+
+        Internally this method uses
+        ``_get_dtv_vehicle_options_and_book_mappings`` to query dtv
+        however on top of simply making the dtv query, this method also
+        massages/filters the data as necessary.
+        """
+        options_and_book_mappings = \
+            self._get_dtv_vehicle_options_and_book_mappings(trim_id, **kwargs)
+
+        if options_and_book_mappings is None:
+            return []
+        return options_and_book_mappings
+
+    def get_dtv_vehicle_options_response(self, trim_id, **kwargs):
+        """
+        Get a list of all vehicle options data for a particular vehicle
+        matching given parameters.
+
+        Internally this method uses
+        ``_get_dtv_vehicle_options_and_book_mappings`` to query dtv
+        however on top of simply making the dtv query, this method also
+        massages/filters the data as necessary.
+        """
+        kwargs['all_data'] = True
+        options_and_book_mappings = \
+            self._get_dtv_vehicle_options_and_book_mappings(trim_id, **kwargs)
+
+        if options_and_book_mappings is None:
+            return []
+        return options_and_book_mappings
+
+    def _get_vehicle_book_dict(self, book_mappings):
+        """
+        Given Book Mappings return a dictionary with the key as the bookname,
+        and value as the VehicleBookKey.
+
+        Right now we only need Nada and BlackBook.
+        :param book_mappings: A List of dictionaries of BookTypes
+        """
+        veh_book_key_dict = {}
+        inverse_book_map = {v: k for k, v in BOOK_TYPES.items()}
+        for mapping in book_mappings:
+            key = inverse_book_map[mapping.get('VehicleBook')]
+            veh_book_key_dict[key] = mapping.get('VehicleBookKey')
+        return veh_book_key_dict
+
+    def _get_filtered_book_mappings(self, book_mappings):
+        """
+        Get only the book mappings that are associated with
+        Nada and BlackBook.
+        """
+        required_book_types = (
+            BOOK_TYPES['black'],
+            BOOK_TYPES['nada'],
+        )
+
+        # Get only Black and Nada book mappings
+        filtered_book_mappings = [
+            mapping
+            for mapping in book_mappings
+            if mapping.get('VehicleBook') in required_book_types
+        ]
+        return filtered_book_mappings
+
+    def _filter_global_options(self, global_options, book_mappings):
+        """
+        Filer global options based on Book Mappings.
+        Only show global options if they are present on
+        BB or Nada.
+        """
+        mapping_global_options_ids = []
+        for mapping in book_mappings:
+            option_maps = mapping.get('OptionMaps')
+            for option_map in option_maps:
+                mapping_global_options_ids.append(
+                    option_map.get('GlobalOptionId')
+                )
+
+        # Only add those global options that have theirs ids
+        # in Nada and Black Books mappings in OptionMaps,
+        # Global Options Id
+        filtered_global_options = [
+            option
+            for option in global_options
+            if int(option.get('VehicleBookKey')) in mapping_global_options_ids
+        ]
+        return self._filter_vehicle_value_options(filtered_global_options)
+
+    def _filter_vehicle_value_options(self, filtered_global_options):
+        """
+        Filter options by keeping on those options that have BookValues
+        """
+        return [
+            option
+            for option in filtered_global_options
+            if len(option.get('BookValues', [])) > 0
+        ]
+
+    def get_vehicle_options_for_credit_app(self, deal, trim_id, **kwargs):
+        """
+        Get a list of all vehicle options with a flag
+        whether a particular vehicle option is selected
+        for the specified credit app.
+
+        Function returns a list of vehicle option dicts, same as in
+        ``get_vehicle_options`` however each vehicle option dict
+        also each contains a flag ``"IsSaved"`` which indicates
+        whether that vehicle option was selected by the user.
+        Possible values for the flag are:
+
+        * ``True`` - user has selected the vehicle option
+        * ``False`` - vehicle option is preselected as specified
+          by DTV however user unselected it
+        * ``None`` - user has not made any [un]selections for
+          this vehicle option
+        """
+        all_options = self.get_vehicle_options(trim_id, **kwargs)
+        all_saved_options = self._vehicle_options_to_dict(
+            self.get_all_vehicle_options(deal)
+        )
+        selected_options = self._vehicle_options_to_dict(
+            self.get_selected_vehicle_options(deal)
+        )
+
+        for option in all_options:
+            saved = None
+            option_id = int(option['VehicleBookKey'])
+            if option_id in selected_options:
+                saved = True
+            elif option_id in all_saved_options:
+                saved = False
+            option['IsSaved'] = saved
+
+        return all_options
+
+    def get_all_vehicle_options(self, obj):
+        """
+        Get the list of all vehicle options for the
+        particular credit app via ``obj`` object,
+        both selected and possibly not selected.
+
+        If no vehicle options are saved, then empty list
+        is returned.
+
+        :param obj: Either Deal or BuyVehicle instance
+        """
+        if obj:
+            if isinstance(obj, Deal):
+                obj = obj.buy_vehicle
+            return getattr(obj, 'options', []) or []
+        return []
+
+    def get_selected_vehicle_options(self, obj):
+        """
+        Get the list of vehicle options user has
+        selected for the particular credit app
+        via ``obj`` object.
+
+        :param obj: Either Deal or BuyVehicle instance
+        """
+        options = self.get_all_vehicle_options(obj)
+        return filter(lambda option: option.is_selected == 'Y', options)
+
+    def _delete_vehicle_options(self, to_delete_ids, already_saved_dict, deal):
+        """
+        Used to delete unchecked yet not preselected options.
+
+        In order not to clutter the ChromeVehicleOptions table
+        since it can potentially grow a lot fasten than
+        vehicle table, we need to store minimal data in it.
+        Therefore we only store user-selected vehicle options
+        for a particular credit app as well as any exceptions
+        which must be stored. Currently there is only one
+        such exception - preselected options as returned
+        by DTV call which user unselected. We need to store
+        these because otherwise each time app will be opened,
+        these options will be selected again since as per DTV
+        spec. Storing these exceptions avoid that problem.
+
+        .. warning::
+            This function does not figure out which options
+            to delete. It expects a list of ids of vehicle
+            options to delete and then simply deletes them.
+
+        :param to_delete_ids: list of vehicle options ids to delete
+        :type to_delete_ids: list
+        :param already_saved_dict: Dictionary of already saved
+            vehicle options where keys are vehicle option ids
+            and values are ChromeVehicleOptions instances.
+        :type already_saved_dict: dict
+        :param deal: Deal instance
+        :type deal: Deal
+        """
+        for option_id in to_delete_ids:
+            del already_saved_dict[option_id]
+
+        # this will implicitly delete the missing other
+        # this requires BuyVehicle to have relation
+        # ChromeVehicleOptions with delete-orphan cascade
+        deal.buy_vehicle.options = already_saved_dict.values()
+
+    def _create_or_update_vehicle_options(self,
+                                          data,
+                                          already_saved_dict,
+                                          deal,
+                                          is_selected='Y'):
+        """
+        Create or update selected vehicle options
+
+        :param data: List of dictionary of vehicle options
+            which require "id", "name" and "preselected" keys::
+
+                [
+                    {
+                        "id": 1,
+                        "name": "foo",
+                        "preselected": False,
+                    },
+                    ...
+                ]
+        :param already_saved_dict: Dictionary of already saved
+            vehicle options where keys are vehicle option ids
+            and values are ChromeVehicleOptions instances.
+            This is necessary to determine whether update
+            or create new ChromeVehicleOption instance.
+        :param deal: Deal instance
+        :param is_selected: is_selected flag which will be
+            used to update/create ChromeVehicleOption instance.
+            This flag allows to reuse this function to create/update
+            not only selected vehicle options but also create/update
+            unselected vehicle options if exist.
+        """
+        for option_id, option in data.items():
+            vehicle_option = already_saved_dict.get(
+                option_id,
+                ChromeVehicleOptions(global_option_id=option['id'])
+            )
+            vehicle_option.is_selected = is_selected
+            vehicle_option.is_overwritten = 'Y' if option.get('preselected') else 'N'
+            vehicle_option.global_option_description = option['name']
+
+            if option_id not in already_saved_dict:
+                deal.buy_vehicle.options.append(vehicle_option)
+
+    def _data_options_to_dict(self, data):
+        """
+        Get a dictionary where keys are option ids and value
+        is the option itself.
+
+        For example::
+
+            >>> m = VehicleOptionsManager({})
+            >>> assert m._data_options_to_dict([
+            ...     {
+            ...         'id': 5,
+            ...         'name': 'foo',
+            ...         'preselected': False,
+            ...     }
+            ... ]) == {
+            ...     5: {
+            ...         'id': 5,
+            ...         'name': 'foo',
+            ...         'preselected': False,
+            ...     }
+            ... }
+        """
+        return dict(zip(
+            map(operator.itemgetter('id'), data),
+            data,
+        ))
+
+    def _vehicle_options_to_dict(self, options):
+        """
+        Get a dictionary where keys are the vehicle option ids
+        and value is the ChromeVehicleOptions instances.
+
+        For example::
+
+            >>> m = VehicleOptionsManager({})
+            >>> assert m._data_options_to_dict([
+            ...     ChromeVehicleOptions(
+            ...         global_option_id=5,
+            ...         global_option_description='foo',
+            ...     )
+            ... ]) == {
+            ...     5: ChromeVehicleOptions(
+            ...         global_option_id=5,
+            ...         global_option_description='foo',
+            ...     )
+            ... }
+
+        """
+        return dict(zip(
+            map(operator.attrgetter('global_option_id'), options),
+            options,
+        ))
+
+    def create_or_update_vehicle_options(self, data, deal, all_data=None):
+        """
+        Create or update chrome vehicle options for the given data
+
+        :param data: List of dictionaries with vehicle options data.
+            Each dictionary must of form::
+
+                {
+                    "id": <int>,
+                    "name": <string>,
+                    "preselected": <boolean>,
+                }
+            If ``None`` is provided, no options are modified.
+        :param deal: Deal instance to which vehicle options will be added
+        :param all_data: Unlike ``data`` parameter which only lists
+            user-selected vehicle options, this parameters
+            requires all vehicle options as returned by DTV
+            in the same dict form as ``data`` parameter.
+            This information is used to figure all data exceptions
+            such as preselected user-unselected vehicle options
+            so that they can be stored since they cannot be
+            determined from ``data`` directly.
+        """
+        if not deal.buy_vehicle:
+            return
+
+        # explicitly check for None since data genuinely can be
+        # false (e.g. []) in which case all vehicle options
+        # should be erased however if None is provided
+        # no action should be taken
+        if data is None:
+            return
+
+        # delete all vehicle options for new vehicle
+        # or for when user typed custom YMMT
+        if any((deal.buy_vehicle.condition_type == 'NEW',
+                getattr(deal.buy_vehicle.vehicle, 'has_custom_ymmt', bool)())):
+            deal.buy_vehicle.options[:] = []
+            return deal.buy_vehicle.options
+
+        # get all saved vehicle options
+        # both checked and preselected but unchecked
+        already_saved = self._vehicle_options_to_dict(
+            self.get_all_vehicle_options(deal)
+        )
+
+        # get all preselected vehicle options
+        # from the submitted data, if any
+        all_preselected = self._data_options_to_dict(
+            filter(lambda i: i.get('preselected', False),
+                   all_data or [])
+        )
+
+        selected = self._data_options_to_dict(data)
+
+        # compute ids of vehicle options to delete
+        # previously selected
+        to_delete_ids = (set(already_saved) - set(selected) - set(all_preselected))
+
+        # uncheck preselected options since
+        # user explicitly unchecked them
+        to_uncheck_ids = (set(all_preselected) - set(selected))
+
+        def get_options_by_ids(ids, data_dict):
+            return {
+                option['id']: option
+                for option_id, option in data_dict.items() if option_id in ids
+            }
+
+        self._delete_vehicle_options(
+            to_delete_ids,
+            already_saved,
+            deal,
+        )
+        self._create_or_update_vehicle_options(
+            selected,
+            already_saved,
+            deal,
+        )
+        self._create_or_update_vehicle_options(
+            get_options_by_ids(to_uncheck_ids, all_preselected),
+            already_saved_dict=already_saved,
+            deal=deal,
+            is_selected='N',
+        )
+
+        return deal.buy_vehicle.options
+
+    @staticmethod
+    def construct_json_from_data(data):
+        """
+        Construct field-friendly json from dtv data dict
+        """
+        return {
+            'id': int(data['VehicleBookKey']),
+            'name': data['Name'],
+            'preselected': data['IsSelected'],
+        }
+
+    @staticmethod
+    def construct_json_from_options(option):
+        """
+        Construct field-friendly json from ChromeVehicleOptions instance
+        """
+        return {
+            'id': option.global_option_id,
+            'name': option.global_option_description,
+            'preselected': True if option.is_overwritten == 'Y' else False,
+        }

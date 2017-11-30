@@ -1,0 +1,211 @@
+from common.credit_app.applicant.views import BaseApplicantView
+
+
+# -*- coding: utf-8 -*-
+"""
+Credit Application - Applicant View
+"""
+import six
+from django import forms
+
+from platform_utils.utils.mapper import multi_level_getattr
+
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.fusion.customermanager import CustomerManager
+
+from common.credit_app import constants
+from common.credit_app.applicant.forms import BaseApplicantForm
+from common.credit_app.utils import push_initial_data_to_session
+from common.credit_app.views import BaseCreditAppView
+from common.dealjacket.views import make_business_customer_form
+from common.forms.constants import ID_VERIFICATION_NONE
+from common.mixins.data_entry import LockCreditAppDataEntryPages
+from common.views.ajax_form_view import AjaxFieldValidationFormView
+from utils.views.generic.lock import DealJacketLockMixin, DealjacketAccessMixin
+
+
+class BaseApplicantView(LockCreditAppDataEntryPages, DealJacketLockMixin, DealjacketAccessMixin,
+                        BaseCreditAppView, AjaxFieldValidationFormView):
+
+    """Applicant View Class"""
+    is_business = forms.ChoiceField(
+        label="Moo",
+        choices=[('N', 'N'), ('Y', 'Y')],
+        initial='N',
+        widget=forms.RadioSelect())
+
+    template_name = 'credit_app/applicant.html'
+    next_route_name = constants.VEHICLE_ROUTE_NAME
+
+    def get_form_class(self):
+        """Returns the form class based on the Application Type"""
+        # try getting the applicant type out of the POSTed
+        # data first to be more efficient.
+        # This code is REQUIRED for ajax_field_validation() to work.
+        try:
+            if self.request.POST[constants.IS_BUSINESS_KEY] == constants.IS_BUSINESS_YES:
+                form_class = make_business_customer_form('a')
+            else:
+                form_class = BaseApplicantForm
+        except Exception:
+            models = self.get_models()
+            applicant = models[0].model
+            if applicant.is_business == constants.IS_BUSINESS_YES:
+                form_class = make_business_customer_form('a')
+            else:
+                form_class = BaseApplicantForm
+
+        return form_class
+
+    def get_form(self, form_class=None):
+        """
+        Returns the instance of the form class.
+        """
+        if form_class is None:
+            form_class = self.get_form_class()
+        kwargs = self.get_form_kwargs()
+        if form_class is BaseApplicantForm:
+            self.unmask_applicant_form_fields(kwargs)
+
+        return form_class(
+            **kwargs
+        )
+
+    def unmask_applicant_form_fields(self, kwargs):
+        """
+        Method to unmask the masked applicant form fields, and add them to kwargs dict.
+        :param kwargs:
+        :return:
+        """
+        if constants.APPLICATION_KEY in self.request.dtsession.keys():
+            applicant_form_dict = self.request.dtsession[constants.APPLICATION_KEY].get(
+                constants.APPLICANT_FORM_KEY, {})
+            coapplicant_form_dict = self.request.dtsession[constants.APPLICATION_KEY].get(
+                constants.COAPPLICANT_FORM_KEY, {})
+        else:
+            applicant_form_dict = {}
+            coapplicant_form_dict = {}
+
+        ccm = getManager(CustomerManager, self.request.context_data)
+        kwargs[constants.DEALER_CODE_KEY] = self.request.context_data[constants.DEALER_CODE_KEY]
+        kwargs['deal_jacket_id'] = self.request.context_data['deal_jacket_id']
+        kwargs['context_data'] = self.request.context_data
+        unmasked_birth_date = applicant_form_dict.get('birth_date', '')
+        if not unmasked_birth_date:
+            unmasked_birth_date = ccm.get_app_coapp_dob(
+                self.request.context_data.get('deal_jacket_id'),
+                self.request.context_data.get('deal_id'),
+                app_type='A')
+        kwargs['unmasked_birth_date'] = unmasked_birth_date
+
+        # Co-Applicant SSN added in kwargs for validation
+        if coapplicant_form_dict and coapplicant_form_dict.get('tax_id') and \
+                '*' not in coapplicant_form_dict.get('tax_id'):
+            kwargs['coapplicant_ssn'] = coapplicant_form_dict.get('tax_id')
+        else:
+            kwargs['coapplicant_ssn'] = ccm.get_app_coapp_ssn(
+                self.request.context_data.get('deal_jacket_id'),
+                self.request.context_data.get('deal_id'),
+                app_type='C')
+
+    def get_context_data(self, **kwargs):
+        """Returns the context data"""
+        context = super(BaseApplicantView, self).get_context_data(**kwargs)
+        context[constants.TEXT_HEADER_KEY] = constants.CREDIT_APP_APPLICANT_TEMPLATE_HEADER
+        context[constants.BASE_TEMPLATE_KEY] = constants.BASE_DEALJACKET_TEMPLATE_NAME
+        return context
+
+    def form_continue(self, form, **kwargs):
+        """
+        This method sets cc_id in dtsession
+        """
+        # checking if the session exists; setting lender_deal_update to false
+        # as there are no fields on the applicant page which trigger lender deal update function
+        if self.session_helper.session:
+            self.session_helper.session['lender_deal_update'] = False
+        self.request.dtsession[constants.CC_ID_KEY] = self.request.POST.get(constants.CC_ID_KEY)
+        us_state_code = form.cleaned_data.get(constants.US_STATE_CODE_KEY, '')
+        marital_status_code = form.cleaned_data.get(constants.MARITAL_STATUS_CODE_KEY)
+        if self.request.POST.get(constants.HAS_COAPPLICANT_KEY) == constants.STRING_TRUE or \
+                self.request.POST.get(constants.COAPPLICANT_DISABLED_KEY) == constants.COAPPLICANT_DISABLED:
+            self.next_route_name = constants.COAPPLICANT_ROUTE_NAME
+        else:
+            if us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN:
+                if marital_status_code in [constants.MARITAL_STATUS_CODE_MARRIED, constants.MARITAL_STATUS_CODE_SEPARATED]:
+                    self.next_route_name = constants.WISCONSIN_SPOUSE_ROUTE_NAME
+        return super(BaseApplicantView, self).form_continue(form, **kwargs)
+
+    def get_initial(self):
+        """init method for BaseApplicantView"""
+        initial = super(BaseApplicantView, self).get_initial()
+        if self.request.method == 'POST':
+            return
+
+        # normalize phone numbers to strings from model instances when they
+        # are retrieved from DB
+        for field_name in ['current_business_phone', 'current_bank_phone']:
+            if field_name not in initial:
+                continue
+
+            value = initial.get(field_name)
+
+            # value is already string so no need to normalize it
+            # or value is falsy hence nothing to normalize
+            if not value or isinstance(value, six.string_types):
+                continue
+
+            # need to use both variants of phone_number and phone.phone_number
+            # since Customer and DealJacketCustomer return different phone types.
+            # One returns Phone and other returns DealJacketPhone.
+            initial[field_name] = multi_level_getattr(
+                value, 'phone.phone_number',
+                default=getattr(value, 'phone_number', None),
+            )
+
+        if constants.APPLICATION_KEY in self.request.dtsession:
+            if constants.COAPPLICANT_FORM_KEY in self.request.dtsession.get(constants.APPLICATION_KEY):
+                co_applicant_form_dict = self.request.dtsession.get(
+                    constants.APPLICATION_KEY).get(constants.COAPPLICANT_FORM_KEY)
+                if constants.PARTY_RELATIONSHIP_CODE_KEY in co_applicant_form_dict:
+                    initial[constants.PARTY_RELATIONSHIP_CODE_KEY] = co_applicant_form_dict[
+                        constants.PARTY_RELATIONSHIP_CODE_KEY]
+            if constants.APPLICANT_ROUTE_NAME in self.request.dtsession.get(constants.APPLICATION_KEY):
+                applicant_form = self.request.dtsession.get(constants.APPLICATION_KEY).get(constants.APPLICANT_ROUTE_NAME)
+                initial['primary_phone_number'] = applicant_form.get('primary_phone_number')
+                initial['primary_phone_type'] = applicant_form.get('primary_phone_type')
+                initial['alternate_phone_number'] = applicant_form.get('alternate_phone_number')
+                initial['alternate_phone_type'] = applicant_form.get('alternate_phone_type')
+
+        # check for disabling the coapplicant
+        initial['disable_coapplicant'] = False
+        if self.deal.is_submitted and self.deal.has_coapplicant:
+            initial['disable_coapplicant'] = True
+
+        # set previous last name
+        if 'last_name' in initial:
+            initial['previous_last_name'] = initial['last_name']
+
+        if 'business_name' in initial:
+            initial['previous_business_name'] = initial['business_name']
+            initial['id_verification'] = ID_VERIFICATION_NONE
+
+        # CreditScore model stores the score as 'credit_score' but our form uses 'customer_credit_score'
+        # This will make sure the value from the db appears on the Applicant page.
+        if initial.get('credit_score', None):
+            initial['custom_credit_score'] = initial.pop('credit_score')
+
+        initial['spot_con_in'] = self.deal.spot_contract_indicator
+
+        push_initial_data_to_session(self.deal, self.session_helper, initial, constants.APPLICANT_ROUTE_NAME)
+        return initial
+
+    def get_models(self):
+        """
+        Return list of sql alchemy models wrapped in model class
+        """
+        ccm = getManager(CustomerManager, self.request.context_data)
+        return ccm.get_models_for_customer_by_ccid(
+            cc_id=self.get_cc_id(),
+            deal=self.deal,
+            deal_customer_attr='applicant',
+        )

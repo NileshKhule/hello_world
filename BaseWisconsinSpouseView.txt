@@ -1,0 +1,128 @@
+from common.credit_app.wisconsin_spouse.views import BaseWisconsinSpouseView
+
+
+# -*- coding: utf-8 -*-
+"""
+Credit Application - Co Applicant View
+"""
+from dtplatform.common.base_manager import getManager
+from dtplatform.common.fusion.customermanager import CustomerManager
+
+from common.credit_app import constants
+from common.credit_app.views import BaseCreditAppView
+from common.credit_app.wisconsin_spouse.forms import BaseWisconsinSpouseForm
+from common.mixins.data_entry import LockCreditAppDataEntryPages
+from common.views.ajax_form_view import AjaxFieldValidationFormView
+from utils.views.generic.lock import DealJacketLockMixin
+
+
+class BaseWisconsinSpouseView(LockCreditAppDataEntryPages, DealJacketLockMixin, BaseCreditAppView,
+                              AjaxFieldValidationFormView):
+
+    """Wisconsin Spouse View Class"""
+
+    form_class = BaseWisconsinSpouseForm
+    template_name = "credit_app/" + constants.WISCONSIN_SPOUSE_TEMPLATE_NAME
+    next_route_name = constants.VEHICLE_ROUTE_NAME
+    previous_route_name = constants.APPLICANT_ROUTE_NAME
+
+    def get_models(self):
+        """
+        Return list of sql alchemy models wrapped in model class
+        """
+        ccm = getManager(CustomerManager, self.request.context_data)
+        return ccm.get_models_for_customer_spouses(self.deal)
+
+    def get_context_data(self, **kwargs):
+        context = super(BaseWisconsinSpouseView, self).get_context_data(**kwargs)
+        context[constants.TEXT_HEADER_KEY] = constants.CREDIT_APP_SPOUSE_INFORMATION_TEMPLATE_HEADER
+        context[constants.BASE_TEMPLATE_KEY] = constants.BASE_DEALJACKET_TEMPLATE_NAME
+        return context
+
+    def get_initial(self):
+        """Return applicant address for same as address checkbox"""
+        if self.request.POST:
+            return
+
+        initial = super(BaseWisconsinSpouseView, self).get_initial()
+        # app_spouse_flag and coapp_spouse_flag are used to show/hide applicant/co-applicant spouse information
+        # If app_spouse_flag is True, display the applicant spouse information
+        # If coapp_spouse_flag to True, display the co-applicant spouse information
+        initial['app_spouse_flag'] = False
+        initial['coapp_spouse_flag'] = False
+        application_data = self.request.dtsession.get(constants.APPLICATION_KEY)
+        applicant_form = application_data.get(constants.APPLICANT_FORM_KEY) if application_data else {}
+        if applicant_form.get(constants.HAS_COAPPLICANT_KEY) in [constants.STRING_TRUE, True]:
+            co_applicant_form = self.request.dtsession.get(
+                constants.APPLICATION_KEY).get(constants.COAPPLICANT_FORM_KEY)
+            coapp_us_state_code = co_applicant_form.get(constants.US_STATE_CODE_KEY, '')
+            party_relation_code = co_applicant_form.get(constants.PARTY_RELATIONSHIP_CODE_KEY)
+            app_us_state_code = applicant_form.get(constants.US_STATE_CODE_KEY, '')
+
+            if party_relation_code != constants.PARTY_RELATIONSHIP_CODE_SPOUSE:
+                if (app_us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN and
+                    applicant_form.get(constants.MARITAL_STATUS_CODE_KEY) in (constants.MARITAL_STATUS_CODE_MARRIED,
+                                                                              constants.MARITAL_STATUS_CODE_SEPARATED)):
+                    initial['app_spouse_flag'] = True
+
+                if (coapp_us_state_code.upper() == constants.US_STATE_CODE_WISCONSIN and
+                    co_applicant_form.get(constants.MARITAL_STATUS_CODE_KEY) in (constants.MARITAL_STATUS_CODE_MARRIED,
+                                                                                 constants.MARITAL_STATUS_CODE_SEPARATED)):
+                    initial['coapp_spouse_flag'] = True
+        else:
+            initial['app_spouse_flag'] = True
+            initial['coapp_spouse_flag'] = False
+
+        try:
+            applicant_form_dict = application_data[constants.APPLICANT_FORM_KEY] if application_data else {}
+
+            initial[constants.APPLICANT_ADDRESS_KEY] = [
+                applicant_form_dict.get(constants.LINE_1_ADDRESS_KEY) or u'',
+                applicant_form_dict.get(constants.LINE_2_ADDRESS_KEY) or u'',
+                applicant_form_dict.get(constants.CITY_KEY) or u'',
+                applicant_form_dict.get(constants.US_STATE_CODE_KEY) or u'',
+                applicant_form_dict.get(constants.ZIP_CODE_KEY) or u''
+            ]
+            if applicant_form.get(constants.HAS_COAPPLICANT_KEY) in [constants.STRING_TRUE, True]:
+                coapplicant_form_dict = self.request.dtsession.get(
+                    constants.APPLICATION_KEY)[constants.COAPPLICANT_FORM_KEY]
+
+                initial[constants.COAPPLICANT_ADDRESS_KEY] = [
+                    coapplicant_form_dict.get(constants.LINE_1_ADDRESS_KEY) or u'',
+                    coapplicant_form_dict.get(constants.LINE_2_ADDRESS_KEY) or u'',
+                    coapplicant_form_dict.get(constants.CITY_KEY) or u'',
+                    coapplicant_form_dict.get(constants.US_STATE_CODE_KEY) or u'',
+                    coapplicant_form_dict.get(constants.ZIP_CODE_KEY) or u''
+                ]
+
+        except KeyError:
+            applicant = self.deal.applicant.customer_detail
+            if applicant.current_address:
+                initial[constants.APPLICANT_ADDRESS_KEY] = [
+                    applicant.current_address.line_1_address or '',
+                    applicant.current_address.line_2_address or '',
+                    applicant.current_address.city or '',
+                    applicant.current_address.us_state_code or '',
+                    applicant.current_address.zip_code or ''
+                ]
+            if applicant_form.get(constants.HAS_COAPPLICANT_KEY) in [constants.STRING_TRUE, True]:
+                coapplicant = self.deal.coapplicant.customer_detail
+                if coapplicant.current_address:
+                    initial[constants.COAPPLICANT_ADDRESS_KEY] = [
+                        coapplicant.current_address.line_1_address or '',
+                        coapplicant.current_address.line_2_address or '',
+                        coapplicant.current_address.city or '',
+                        coapplicant.current_address.us_state_code or '',
+                        coapplicant.current_address.zip_code or ''
+                    ]
+        return initial
+
+    def form_back(self, form, **kwargs):
+        """
+        This method sets cc_id in dtsession
+        """
+        self.request.dtsession[constants.CC_ID_KEY] = self.request.POST.get(constants.CC_ID_KEY)
+        if self.request.dtsession.get(constants.APPLICATION_KEY).get(constants.APPLICANT_FORM_KEY).\
+                get(constants.HAS_COAPPLICANT_KEY) in [constants.STRING_TRUE, True]:
+            self.previous_route_name = constants.COAPPLICANT_ROUTE_NAME
+        return super(BaseWisconsinSpouseView, self).form_back(form, **kwargs)

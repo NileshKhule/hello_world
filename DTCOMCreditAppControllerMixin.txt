@@ -1,0 +1,100 @@
+from ..mixins.credit_app_session import DTCOMCreditAppControllerMixin
+
+
+# -*- coding: utf-8 -*-
+""" DTCOM Credit App Mixins """
+
+from collections import OrderedDict
+
+from dt_django_base.mixins.tenant_brand import TenantBrandMixin
+from platform_utils.utils.obj_utils import get_attr_chained
+
+from common.credit_app import constants
+
+
+class DTCOMCreditAppControllerMixin(TenantBrandMixin):
+
+    """
+    DTCOM specific credit app controller mixin.
+
+    This mixin also repopulates session with all credit-app information
+    in order to be able to successfully copy deal-jacket via sessions.
+
+    Whenever un-submitted credit-app form is accessed for the first time,
+    the session gets flushed as per BaseFormView. However if afterwards,
+    sound-ex is triggered due to significant applicant or co-applicant change
+    and the credit-app is saved, the whole deal-jacket needs to be copied.
+    Since it is copied by saving data in session to db and since the session
+    was flushed upon accessing the app, not all information is copied.
+    This mixin allows to repopulate the session data whenever session is
+    cleared out which solves this issue.
+    """
+
+    def get_session_repopulate_views_mapping(self):
+        """
+        DTCOM implementation of get_session_repopulate_views_mapping
+        Get mapping between session keys for the views which can retrieve
+        the data for that step in credit-app wizard.
+        """
+        from dtcom.credit_app.views import ApplicantView, CoApplicantView, VehicleFinanceView, WisconsinSpouseView
+
+        return {
+            constants.APPLICANT_FORM_KEY: ApplicantView,
+            constants.COAPPLICANT_FORM_KEY: CoApplicantView,
+            constants.WISCONSIN_SPOUSE_FORM_KEY: WisconsinSpouseView,
+            constants.VEHICLE_FORM_KEY: VehicleFinanceView
+        }
+
+    def populate_session_views(self, views_mapping, forced_views=None):
+        """
+        DTCOM implementation populate_session_views
+        Creates an OrderedDict that contains the views for DTCOM
+        """
+        forced_views = forced_views or []
+        deal = self.deal
+        view_route_mapping = OrderedDict()
+        # applicant
+        applicant_view = self.other_view_getter(views_mapping[constants.APPLICANT_FORM_KEY])
+        view_route_mapping[constants.APPLICANT_FORM_KEY] = applicant_view
+
+        # co-applicant
+        if deal.has_coapplicant or constants.COAPPLICANT_FORM_KEY in forced_views:
+            co_applicant_view = self.other_view_getter(views_mapping[constants.COAPPLICANT_FORM_KEY])
+            view_route_mapping[constants.COAPPLICANT_FORM_KEY] = co_applicant_view
+
+        # spouse
+        if any([deal.applicant.deal_customer_spouse,
+                deal.has_coapplicant and deal.coapplicant.deal_customer_spouse,
+                constants.WISCONSIN_SPOUSE_FORM_KEY in forced_views]):
+            spouse_view = self.other_view_getter(views_mapping[constants.WISCONSIN_SPOUSE_FORM_KEY])
+            view_route_mapping[constants.WISCONSIN_SPOUSE_FORM_KEY] = spouse_view
+
+        # vehicle and finance
+        # Only populate the vehicle form if there are both Vehicle and DealFinance objects (only for non-payment call apps) in the database
+        # We want to ensure that the user actually went to the V&F page to save this data.
+        # Note:
+        # (1) Using vehicle information alone is not sufficient, because the user could have gone to the AddVehicle page
+        # to save the vehicle data. In that case, the form would have errors for missing finance data.
+        # (2) We don't need to worry about the user using the Deal Edit page to save data into the DB before going to the V&F page,
+        # because all required fields on the V&F page are required on the Deal Edit page.
+        # (3) DTCOM Payment Call applications always have Vehicle objects, since they must have a vehicle type (condition type)
+        vehicle_cond = get_attr_chained(deal, ['buy_vehicle', 'vehicle'])
+        finance_cond = deal.deal_finance or (deal.payment_call_indicator == constants.PAYMENT_CALL_INDICATOR_YES)
+        if any([vehicle_cond and finance_cond,
+                constants.VEHICLE_FORM_KEY in forced_views]):
+            vehicle_view = self.other_view_getter(views_mapping[constants.VEHICLE_FORM_KEY])
+            view_route_mapping[constants.VEHICLE_FORM_KEY] = vehicle_view
+
+        return view_route_mapping
+
+    def validate_form_store_session(self, view, route_name, application_data, deal):
+        # TODO this causes multiple get_initial calls, here and in base implementation
+        # TODO should be refactored
+        initial = view.get_initial()
+
+        if deal.payment_call_indicator == constants.PAYMENT_CALL_INDICATOR_YES:
+            initial.pop(constants.PRODUCT_TYPE_KEY, None)
+
+        return super(DTCOMCreditAppControllerMixin, self).validate_form_store_session(
+            view, route_name, application_data, deal
+        )

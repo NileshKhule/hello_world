@@ -1,0 +1,390 @@
+from common.credit_app import constants
+
+
+# -*- coding: utf-8 -*-
+"""
+This class constants values
+
+"""
+# originally common.credit_app.constants
+
+from __future__ import unicode_literals
+
+from django.utils.translation import ugettext_lazy as _
+
+from dt_django_base.constants import *  # noqa
+from platform_utils.utils.enum import Enum
+
+from dtplatform.common.credit_app import constants as platformconstants
+from dtplatform.common.credit_bureau import constants as platformcbconstants
+
+
+# if your constant is not in this file, and you are importing it through here,
+# it is in dt_django_base.constants
+# PLEASE import directly from dt_django_base if you possibly can
+
+ACCIDENT_HEALTH_INSURANCE_AMOUNT_KEY = 'accident_health_insurance_amount'
+
+ACQUISITION_FEE_AMOUNT_KEY = 'acquisition_fee_amount'
+
+APPLICANT_ADDRESS_KEY = 'applicant_address'
+APPLICANT_LINK_TITLE = _('Applicant')
+APPLICANT_ROUTE_NAME = 'applicant_form'
+APPLICANT_TYPE_APPLICANT = 'A'
+APPLICANT_TYPE_COAPPLICANT = 'C'
+APPLICANT_US_STATE_CODE_KEY = 'app_us_state_code'
+
+APP_SUB_SUCCESS_MSG = 'Application submitted successfully.'
+APP_SUBMITTED_NAME = "app_submitted"
+
+BACK_END_FEE_AMOUNT_KEY = 'back_end_fee_amount'
+
+BASE_DEALJACKET_TEMPLATE_NAME = 'base_dealjacket.html'
+
+BASE_TEMPLATE_KEY = 'base_template'
+
+# Should this not come from the reference.ref_book table??
+BOOK_CHOICES = [('', ''), ('NADA', 'NADA'), ('KBB', 'Kelley Blue Book'),
+                ('BB', 'Black Book'), ('GAL', 'Galves'), ('OTHER', 'Other')]
+
+BUSINESS_APPLICANT_KEY = 'business_applicant'
+
+CAPCOST_TEXT = 'capcost'
+CAPCOST_KEY = 'cap_cost'
+
+CASH_DOWN_AMOUNT_KEY = 'cash_down_amount'
+CASH_SELL_PRICE_AMOUNT_KEY = 'cash_sell_price_amount'
+
+CA_FEATURE_STATUS_CODE_SUBMIT = 'ASUB'
+CA_PROMPT_ROUTE_NAME = 'ca_prompt'
+CA_PARAM_DICT = 'ca_param_dict'
+
+COMMENTS_KEY = "comments"
+
+CC_ID_KEY = 'cc_id'
+
+CHANGES_KEY = 'changes'
+
+CHECKED_LENDERS_KEY = 'checked_lenders'
+
+CITY_KEY = 'city'
+
+COAPPLICANT_ADDRESS_KEY = 'coapplicant_address'
+COAPPLICANT_DISABLED = 'Y'
+COAPPLICANT_DISABLED_KEY = 'coapplicant_disabled'
+COAPPLICANT_FORM_KEY = 'co_applicant_form'
+COAPPLICANT_LINK_TITLE = _('Co-Applicant')
+COAPPLICANT_ROUTE_NAME = 'co_applicant_form'
+
+COMMUNITY_STATE_DISCLOSURE_KEY = 'community_state_disclosure'
+COMMUNITY_STATE_KEY = 'community_state'
+DISCLOSER_COMMUNITY_STATE = platformconstants.DISCLOSER_COMMUNITY_STATE
+
+CONDITION_KEY = 'condition'
+CONDITION_NEW = 'new'
+CONDITION_TYPE_KEY = 'condition_type'
+APPLICANT_STATE_KEY = 'applicant_state_key'
+APPLICANT_ZIP_KEY = 'applicant_zip_key'
+CERTIFIED_INDICATOR_KEY = 'certified_indicator'
+CONDITION_USED = 'used'
+CONDITION_OLD = 'old'
+
+CONNECTION_KEY_DEAL = 'Deal'
+CP_STATES = platformconstants.CP_STATES
+
+CREDIT_APP_ONE_PAGE_TEMPLATE_HEADER = _("Application")
+CREDIT_APP_APPLICANT_TEMPLATE_HEADER = _("Applicant")
+CREDIT_APP_COAPPLICANT_TEMPLATE_HEADER = _("Co-Applicant")
+CREDIT_APP_SPOUSE_INFORMATION_TEMPLATE_HEADER = _("Spouse Information")
+
+CREDIT_LIFE_INSC_AMOUNT_KEY = 'credit_life_insce_am'
+
+CREDIT_TYPE_IND_BUSINESS = 'indbus'
+CREDIT_TYPE_INDIVIDUAL = 'ind'
+CREDIT_TYPE_KEY = 'credit_type'
+
+CUSTOMER_TEMPLATE_NAME = 'customer.html'
+
+DEALER_CODE_KEY = 'dealer_code'
+DEALER_DEFAULT_PREFERENCE_KEY = 'dealer_default_preference'
+
+DEALJACKET_EDIT_VEHICLE_KEY = 'dealjacket_edit_vehicle'
+DEALJACKET_ID_KEY = 'dealjacket_id'
+DEALJACKET_SUMMARY_ROUTE_NAME = 'dealjacket_summary'
+
+DEAL_EDIT_KEY = 'deal_edit'
+DEAL_EDIT_TEXT = 'deal_edit'
+
+DEAL_ID_KEY = 'deal_id'
+DEAL_KEY = 'deal'
+
+DEAL_PROMPT_KEY = 'deal_prompt'
+DEAL_PROMPT_ROUTE_NAME = 'deal_prompt'
+
+DISABLE_COAPP_STATUS = ['PEND', 'APRV', 'COFR', 'DCLN', 'BOOK', 'SUSP', 'RTRN', 'ASUB']
+
+DISCLOSURES_KEY = 'disclosures'
+
+DRIVER_CHOICES = 'driver_choices'
+
+EDIT_VEHICLE_KEY = 'editvehicle'
+EDIT_VEHILCE_FORM_TEXT = 'EditVehicleForm'
+
+ELIGIBLE_LENDERS_KEY = 'elg_lenders'
+
+ENABLE_ADDRESS_COPY_KEY = 'enable_addr_copy'
+
+ERROR_REASONS_LIST_KEY = 'error_reasons_list'
+
+ESTIMATED_FINANCED_AMOUNT = 'estimated_financed_amount'
+ESTIMATED_MONTHLY_PAYMENT_KEY = 'estimated_monthly_payment'
+ESTIMATED_PAYMENT_KEY = 'estimated_monthly_payment'
+
+SALARY_KEY = 'salary'
+OTHER_MONTHLY_INCOME_KEY = 'other_monthly_income'
+SALARY_TYPE_KEY = 'salary_type_code'
+
+FEATURE_CODE_CA = 'CA'
+FEATURE_CODE_DJ = 'DJ'
+
+FEATURE_STATUS_CODE_SUBMIT = 'SUBM'
+
+FILTER_FORM_KEY = 'filter_form'
+
+FRONT_END_FEE_AMOUNT_KEY = 'front_end_fee_amount'
+FRONT_END_FEE_AMOUNT_STRUCTURE_KEY = 'front_end_fee_structure'
+FRONT_END_FEE_DICT_KEY = 'front_end_fee_dict'
+
+GAP_INSC_AMOUNT_KEY = 'gap_insce_am'
+
+HIDE_ITEM_KEY = 'hide_item'
+
+HTTP_POST_NEW_TEXT = '_new_'
+HTTP_POST_UPDATE_TEXT = '_update_'
+
+INELIGIBLE_LENDERS_KEY = 'in_elg_lenders'
+
+INVOICE_AMOUNT_KEY = 'invoice_amount'
+
+IS_BUSINESS_KEY = 'is_business'
+IS_BUSINESS_YES = 'Y'
+IS_BUSINESS_NO = 'N'
+
+IS_STATE_CHANGE_KEY = 'is_state_change'
+
+LENDERS_FORM_KEY = 'lenders_form'
+LENDERS_FORM_TEMPLATE_NAME = 'lenders_form.html'
+LENDER_CONTROLLED_TEMPLATE_NAME = 'lender_controlled_additional.html'
+LENDERS_KEY = 'lenders'
+LENDERS_DATA_KEY = 'lenders_data'
+LENDERS_ROUTE_NAME = 'lenders_form'
+LENDER_DETAIL_ROUTE_NAME = 'detail'
+LENDER_ADDITIONAL_ROUTE_NAME = 'lender_additional'
+LENDER_CONTROLLED_ADDITIONAL_ROUTE_NAME = 'lender_controlled_additional'
+LENDER_SPECIFIC_JSON = 'lender_specific_jsondata'
+SELECTED_LENDERS = 'selected_lenders'
+SELECTED_LENDERS_WITH_PROGRAMS = 'selected_lenders_with_programs'
+PRESERVE_SESSION_ON_SUBMIT = 'preserve_session_on_submit'
+PASS_THRU_EXCLUDE_CHECK = 'pass_thru_exclude_check'
+
+LINE_1_ADDRESS_KEY = 'line_1_address'
+LINE_2_ADDRESS_KEY = 'line_2_address'
+
+LINK_TITLE_KEY = 'link_title'
+
+LOAN_TYPE_AUTO = 'auto'
+LOAN_TYPE_MOTORCYCLE = 'motorcycle'
+LOAN_TYPE_KEY = 'loan_type'
+
+MAKE_ID_TEXT = 'make_id'
+MODEL_ID_TEXT = 'model_id'
+
+ODOMETER_NUMBER = 'odometer_number'
+
+OPERATION_KEY = 'operation'
+
+PAYMENT_CALL_INDICATOR_KEY = 'payment_call_indicator'
+PAYMENT_CALL_UPDATE_KEY = 'payment_call_update'
+PAYMENT_CALL_INDICATOR_NO = platformconstants.PAYMENT_CALL_INDICATOR_NO
+PAYMENT_CALL_INDICATOR_YES = platformconstants.PAYMENT_CALL_INDICATOR_YES
+PAYMENT_CALL_KEY = platformconstants.PAYMENT_CALL_KEY
+PAYMENT_CALL_PARTNER_SUPPORT_KEY = platformconstants.PAYMENT_CALL_PARTNER_SUPPORT_KEY
+PAYMENT_CALL_NO = platformconstants.PAYMENT_CALL_NO
+PAYMENT_CALL_YES = platformconstants.PAYMENT_CALL_YES
+PAYMENT_CALL_APPROVED_STATUSES = ['APPR', 'COFR']
+
+PREFERENCE_SETTINGS_KEY = 'preference_settings'
+
+PRODUCT_TYPE_CODE_BALLOON = 'BALL'
+PRODUCT_TYPE_CODE_LEASE = 'LEAS'
+PRODUCT_TYPE_CODE_RETAIL = 'RETL'
+PRODUCT_TYPE_KEY = platformconstants.PRODUCT_TYPE_KEY
+PRODUCT_TYPE_RETAIL = 'retail'
+PRODUCT_TYPES = {'A': 'All', 'R': 'Retail', 'L': 'Lease', 'B': 'Ballon'}
+BUREAU_RSPNS_WITH_TRADELINE = 'bureau_rspns_with_tradeline'
+PRESELECT_APP_TYPE = 'app_type'
+
+PROGRAM_ROUTING_NO = 'N'
+PROGRAM_ROUTING_LENDERS_DICT_KEY = "prg_routing_lenders_dict"
+PROGRAM_ROUTING_EXCEPTION = 'program_routing_exception'
+
+REBATE_AMOUNT_KEY = 'rebate_amount'
+
+REDIRECTED_FROM_KEY = 'redirected_from'
+REDIRECT_ROUTE_NAME = 'redirect_to_route'
+REGB_DISCLOSURE_KEY = 'regb_disclosure'
+REGB_KEY = 'regb'
+DISCLOSER_REGB = platformconstants.DISCLOSER_REGB
+RETAIL_SOURCE_KEY = 'retail_source'
+ROUTE_NAME_KEY = 'route_name'
+
+SALES_TAX_AMOUNT_KEY = 'sales_tax_amount'
+SALES_TAX_RATE_KEY = 'sales_tax_rate'
+
+SELECT_LENDERS_DATA_KEY = 'select_lenders_data'
+SELECT_LENDERS_LINK_TITLE = _('Select Lenders')
+
+MAKE_KEY = 'make'
+MODEL_KEY = 'model'
+YEAR_KEY = 'year'
+TERM_KEY = 'term'
+TERM_COUNT_KEY = 'term_count'
+MILEAGE_KEY = 'mileage'
+
+SIGNER_TYPE_CODE = 'signer_type_code'
+
+STATE_CHANGE_UPDATE = 'state_change_update_indicator'
+SUB_LINKS_KEY = 'sub_links'
+TEXT_HEADER_KEY = 'text_header'
+TITLE_AND_LICENSE_AMOUNT_KEY = 'title_and_license_amount'
+
+TRADE_IN_FALSE = 'False'
+TRADE_IN_KEY = 'trade_in'
+TRADE_IN_TRUE = 'True'
+TRADE_IN_VALUE_AMOUNT_KEY = 'trade_in_value_amount'
+TRADE_IN_CUSTOM_YMMT = 'trade_in_custom_ymmt'
+
+TRANSMISSION_AUTOMATIC = 'Automatic'
+TRANSMISSION_MANUAL = 'Manual'
+
+TRIM_ID_TEXT = 'trim_id'
+UNPAID_BALANCE_AMOUNT_KEY = 'unpaid_balance_amount'
+UNPAID_TEXT = 'unpaid'
+VEHCILE_TYPE_CODE_CAR = 'CAR'
+PRESELECT_INVOICE = 'invoice_amount'
+PRESELECT_WHOLESALE_AMOUNT = 'wholesale_amount'
+
+VEHICLE_FINANCE_LINK_TITLE = _('Vehicle & Finance')
+
+VEHICLE_FORM_KEY = 'vehicle_form'
+VEHICLE_LOAN_TEMPLATE_NAME = 'vehicle_loan_form.html'
+VEHICLE_NUMBER_TEXT = 'vin_number'
+VEHICLE_ROUTE_NAME = 'vehicle_form'
+VEHICLE_TYPES = {'A': 'All', 'N': 'New', '': 'Used', 'D': 'Demo'}
+
+VIEW_APPLICATION_ROUTE_NAME = 'view_application'
+VIEW_APPLICATION_TEMPLATE_NAME = 'view_application.html'
+VIEW_CREDIT_APP_TEMPLATE_HEADER = 'View Credit Application'
+
+WARRANTY_AMOUNT_KEY = 'warranty_amount'
+
+WHOLESALE_SOURCE_KEY = 'wholesale_source'
+
+WISCONSIN_SPOUSE_FORM_KEY = 'wisconsin_spouse_form'
+WISCONSIN_SPOUSE_LINK_TITLE = _('Wisconsin Spouse')
+WISCONSIN_SPOUSE_ROUTE_NAME = 'wisconsin_spouse_form'
+WISCONSIN_SPOUSE_TEMPLATE_NAME = 'wisconsin_spouse_form.html'
+YEAR_ID_TEXT = 'year_id'
+ZIP_CODE_KEY = 'zip_code'
+
+PROGRAM_ROUTING_FORM_TEMPLATE_NAME = 'program_routing.html'
+PROGRAM_ROUTING_KEY = 'program_routing'
+PROGRAM_ROUTING_LINK_TITLE = _('Program Results')
+
+CREDIT_BUREAU_DICT = platformcbconstants.CREDIT_BUREAU_DICT
+INTERNET_APP_SERVICE_SOURCE_KEY = platformconstants.INTERNET_APP_SERVICE_SOURCE_KEY
+
+ADDRESS_KEYS = [
+    LINE_1_ADDRESS_KEY, LINE_2_ADDRESS_KEY, CITY_KEY, US_STATE_CODE_KEY, ZIP_CODE_KEY  # noqa: F405
+]
+
+
+class CategoryCode(object):
+    BOS = 'BOS'
+    PGRD = 'PGRD'
+    BOSS = 'BOSS'
+    PGRDS = 'PGRDS'
+    INC = 'INC'
+    MTDP = 'MTDP'
+
+
+class PreselectAppType(object):
+    Business = '8'
+    BusinessCoApp = '9'
+    IndividualApp = 'I'
+    JointApp = 'J'
+
+
+class ResponseFormat(object):
+    JSON_TYPE = 'json'
+    XML_TYPE = 'xml'
+
+
+class TransTypes(object):
+    Individual = 'ind'
+    Business = 'indbus'
+    Joint = 'joint'
+    JointBusiness = 'jointbus'
+
+
+LENDER_LA_SETTINGS = 'LENDER_LA_SETTINGS'
+CURRENT_LENDER = 'CURRENT_LENDER'
+SUBMITTED_LENDERS = 'SUBMITTED_LENDERS'
+AIM_CONNECTION_ERROR_MESSAGE = 'The application was not submitted to Aimbridge because it was not able to provide the '\
+                               'service to collect the membership eligibility information. Please click Back button ' \
+                               'to go back to submit to other lenders or select Aimbridge to try again.'
+EMPLOYMENT_ADDITIONAL_FORMS = ('HondaApplicantForm',)
+STATE_SPECIFIC_MAPPING = {'NV': (EMPLOYMENT_ADDITIONAL_FORMS, [PRODUCT_TYPE_CODE_RETAIL], ['employment_status_code', 'work_phone_number'])}
+SPOT_MARITAL_STATUS_ENABLE_FORMS = ('DTCOMApplicantForm', 'HondaApplicantForm', 'DTCOMCoApplicantForm', 'HondaCoApplicantForm',)
+SPOT_READ_ONLY_FIELDS = {'DTCOMApplicantForm': ['first_name', 'middle_name', 'last_name', 'suffix_code', 'line_1_address',
+                                                'line_2_address', 'city', 'us_state_code', 'zip_code',
+                                                'primary_phone_type', 'primary_phone_number', 'has_coapplicant', 'tax_id', 'birth_date'],
+                         'HondaApplicantForm': ['first_name', 'middle_name', 'last_name', 'suffix_code', 'line_1_address',
+                                                'line_2_address', 'city', 'us_state_code', 'zip_code',
+                                                'primary_phone_type', 'primary_phone_number', 'has_coapplicant', 'tax_id', 'birth_date'],
+                         'HondaBusinessCustomerForm': ['business_name', 'line_1_address', 'line_2_address', 'city',
+                                                       'us_state_code', 'zip_code', 'has_coapplicant', 'business_tax_id_number',
+                                                       'current_business_phone'],
+                         'DTCOMCoApplicantForm': ['party_relationship_code', 'first_name', 'middle_name', 'last_name',
+                                                  'suffix_code', 'line_1_address', 'line_2_address', 'city', 'zip_code', 'same_address',
+                                                  'us_state_code', 'primary_phone_type', 'primary_phone_number', 'tax_id', 'birth_date'],
+                         'HondaCoApplicantForm': ['signer_type_code', 'party_relationship_code', 'first_name', 'middle_name', 'last_name',
+                                                  'suffix_code', 'line_1_address', 'line_2_address', 'city', 'zip_code', 'same_address',
+                                                  'us_state_code', 'primary_phone_type', 'primary_phone_number', 'tax_id', 'birth_date'],
+                         'DTCOMVehicleFinanceForm': ['product_type', 'condition_type', 'vin_number', 'year_id', 'make_id',
+                                                     'model_id', 'trim_id', 'odometer_number', 'msrp_amount', 'trade_in',
+                                                     'cash_sell_price_amount', 'sales_tax_amount', 'cash_down_amount',
+                                                     'rebate_amount', 'accident_health_insurance_amount', 'credit_life_insce_am',
+                                                     'gap_insce_am', 'warranty_amount', 'term_count', 'stock_number', 'estimated_monthly_payment'],
+                         'HondaCreateVehicleForm': ['product_type', 'condition_type', 'vin_number', 'year_id', 'make_id',
+                                                    'model_id', 'trim_id', 'honda_model_id', 'odometer_number', 'msrp_amount',
+                                                    'trade_in', 'cash_sell_price_amount', 'sales_tax_amount', 'cash_down_amount',
+                                                    'rebate_amount', 'accident_health_insurance_amount', 'credit_life_insce_am',
+                                                    'gap_insce_am', 'warranty_amount', 'term_count', 'stock_number', 'estimated_monthly_payment',
+                                                    'appraised_value_amount', 'unpaid_balance_amount_ahfc', 'trade_in_vin_number'],
+                         'AcuraCreateVehicleForm': ['product_type', 'condition_type', 'vin_number', 'year_id', 'make_id',
+                                                    'model_id', 'trim_id', 'honda_model_id', 'odometer_number', 'msrp_amount',
+                                                    'trade_in', 'cash_sell_price_amount', 'sales_tax_amount', 'cash_down_amount',
+                                                    'rebate_amount', 'accident_health_insurance_amount', 'credit_life_insce_am',
+                                                    'gap_insce_am', 'warranty_amount', 'term_count', 'stock_number',
+                                                    'appraised_value_amount', 'unpaid_balance_amount_ahfc', 'trade_in_vin_number']
+                         }
+
+
+class BusinessCoAppTypes(Enum):
+    GRNTR = 'G', 'Guarantor'
+    COAPP = 'B', 'Co-Applicant'
+
+
+BUSINESS_COAPP_TYPE_CHOICES = [('', '')]
+BUSINESS_COAPP_TYPE_CHOICES.extend([(e.value, e.description) for e in BusinessCoAppTypes])

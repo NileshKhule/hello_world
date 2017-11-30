@@ -1,0 +1,1954 @@
+from dtplatform.common.credit_app.credit_app_manager import CreditAppManager
+
+# -*- coding: utf-8 -*-
+"""
+This module will be responsible for saving,
+submitting credit applications. All CA generic
+platform code should be here
+"""
+from __future__ import absolute_import, print_function, unicode_literals
+from datetime import datetime
+
+import simplejson as json
+from requests import ConnectionError, HTTPError, Timeout
+from sqlalchemy import func
+from sqlalchemy.orm import joinedload, joinedload_all
+from sqlalchemy.orm.exc import (
+    MultipleResultsFound,
+    NoResultFound,
+    StaleDataError,
+)
+
+from dt_database_utils import signals
+from platform_utils.utils import dt_datetime, dt_requests
+from platform_utils.utils.dict_utils import getpath
+from platform_utils.utils.dt_fugu import send_fugu
+from platform_utils.utils.functools import cache_property
+from platform_utils.utils.mapper import (
+    data_property_mapper,
+    property_mapper,
+    yesno,
+)
+from platform_utils.utils.notifications import remove_bulk_notifications
+
+from dtplatform.common.base_manager import BaseManager, ParseError, getManager
+from dtplatform.common.billing.billing_manager import BillingManager
+from dtplatform.common.constants import (
+    FeatureCode,
+    FeatureStatusCode,
+    LogEventName,
+    SubfeatureCode,
+)
+from dtplatform.common.core.conversion_control_manager import BaseConversionControlManager
+from dtplatform.common.credit_app import constants
+from dtplatform.common.credit_app.lender.creditapp_lender_manager import CreditAppLenderManager
+from dtplatform.common.decisions.base_decision_manager import (
+    BaseCreditDecisionManager,
+    BaseDecisionManager,
+)
+from dtplatform.common.decisions.webhooks import (
+    CDACKWebHookEvent,
+    CDNACKWebHookEvent,
+)
+from dtplatform.common.dtv.dealer_bookout_manager import DealerBookoutManager
+from dtplatform.common.fusion.customermanager import CustomerManager
+from dtplatform.common.fusion.partner_manager import PartnerManager
+from dtplatform.common.preapproval.deal_preapproval_manager import DealPreApprovalManager
+from dtplatform.common.transaction import commit_or_rollback
+from dtplatform.common.webhooks import WebHookManager
+from dtplatform.conf import settings
+from dtplatform.core import constants as core_constants
+from dtplatform.core.deal_persist_manager import DealPersistManager
+from dtplatform.core.dealermanager import DealerManager
+from dtplatform.core.dealjacket_event_manager import DealJacketEventManager
+from dtplatform.core.dealjacket_manager import DealJacketManager
+from dtplatform.core.dealupdate_manager import DealUpdateManager
+from dtplatform.core.models.ca.credit_app import CreditApp
+from dtplatform.core.models.ca.credit_app_request import CreditAppRequest
+from dtplatform.core.models.cc3.customer import Customer
+from dtplatform.core.models.cd.lender_dcsn_rspns import LenderDecisionResponse
+from dtplatform.core.models.dj import CASaveEvent, CASubmitEvent
+from dtplatform.core.models.dj.deal import Deal
+from dtplatform.core.models.dj.deal_finance import DealFinance
+from dtplatform.core.models.dj.deal_misc import DealMisc
+from dtplatform.core.usermanager import UserManager
+from dtplatform.core.vehicle_manager import VehicleManager
+from dtplatform.utils.dt_json import dumps
+
+
+class CreditAppAckRetry(Exception):
+    pass
+
+
+class CreditAppManager(BaseManager):
+    """Class based manager for CreditApp and related models"""
+    managed_classes = (CreditApp,)
+
+    def __init__(self, ctx):
+        super(CreditAppManager, self).__init__(ctx)
+        self.submit_queue = settings.DTCOM_CREDIT_APP_SUBMISSION_REQUEST_LOCAL_STUB_QUEUE_NAME
+
+        self.deal_persist_manager = getManager(DealPersistManager, self.context)
+
+        # lender deal update logic for customer data changed
+        self.customer_data_changed = self.context.get('customer_updated_indicator', False)
+
+    @cache_property
+    def customer_manager(self):
+        return getManager(CustomerManager, self.context)
+
+    @cache_property
+    def deal_preapproval_manager(self):
+        return getManager(DealPreApprovalManager, self.context)
+
+    @cache_property
+    def conversion_control_manager(self):
+        return getManager(BaseConversionControlManager, self.context)
+
+    @cache_property
+    def billing_manager(self):
+        return getManager(BillingManager, self.context)
+
+    @cache_property
+    def deal_jacket_manager(self):
+        return getManager(DealJacketManager, self.context)
+
+    @cache_property
+    def dealer_bookout_manager(self):
+        return getManager(DealerBookoutManager, self.context)
+
+    def _save_applicant(self, data, deal, new_cc_id, dealjacket=None):
+        """
+        Helper method for saving applicant information
+        while saving the credit app.
+        Should only be called if the application data
+        has applicant information.
+        """
+        return self.deal_persist_manager.save_applicant(data, deal, new_cc_id, dealjacket)
+
+    def _persist_customer(self,
+                          data,
+                          new_cc_id=None,
+                          old_cc_id=None,
+                          applicant_type='A',
+                          existing_deal=None):
+        """
+        Helper method which calls ``create_or_update_customer`` method
+        in CustomerManager to actually save the customer. However before calling
+        that method, it makes sure all the parameters have been
+        correctly provided.
+        """
+        return self.deal_persist_manager.persist_customer(data, new_cc_id, old_cc_id, applicant_type, existing_deal)
+
+    def _save_coapplicant(self, data, deal, new_cc_id, dealjacket=None):
+        """
+        Helper method for saving coapplicant information
+        while saving the credit app.
+        Should only be called if the application data
+        has coapplicant information.
+        """
+        return self.deal_persist_manager.save_coapplicant(data, deal, new_cc_id, dealjacket)
+
+    def _save_additional(self, data, deal):
+        """
+        Helper method for saving credit app additional
+        information.
+        """
+        self.deal_persist_manager.save_additional(data, deal)
+
+    def _save_vehicle(self, data, deal):
+        """
+        Save the vehicle information for a deal to the DB
+        """
+        self.deal_persist_manager.save_vehicle(data, deal)
+
+    def _save_deal_finance(self, data, deal):
+        if not deal.deal_finance:
+            deal.deal_finance = DealFinance()
+
+        deal.deal_finance = data_property_mapper(data, deal.deal_finance)
+
+        deal.deal_finance.estimated_payment_amount = \
+            data.get(constants.DATA_ESTIMATED_MONTHLY_PAYMENT_KEY)
+        deal.deal_type_code = data.get(constants.DATA_PRODUCT_TYPE_KEY)
+
+        # DealFinance doesn't have Payment Call (PC) as a column,
+        # so to prevent storing default values of PC,
+        # we need to explicitly set it to the Deal Model
+        if constants.DATA_PAYMENT_CALL_INDICATOR_KEY in data:
+            deal.payment_call_indicator = \
+                data.get(constants.DATA_PAYMENT_CALL_INDICATOR_KEY)
+
+        dj_manager = getManager(DealJacketManager, self.context)
+        dj_manager.update_deal(deal)
+
+    def _save_wisconsin_spouse(self, data, deal):
+        """
+        Save the information for a wisconsin applicant with a spouse
+        """
+        self.deal_persist_manager.save_wisconsin_spouse(data, deal)
+
+    def _calculate_state_change_finance_diff(self, deal):
+        """
+        Calculate finance data changes if customer changes province code.
+        If customer changes province code in credit app applicant details
+        for saved credit app, relevant sales tax amount entered by dealer
+        in preference settings, should be updated automatically.
+        It also recalculates value for unpaid_balance_amount and
+        estimated_finance_amount fields.
+
+        :returns: dictionary with updated values
+        """
+        return self.deal_persist_manager.calculate_state_change_finance_diff(deal)
+
+    def _save_for_edit_vehicle(self, deal, extra):
+        """
+        Save helper function for when edit vehicle workflow is used.
+        Safe to call even if save vehicle is not used since
+        this method implements its own conditionals.
+
+        :returns: Dictionary of flags
+        """
+        return self.deal_persist_manager.save_for_edit_vehicle(deal, extra)
+
+    def _save_for_edit_deal(self, data, deal, extra):
+        """
+        Save functionality for the edit deal flow
+        """
+        self.deal_persist_manager.save_for_edit_deal(data, deal, extra)
+
+    def _save_for_deal(self, data, deal, extra):
+        self.deal_persist_manager.save_for_deal(data, deal, extra)
+
+    def create_basic_deal(self, data, attach_existing_applicant=False, attach_existing_coapplicant=False):
+        """
+        Method to create Deal with basic deal data like customers
+        and sets the cc_id back to data dict.
+        attach_existing_applicant & attach_existing_coapplicant to be set properly
+        based on the usecase like u want to attach the deal to the
+        existing applicant & coapplicant or create a brand new.
+
+        Args:
+         data: dict in credit application forms data structures
+         attach_existing_applicant: (bool)
+         attach_existing_coapplicant: (bool)
+
+        Returns:
+            newly created deal object
+        """
+        return self.deal_persist_manager.create_basic_deal(data, attach_existing_applicant, attach_existing_coapplicant)
+
+    def update_ca_deal_version(self, deal, selected_lenders, lender_dealupdate_indicator=False):
+        """update CA deal version in resubmit flow"""
+        pass
+
+    def update_lender_deal_update_sequence_number(self, deal, ldu_lender_id):
+        """Method to update the lender deal update sequence number"""
+        pass
+
+    def update_deal_version(self, deal):
+        self.deal_persist_manager.update_deal_version(deal)
+
+    def check_for_critical_fields_in_deal(self, credit_app_json):
+        """Checks that critical fields are present in the credit app."""
+        pass
+
+    def save(self,
+             data,
+             deal=None,
+             new_cc_id=None,
+             extra=None,
+             attach_existing_applicant=False,
+             attach_existing_coapplicant=False):
+        """
+        Given complete credit app data, save all of the data to the database
+        using appropriate managers.
+        attach_existing_applicant & attach_existing_coapplicant to be set properly
+        based on the usecase like u want to attach the application to the
+        existing applicant & coapplicant or create a brand new.
+
+        Args:
+            data: Complete credit app data as per form_dict(dict)
+            deal: (Deal instance)
+            new_cc_id: (int)
+            extra: dictionary of flags/data (dict)
+            attach_existing_applicant: (bool)
+            attach_existing_coapplicant: (bool)
+        Returns:
+            Requested data, deal, dealjacket
+        """
+        dj_manager = getManager(DealJacketManager, self.context)
+        veh_manager = getManager(VehicleManager, self.context)
+
+        if deal is None:
+            deal = self.create_basic_deal(data, attach_existing_applicant, attach_existing_coapplicant)
+
+        new_dealjacket = None
+        extra = extra or {}
+
+        has_province_code_changed = False
+
+        applicant_data = data.get(constants.DATA_APPLICANT_KEY, {})
+        has_coapplicant = (
+            applicant_data.get(constants.DATA_HAS_COAPPLICANT_KEY)
+            in constants.TRUTH
+        )
+
+        if not attach_existing_applicant:
+            if constants.DATA_APPLICANT_KEY in data:
+                data[constants.DATA_APPLICANT_KEY]['cc_id'] = deal.applicant.cc_id if deal.applicant else None
+                _save_applicant = self._save_applicant(
+                    data, deal, new_cc_id, new_dealjacket
+                )
+                new_dealjacket = _save_applicant['new_dealjacket']
+                deal = _save_applicant['deal']
+                has_province_code_changed = _save_applicant['has_province_code_changed']
+
+        if not attach_existing_coapplicant:
+            if constants.DATA_COAPPLICANT_KEY in data and has_coapplicant:
+                data[constants.DATA_COAPPLICANT_KEY]['cc_id'] = deal.coapplicant.cc_id if deal.coapplicant else None
+                _save_coapplicant = self._save_coapplicant(
+                    data, deal, new_cc_id, new_dealjacket
+                )
+                new_dealjacket = _save_coapplicant['new_dealjacket']
+                deal = _save_coapplicant['deal']
+
+        # In case we want to attach the deal to the existing customers
+        # updating the citizenship country because  this value is not
+        # stored by any other product so the value is not replicated.
+        self.customer_manager.save_customer_country_citizen(deal, data)
+
+        # Currently we are not saving the relationship type code
+        # when we are attaching the deal to the existing customer.
+        self.deal_persist_manager.save_relationship_type(deal, data)
+
+        if 'application_additional' in data:
+            self._save_additional(data, deal)
+
+        if constants.DATA_VEHICLE_KEY in data:
+            self._save_vehicle(data, deal)
+            # update lender deal version if lender deal update
+            # fields have changed
+            if extra.get('lender_deal_update', False):
+                self.update_deal_version(deal)
+
+        if any((constants.DATA_APPLICANT_KEY in data,
+                constants.DATA_COAPPLICANT_KEY in data and has_coapplicant)):
+            customer_updated_indicator = extra.get('customer_updated_indicator', 'N')
+            for ca in deal.credit_app:
+                ca.customer_updated_indicator = customer_updated_indicator
+
+        self._save_wisconsin_spouse(data, deal)
+
+        # edit vehicle workflow
+        self._save_for_edit_vehicle(deal, extra)
+
+        # recalculate finance data on province code change
+        if has_province_code_changed:
+            if all((not data.get(constants.DATA_VEHICLE_KEY),
+                    deal.deal_finance)):
+
+                if all((deal.deal_finance.cash_sell_price_amount,
+                        not deal.deal_finance.sales_tax_amount)):
+                    finance_data = self._calculate_state_change_finance_diff(deal)
+                    deal.deal_finance = veh_manager.update_finance_data(
+                        finance_data,
+                        deal
+                    )
+                    dj_manager.update_deal(deal, deal.deal_tradeins)
+
+        if constants.DATA_DEAL_EDIT_KEY in data:
+            self._save_for_edit_deal(data, deal, extra)
+        else:
+            self._save_for_deal(data, deal, extra)
+
+        if (not extra.get('deal_update_event_flag') and not extra.get('new_deal')):
+            self.finish_save(deal)
+
+        if data.get('vehicle_form') and not data['vehicle_form'].get('bookout_active'):
+            self._set_bookoout_inactive(data)
+
+        return data, deal, new_dealjacket
+
+    def _set_bookoout_inactive(self, data):
+        """Save helper function to see if bookout need to be disassociated
+        Args:
+            data (dict):
+        """
+        external_ref = self.dealer_bookout_manager.get_external_ref(self.context['dealer_code'],
+                                                                    self.context['deal_jacket_id'],
+                                                                    self.context['deal_id'])
+
+        if external_ref:
+            self.log_event(LogEventName.BOOKOUT_INACTIVE,
+                           extra_kwargs={'external_id': external_ref.external_id},
+                           **self.context)
+            self.dealer_bookout_manager.set_bookout_inactive(external_ref)
+            self.dealer_bookout_manager.delete_external_ref(external_ref)
+
+    def finish_save(self, deal):
+        """
+        Finish the credit app saving process by flushing the session
+        as well as creating all the necessary save events for the dealjacket
+        via DealJacketEventManager.
+
+        :param deal: Deal
+        """
+        self.session.flush()
+        event = CASaveEvent(deal)
+        djem = getManager(DealJacketEventManager, context=self.context)
+        djem.save_event(event, deal=deal)
+        self.context.push(
+            {
+                'app_first_name': deal.applicant.dealjacket_customer.customer.first_name,
+                'app_last_name': deal.applicant.dealjacket_customer.customer.last_name,
+                'app_ssn': deal.applicant.dealjacket_customer.customer.tax_id_last_four,
+                'coapp_first_name': deal.coapplicant.dealjacket_customer.customer.first_name if deal.coapplicant else '<No coapplicant>',
+                'coapp_last_name': deal.coapplicant.dealjacket_customer.customer.last_name if deal.coapplicant else '<No coapplicant>',
+                'coapp_ssn': deal.coapplicant.dealjacket_customer.customer.tax_id_last_four if deal.coapplicant else '<No coapplicant>',
+            }
+        )
+        self.log_event(LogEventName.CREDIT_APP_SAVE, **self.context)
+
+    def _execute_pr_rules(self, deal, lenders, **kwargs):
+        """
+        Specific implementation is in DTCOM specific code.
+        """
+        return self._submit(deal, lenders, lender_specific_jsondata=None, **kwargs)
+
+    def _submit(self, deal, lenders, lender_specific_jsondata=None, **kwargs):
+        """
+        Submit application to selected lenders. This method will
+        read saved deal data and create json required to be sent to the
+        message queue. Then will update deal status to 'Submitted'
+        on successful submission
+
+        """
+        self.context.push(
+            {
+                'app_first_name': deal.applicant.dealjacket_customer.customer.first_name,
+                'app_last_name': deal.applicant.dealjacket_customer.customer.last_name,
+                'app_ssn': deal.applicant.dealjacket_customer.customer.tax_id_last_four,
+                'coapp_first_name': deal.coapplicant.dealjacket_customer.customer.first_name if deal.coapplicant else '<No coapplicant>',
+                'coapp_last_name': deal.coapplicant.dealjacket_customer.customer.last_name if deal.coapplicant else '<No coapplicant>',
+                'coapp_ssn': deal.coapplicant.dealjacket_customer.customer.tax_id_last_four if deal.coapplicant else '<No coapplicant>',
+            }
+        )
+        self.check_for_critical_fields_in_deal(deal)
+
+        lender_program_json = kwargs.get('lender_program_json', {})
+        pass_thru_exclude_check = kwargs.get('pass_thru_exclude_check', False)
+        pass_through_app = kwargs.get('pass_through_app', False)
+
+        lender_specific_jsondata = lender_specific_jsondata or {}
+        dealjacket_id = deal.deal_jacket_id
+        dealer_code = deal.dealer_code
+        customer_data_changed = self.customer_data_changed
+        # Create Credit_App records with respective to list of lender.
+        # Example:
+        # In [35]: zip(*[(1, ('A', 'a'),), (2, ('B', 'b')), (3, ('C', 'c')),
+        # (4, ('D', 'd'))])
+        # Out[35]: [(1, 2, 3, 4), (('A', 'a'), ('B', 'b'), ('C', 'c'), ('D',
+        # 'd'))]
+        # check if the deal and CA is eligible for deal update
+        credit_decision_manager = getManager(BaseCreditDecisionManager, self.context)
+        dealupdate_manager = getManager(DealUpdateManager, self.context)
+        lender_dealupdate_indicator = dealupdate_manager.eligible_for_lenderdealupdate(deal)
+        lender_names, submit_lender_pair = zip(*[(lender.short_name,
+                                                  (lender.partner_id, lender))
+                                                 for lender in lenders])
+        submit_lender_dict = dict(submit_lender_pair)
+        lender_ids = submit_lender_dict.keys()
+        dj_manager = getManager(DealJacketManager, self.context)
+        dj_manager.update_dealjacket_status(
+            deal.dealjacket, FeatureCode.CreditDecision,
+            FeatureStatusCode.Transmitting, deal.deal_id)
+
+        lender_apps = self.create_credit_apps(
+            deal, lender_ids, lender_specific_jsondata,
+            customer_data_changed=customer_data_changed,
+            lender_dealupdate_indicator=lender_dealupdate_indicator,
+            pass_thru_exclude_check=pass_thru_exclude_check,
+            original_app_id=kwargs.get('lender_app_id'),
+            existing_credit_app_id_short=kwargs.get('credit_app_id_short'),
+            lender_referral=self.deal_preapproval_manager.is_deal_eligible_to_only_preapproval_lender(deal),
+            pass_through_app=pass_through_app
+        )
+
+        lender_app_ids = [dict(partner_id=app.cp_id,
+                               app_id=app.credit_app_rqst_id,
+                               lender_app_id=app.lender_app_id,
+                               ca_short_id=app.credit_app_id_short)
+                          for app in lender_apps]
+
+        ca_lndr_dealupdate_status = {}
+        # customer_data_change overrides lender_deal_update
+        if lender_dealupdate_indicator and not customer_data_changed:
+            for lender_app in lender_apps:
+                lender_configured_for_dealupdate = dealupdate_manager.is_lender_configured_for_dealupdate(lender_app.cp_id)
+                ca_approved_for_dealupdate = dealupdate_manager.is_ca_approved_for_dealupdate(deal, lender_app.cp_id)
+                lender_ca_eligible = lender_configured_for_dealupdate and ca_approved_for_dealupdate
+                ca_lndr_dealupdate_status[lender_app.cp_id] = lender_ca_eligible
+                self.log_event(LogEventName.DEAL_UPDATE_APP,
+                               extra_kwargs={'lender_ca_deal_update_eligible': lender_ca_eligible,
+                                             'lender_configured_for_dealupdate': lender_configured_for_dealupdate,
+                                             'ca_approved_for_dealupdate': ca_approved_for_dealupdate}, **self.context)
+                if lender_ca_eligible:
+                    self.update_lender_deal_update_sequence_number(deal, lender_app.cp_id)
+
+        # bump up the ca lender deal update version for previously submitted lenders
+        self.update_ca_deal_version(deal, [lender.partner_id for lender in lenders],
+                                    lender_dealupdate_indicator and not customer_data_changed)
+        self.setup_lender_decisions(deal, lender_apps)
+        self.log.debug('Decision rows created {}'.format(deal.deal_id))
+        ca_json_to_be_submitted = []
+        partner_legacy_map = {}
+        msg_sent_flg = True
+        for lender_app in lender_apps:
+            basic_app_data_dict = self.prepare_basic_app_dict(deal, lender_app, lender_app_ids,
+                                                              submit_lender_dict, lender_specific_jsondata,
+                                                              ca_lndr_dealupdate_status, lender_program_json)
+            basic_app_data_dict[constants.DEAL_SOURCE_CODE] = deal.deal_source_code
+
+            request_message = self.prepare_message(deal, basic_app_data_dict)
+
+            partner_legacy_map[lender_app.cp_id] = basic_app_data_dict.get(constants.LENDER_ID_KEY)
+
+            ca_json_to_be_submitted.append({'dealer_code': self.context['dealer_code'],
+                                            'credit_app_rqst_id': basic_app_data_dict['app_id'],
+                                            'deal_jacket_id': deal.deal_jacket_id,
+                                            'deal_id': deal.deal_id,
+                                            'credit_app_json_tx': request_message,
+                                            'cp_id': basic_app_data_dict['partner_id'],
+                                            'feature_code': FeatureCode.CreditApp})
+
+            # Set the payment call indicator in decision response table if
+            # submitting a payment call app to the lender. Used to keep track
+            # of when a lender was submitted to as a payment call.
+            if lender_app._is_resubmit == 'false':
+                credit_decision_manager.set_payment_call_in(deal, lender_app.cp_id, deal.payment_call_indicator)
+
+            if lender_specific_jsondata.get(lender_app.cp_id) and \
+               lender_specific_jsondata[lender_app.cp_id].get('competitive_advantage_lenders'):
+                self.save_competitive_advantage(deal, lender_specific_jsondata[lender_app.cp_id])
+
+            msg_properties = {}
+            msg_properties.update(self.context)
+            msg_properties.update({
+                'request_id': basic_app_data_dict.get(constants.APP_ID_KEY, None),
+                'partner_id': basic_app_data_dict.get('partner_id', None),
+                'app_id': basic_app_data_dict.get('dt_app_id', None),
+                'app_cc_id': deal.applicant.cc_id,
+                'co_app_cc_id': deal.coapplicant.cc_id if deal.has_coapplicant else None,
+            })
+            response = self.send_to_fugu(
+                request_message,
+                settings.FUGU_APP_SUBMIT_URL,
+                self.context,
+                msg_properties,
+            )
+
+            if response is None:
+                msg_sent_flg = False
+
+            if msg_sent_flg:
+                self.log.info('Message submitted successfully for lender: {}, partner_id: {}, app_short_id: {}'
+                              ''.format(basic_app_data_dict.get('party_id', '<Data missing>'),
+                                        basic_app_data_dict.get('partner_id', '<Data missing>'),
+                                        basic_app_data_dict.get('dt_app_id', '<Data missing>')))
+
+        # if all submissions are success, only then proceed
+        if msg_sent_flg:
+
+            def funding_package_signal(session):
+                self.create_funding_package(dealjacket_id, if_exists='replace')
+
+            signals.after_scoped_commit.connect(funding_package_signal, sender=self.session, weak=False)
+
+            self.log.info('All messages submitted successfully for {}'
+                          ''.format(deal.deal_id))
+            dj_manager = getManager(DealJacketManager, self.context)
+            dj_manager.update_dealjacket_status(
+                (dealer_code, dealjacket_id),
+                FeatureCode.CreditApp,
+                FeatureStatusCode.Submit, deal.deal_id)
+            # reset customer swap and payment call indicators once deal is submitted
+            dj_manager.reset_deal_indicators(deal)
+
+            # Method to save lender specific CA json to DEAL.CREDIT_APP_RQST table
+            # This is overridden in DTCOM
+            self._save_ca_lender_request_data(ca_json_to_be_submitted)
+
+            for app, lender_name in zip(lender_apps, lender_names):
+                app._deal = deal
+                app._lender_name = lender_name
+
+            event = CASubmitEvent(lender_apps, context=self.context)
+            djem = getManager(DealJacketEventManager, context=self.context)
+            djem.save_event(event, deal=deal)
+            self.log.debug('Deal jacket updated. History event logged. Returning back')
+            # call fni_credit_card_api microservice to inititate credit card task only if logged in
+            # dealer has subscribed to any reward service providers.
+            # importing RewardRequestManager here because of circular dependancy issue.
+            from dtplatform.common.credit_card.reward_manager import RewardRequestManager
+            with getManager(RewardRequestManager, self.context) as reward_request_manager:
+                if reward_request_manager.get_reward_program_providers():
+                    try:
+                        dt_requests.post_json(
+                            url=settings.REWARD_REQUEST_API_URL,
+                            context=self.context,
+                            payload=json.dumps({'deal_jacket_id': dealjacket_id, 'deal_id': deal.deal_id}),
+                            timeout=settings.DTSERVICE_TIMEOUT_INTERVAL,
+                            headers=dt_requests.get_request_headers_from_context(self.context),
+                        )
+                    except (ConnectionError, HTTPError, Timeout) as error:
+                        self.log.error('CREDIT_CARD_TASK_FAIL: Request to start FNI Credit Card celery task failed for '
+                                       'deal_jacket_id={}, deal_id={}, dealer_code={} with error={}'.
+                                       format(dealjacket_id, deal.deal_id, dealer_code, error))
+                else:
+                    self.log.info("REWARD_PROGRAM: FNI flow need not to execute as Dealer is not "
+                                  "subscribed to any reward card program.")
+        else:
+            self.log.error('Failed to submit credit app request for {}'.format(deal.deal_id))
+            self._cleanup_on_failed_submission(deal)
+            raise ValueError(
+                'Critical error while submitting Credit Application. Please see log for additional details.')
+
+        for lender_app in lender_apps:
+            self.context.push(
+                {
+                    'dt_app_id': lender_app.credit_app_id_short,
+                    'partner_code': partner_legacy_map.get(lender_app.cp_id),
+                }
+            )
+            event_type = LogEventName.CREDIT_APP_SUBMIT
+            if lender_app._is_resubmit == 'true':
+                event_type = LogEventName.CREDIT_APP_RESUBMIT
+                remove_bulk_notifications(context=self.context,
+                                          notification_reference_code=constants.NOTIFICATION_CODE_LIST,
+                                          deal_jacket_id=dealjacket_id)
+
+            # logging for each lender app id
+            self.log_event(event_type, **self.context)
+        return lender_app_ids
+
+    def send_to_fugu(self, *args, **kwargs):
+        """
+        Hook for sending credit app submissions to fugu
+
+        DO NOT REMOVE
+
+        This hook is used to monkey patch fugu requests in test environments
+        """
+        return send_fugu(*args, **kwargs)
+
+    def submit(self, deal, lenders, **kwargs):
+        """
+        Submit credit applications associate with a deal to the given lenders.
+
+        Args:
+            deal: Deal instance to submit
+            lenders: list of Partner instances to submit to
+
+        Kwargs:
+            execute_program_routing_rules (bool): if True, executes program
+                routing rules engine
+            lender_specific_jsondata (dict): Lender-specific submission dict
+                where keys are lender partner IDs and values are lender-specific
+                data for that lender.
+            pass_thru_exclude_check  (bool): True if these lender submission are
+                pass through exclude applications. (default False)
+            lender_program_json (dict): A dict of lender program selections
+                where keys are lender partner IDs, and values are sub-dicts
+                with a 'lender_program' key underneath.
+            lender_app_id: AHFC-only option (will be ignored for DTCOM)
+                If provided, is the original lender_app_id for this credit_app.
+                'FIS' may be appended to the end if becoming CMSI.
+                Would only work for AHFC as they do no support multiple lenders
+                so would not need multiple lender app IDs.
+            credit_app_id_short: Will be set on the newly created credit apps.
+                Will be the same for all lenders in this submit request.
+            pass_through_app (bool): True if app is submitted to pass thru lender (default False)
+
+        Returns:
+            A list of lender application ids which were created & submitted.
+        """
+        # TODO(mikew) should we be checking the value of this kwargs (bool)?
+        if kwargs.get('execute_program_routing_rules'):
+            # This is a wrapper for `_submit()` that will execute
+            # PR rules, and raise exception to caller if PR rule error
+            return self._execute_pr_rules(
+                deal, lenders,
+                lender_specific_jsondata=kwargs.get('lender_specific_jsondata'),
+                pass_thru_exclude_check=kwargs.get('pass_thru_exclude_check', False),
+                lender_program_json=kwargs.get('lender_program_json'),
+                credit_app_id_short=kwargs.get('credit_app_id_short')
+            )
+        else:
+            return self._submit(
+                deal, lenders,
+                lender_specific_jsondata=kwargs.get('lender_specific_jsondata'),
+                pass_thru_exclude_check=kwargs.get('pass_thru_exclude_check', False),
+                lender_program_json=kwargs.get('lender_program_json'),
+                lender_app_id=kwargs.get('lender_app_id'),
+                credit_app_id_short=kwargs.get('credit_app_id_short'),
+                pass_through_app=kwargs.get('pass_through_app', False)
+            )
+
+    def prepare_message(self, deal, basic_app_data_dict):
+        """ This method is implemented in tenant specific Credit App Manager"""
+        pass
+
+    def _save_ca_lender_request_data(self, request_data):
+        """ This method is implemented in tenant specific Credit App Manager """
+        pass
+
+    def setup_lender_decisions(self, deal, credit_apps):
+        """
+        Sets up the transmitting decision on given credit apps
+        """
+        dcsn_date = datetime.utcnow()
+        payment_call_indicator = None
+
+        for app in credit_apps:
+            if app in deal.credit_app:
+                for decision_response in app.lender_respn[:]:
+                    if decision_response.feature_code == 'CON' and deal.is_spot_contract:
+                        # We do nothing as this is a spot contract
+                        continue
+
+                    elif decision_response.feature_code == 'CON' and not deal.is_spot_contract:
+                        # Delete the decision and unmark decision view only
+                        decision_response.to_be_deleted = 'Y'
+                        if app.deal.dealjacket.is_viewonly:
+                            app.deal.dealjacket.view_only_indicator = 'N'
+
+                    elif decision_response.feature_code == 'CD':
+                        # Since we are deleting the original lender decision response we need
+                        # to carry over the payment call indicator flag to the new response
+                        decision_response.to_be_deleted = 'Y'
+                        payment_call_indicator = decision_response.payment_call_indicator
+
+            decision = self._set_up_lender_decision_response(app, dcsn_date, payment_call_indicator)
+            self.set_up_pre_approval_indicator(decision, app.deal)
+
+    def _set_up_lender_decision_response(self, credit_app, decision_date, payment_call_indicator):
+        lender_decision_response = LenderDecisionResponse(
+            credit_app_id_short=credit_app.credit_app_id_short,
+            lender_app_id=credit_app.lender_app_id,
+            to_be_deleted='N',
+            credit_app=credit_app,
+            dcsn_date=decision_date,
+            feature_code=FeatureCode.CreditDecision,
+            feature_status_code=FeatureStatusCode.Transmitting,
+        )
+        if credit_app.deal.deal_finance and credit_app.deal.deal_finance.comments:
+            self.insert_dealer_comments(lender_decision_response, credit_app.deal)
+
+        if payment_call_indicator:
+            lender_decision_response.payment_call_indicator = payment_call_indicator
+
+        return lender_decision_response
+
+    def set_up_pre_approval_indicator(self, lender_decision_response, deal):
+        """ Actual Implementation in tenant specific manager """
+        return lender_decision_response
+
+    def insert_dealer_comments(self, lender_decision_response, deal):
+        return lender_decision_response
+
+    def get_deal_credit_apps(self, deal):
+        """
+        This method returns dictionary of lender id key and credit app value for the given deal
+        """
+        dealupdate_manager = getManager(DealUpdateManager, self.context)
+        credit_app_by_lender_dict = {}
+        for credit_app in deal.credit_app:
+            is_deal_eligible_for_ldu = dealupdate_manager.is_eligible_for_lender_deal_update(deal, credit_app)
+
+            credit_app_by_lender_dict[credit_app.cp_id] = (credit_app, is_deal_eligible_for_ldu)
+        return credit_app_by_lender_dict
+
+    def eligible_for_resubmit(self, lender_id, deal_credit_apps_dict, **kwargs):
+        """Method to apply all the resubmit rules.
+           here checking if lender has already been submitted to;
+           if so then return (True,'true') else (False,'false')
+           Return Value : tuple(update_ca, resubmit_indicator)
+                          update_ca: indicator used to either update the existing CA or create a new CA record. (return type boolean)
+                          resubmit_indicator: used to identify if the CA is in resubmit flow or not. (return type string 'true' or 'false')
+        """
+        is_resubmit = 'false'
+        if lender_id in deal_credit_apps_dict:
+            is_resubmit = 'true'
+        return (lender_id in deal_credit_apps_dict, is_resubmit)
+
+    def create_empty_credit_app(self,
+                                deal,
+                                lender_id,
+                                credit_app_id_short,
+                                lender_credit_app_id=None,
+                                submitted_time=None,
+                                created_ts=None,
+                                updated_ts=None,
+                                feature_cd=None,
+                                feature_stus_cd=None):
+        """
+        Create credit app instance with minimum data extracted
+        from given parameters.
+
+        This creates empty credit app in a sense that
+        it is is not committed to session.
+
+        Args:
+            deal (Deal): Deal object to which credit app will be attached to
+            lender_id (int): Lender partner id
+            credit_app_id_short (str): Short credit app id which will be used
+                by the lender to reference the credit app when sending
+                decisions back to dealertrack. In classic this is called
+                universal credit app id.
+            lender_credit_app_id (str): the application ID that the lender uses to track the credit app
+            submitted_time (datetime): Optional. Time of when the credit app was submitted.
+                If not provided, current UTC time will be used.
+            created_ts (datetime): Optional. Time of when the credit app was created.
+                If not provided, current UTC time will be used.
+            updated_ts (datetime): Optional. Time of when the credit app was updated.
+                If not provided, current UTC time will be used.
+            feature_cd (str): Optional. The feature code of the new credit app.
+                If not provided, use deal's top ranked feature code.
+            feature_stus_cd (str): Optional. The feature status code of the new credit app.
+                If not provided, use deal's top ranked feature status code.
+        """
+        credit_app = CreditApp(
+            cp_id=int(lender_id),
+            feature_cd=feature_cd if feature_cd else deal.top_ranked_feature_code,
+            feature_stus_cd=feature_stus_cd if feature_stus_cd else deal.top_ranked_feature_status_code,
+            updated_by_user_code=self.context['user_code'],
+            created_by_user_cd=self.context['user_code'],
+            sbmt_ts=submitted_time if submitted_time else datetime.utcnow(),
+            created_ts=created_ts if created_ts else datetime.utcnow(),
+            updtd_ts=updated_ts if updated_ts else datetime.utcnow(),
+            tenant_code=self.context['tenant_code'],
+            submitted_by_user_code=self.context['user_code'],
+            credit_app_id_short=credit_app_id_short,
+            lender_app_id=lender_credit_app_id,
+            lender_deal_update_version=deal.lender_deal_update_version,
+        )
+        credit_app.deal = deal
+        return credit_app
+
+    def create_credit_apps(self, deal, lenders, lender_specific_jsondata=None, lender_referral=False, **kwargs):
+        """
+        This method is part of submit(). Where it iterates the list of lenders, create
+        a Credit_App record for every lender and returns the list of application_id's created.
+
+        Args:
+            deal: Deal instance to submit
+            lenders: list of Partner instances to submit to
+
+        Kwargs:
+            original_app_id: Original lender_app_id (only used for AHFC -
+                ignored for DTCOM)  If provided, is the original lender_app_id
+                for this credit_app.  'FIS' may be appended to the end if
+                becoming CMSI before storing.
+            existing_credit_app_id_short: Will be used as the new credit-app's
+                short ID.  If not provided, one will be generated.
+            lender_specific_jsondata (dict): Lender-specific submission dict
+                where keys are lender partner IDs and values are lender-specific
+                data for that lender.
+            pass_thru_exclude_check (bool): True if these lender submission are
+                pass through exclude applications. (default False)
+            allow_pass_through_apps (bool): True if future pass through submissions
+                are allowed for these applications.  (default True)
+
+        """
+        original_app_id = kwargs.get('original_app_id')
+        existing_credit_app_id_short = kwargs.get('existing_credit_app_id_short')
+        pass_thru_exclude_check = kwargs.get('pass_thru_exclude_check', False)
+        pass_through_app = kwargs.get('pass_through_app', False)
+
+        lender_specific_jsondata = lender_specific_jsondata or {}
+        credit_app_id_short = existing_credit_app_id_short or self.generate_credit_app_id_short()
+
+        # Create a Null Application ID's list.
+        apps = []
+        sbmt_ts = datetime.utcnow()
+
+        # list to hold the lender id's which have updated customer data in the resubmit flow
+        resubmit_lenders_with_updated_customer_data = []
+        deal_credit_apps_dict = self.get_deal_credit_apps(deal)
+        for lender_id in lenders:
+            update_ca, _is_resubmit = self.eligible_for_resubmit(lender_id, deal_credit_apps_dict, **kwargs)
+            if update_ca or lender_referral:
+                credit_app, ca_ldu_elg_in = deal_credit_apps_dict.get(lender_id)
+                credit_app.sbmt_ts = sbmt_ts
+                credit_app.submitted_by_user_code = self.context['user_code']
+                if _is_resubmit == 'true' and credit_app.lender_app_id:
+                    credit_app, _is_resubmit = self.update_ca_lender_app_id_upon_resubmission(credit_app)
+            else:
+                if _is_resubmit == 'true':
+                    resubmit_lenders_with_updated_customer_data.append(lender_id)
+                # Create credit_app
+                credit_app = self.create_empty_credit_app(
+                    deal, lender_id, credit_app_id_short,
+                    submitted_time=sbmt_ts,
+                )
+                # Inject Data into credit_app
+                if hasattr(self, 'generate_lender_app_id'):
+                    _is_resubmit, lender_app_id, los_cd = \
+                        self.generate_lender_app_id(lender_id, lender_app_id=original_app_id)
+                    credit_app.lender_app_id = lender_app_id
+                    credit_app.lender_origination_system = los_cd
+
+            if pass_thru_exclude_check:
+                credit_app.pass_thru_exclude_check = 'Y'
+            else:
+                credit_app.pass_thru_exclude_check = 'N'
+
+            if pass_through_app:
+                credit_app.pass_thru_app_indicator = 'Y'
+
+            self.set_lender_specific_data(credit_app,
+                                          lender_specific_jsondata=lender_specific_jsondata.get(lender_id))
+
+            credit_app.deal = deal
+
+            credit_app._is_resubmit = _is_resubmit
+            apps.append(credit_app)
+
+        decision_manager = getManager(BaseDecisionManager, self.context)
+        decision_manager.set_to_be_deleted(
+            deal.deal_jacket_id,
+            deal.deal_id,
+            resubmit_lenders_with_updated_customer_data,
+        )
+
+        return apps
+
+    def _log_event(self, credit_app, response_dict, event_name):
+        """
+        Logs event for splunk for events passed as event_name
+        """
+        cp_id = None
+        if credit_app:
+            cp_id = credit_app.cp_id
+        log_dict = {'app_short_id': response_dict.get(constants.DT_ACK_TEXT, {}).get(constants.DT_APP_ID_KEY, '<Data missing>'),
+                    'legacy_partner_code': response_dict.get(constants.DT_ACK_TEXT, {}).get(constants.PARTNER_LEGACY_ID, '<Data missing>')
+                    }
+        context_dict = {'short_event_name': event_name,
+                        'partner_id': cp_id}
+        self.context.push(context_dict)
+        self.log.info('{}'.format(dumps(log_dict)))
+        self.context.pop()
+
+    def process_transaction_billing(self, credit_app, lender_decision_response):
+        """
+        Helper to process billing or not
+        Args:
+            credit_app (CreditApp): ``CreditApp`` model instance
+            lender_decision_response (LenderDecisionResponse): ```LenderDecisionResponse``` model instance
+        """
+        if self.billing_manager.should_bill_transaction(credit_app, lender_decision_response):
+            self.capture_billable_ca_transaction(lender_decision_response, credit_app)
+
+    def process_credit_app_ack(self, response_dict):
+        """
+        This method is to process the Acknowledgment received after submitting the Credit Application.
+        """
+        credit_app = self.get_credit_app(response_dict)
+        dealer_code = getattr(credit_app, 'dealer_cd', None)
+        dealer_manager = getManager(DealerManager, self.context)
+        transaction_type = response_dict.get('dt_ack', {}).get('transaction_type', '<Data missing>')
+        if dealer_code:
+            dealer = dealer_manager.get_dealer_by_dealer_code(dealer_code)
+            self.context.push({'dealer_id': dealer.dealeriddtc if dealer else None})
+
+        if credit_app:
+            self.context.push(
+                {
+                    'dealer_code': getattr(credit_app, 'dealer_cd', '<No dealer code found>'),
+                    'dealjacket_id': getattr(credit_app, 'deal_jacket_id', '<No dealjacketid found>'),
+                    'deal_id': getattr(credit_app, 'deal_id', '<No dealid found>'),
+                    'dt_app_id': response_dict.get(constants.DT_ACK_TEXT, {}).get(constants.DT_APP_ID_KEY, '<Data missing>'),
+                    'partner_code': response_dict.get(constants.DT_ACK_TEXT, {}).get(constants.PARTNER_LEGACY_ID, '<Data missing>')
+                }
+            )
+
+        ack_lender_app_id = response_dict.get(constants.LENDER_APP_ID_KEY,
+                                              response_dict.get(constants.DT_ACK_TEXT, {}).get(constants.LENDER_APP_ID_KEY))
+
+        self.log_event(
+            LogEventName.CREDIT_APP_ACKNOWLEDGE_RECEIVED,
+            extra_kwargs={'transaction_type': transaction_type},
+            **self.context
+        )
+        # Don't process sync acks when they come after async acks with valid lender app IDs.
+        if all([credit_app and credit_app.lender_app_id and not credit_app.lender_app_id.strip() == '0',
+                ack_lender_app_id and ack_lender_app_id.strip() == '0',
+                self.has_ack_text(response_dict)]):
+            ack_dropped_error_message = 'Ack dropped, because it would have erased lender app ID from previous ack.'
+            self.log_event(
+                LogEventName.CREDIT_APP_ACKNOWLEDGE_DROPPED,
+                error_message=ack_dropped_error_message,
+                extra_kwargs={'transaction_type': transaction_type},
+                **self.context)
+            return
+
+        try:
+            # Get Decision Response record.
+            if credit_app:
+                decision_manager = getManager(BaseDecisionManager, self.context)
+                lender_decision = decision_manager.get_decision_response_with_credit_app_rqst_id(
+                    credit_app.credit_app_rqst_id)
+
+                webhook_event = None
+
+                # 1.Get Acknowledgment type.
+                # If success (Ack):
+                if self.has_ack_text(response_dict):
+                    existing_lender_app_id = credit_app.lender_app_id
+                    # Update Credit App.
+                    self.update_lender_response(credit_app, lender_decision, response_dict,
+                                                FeatureCode.CreditDecision,
+                                                FeatureStatusCode.Pending)
+
+                    self.process_transaction_billing(credit_app, lender_decision)
+                    # Send decision status with required data to Fugu
+                    self.send_ca_ack_info_into_queue(credit_app, response_dict)
+
+                    # Update external deal with received lender app id for cmsi
+                    self.update_external_deal_for_lender_app_id(existing_lender_app_id, ack_lender_app_id)
+
+                    self.log_event(LogEventName.CREDIT_APP_ACKNOWLEDGE_SAVE, extra_kwargs={'transaction_type': transaction_type}, **self.context)
+
+                    webhook_event = CDACKWebHookEvent.from_decision(self.context, lender_decision)
+                else:
+                    # If Error (Failure):
+                    self.log_event(
+                        LogEventName.CREDIT_APP_ACKNOWLEDGE_PARTNER_ERROR,
+                        log_type='error',
+                        error_message=response_dict.get('dt_ack', {}).get('err_description', '<No Error Message Provided By Lender>'),
+                        extra_kwargs={'transaction_type': transaction_type},
+                        **self.context
+                    )
+
+                    self.update_lender_response(credit_app,
+                                                lender_decision,
+                                                response_dict,
+                                                FeatureCode.CreditDecision,
+                                                FeatureStatusCode.Transmitting)
+
+                    webhook_event = CDNACKWebHookEvent.from_decision(self.context, lender_decision)
+
+                # if no partner_source_code is set, then there is no chance of
+                # a webhook emit occuring as the CD_NACK event type is tied to
+                # ext_source_code.
+                if credit_app.deal.dealjacket.ext_source_code and webhook_event:
+                    getManager(WebHookManager, self.context).emit(webhook_event)
+
+        except StaleDataError as e:
+            self.log_event(LogEventName.CREDIT_APP_ACK_RETRY, log_type='error', extra_kwargs={'transaction_type': transaction_type}, error_message=e, **self.context)
+            raise CreditAppAckRetry
+        except Exception as e:
+            self.log_event(LogEventName.CREDIT_APP_ACKNOWLEDGE_ERROR, log_type='error', extra_kwargs={'transaction_type': transaction_type}, error_message=e, **self.context)
+            raise
+
+    def send_ca_ack_info_into_queue(self, credit_app, response_dict):
+        """
+        Send pending decision back to Mule/Fugu for ca acknowledgement
+
+        Args:
+            credit_app(CreditApp): Credit App object
+            response_dict(dict, str): Decision response either as dict or json string
+        """
+        if not credit_app:
+            return
+
+        if isinstance(response_dict, dict):
+            response_dict = json.dumps(response_dict)
+
+        deal_id = credit_app.deal_id
+        dealjacket_id = credit_app.deal_jacket_id
+        deal_source_code = credit_app.deal.deal_source_code
+
+        # Check if deal_source_code DRS
+        if deal_source_code and deal_source_code == constants.InternetAppSource.DRS_SOURCE:
+            deal_params = {
+                'deal_jacket_id': dealjacket_id,
+                'deal_id': deal_id,
+                'cp_id': credit_app.cp_id
+            }
+            cdmanager = getManager(BaseCreditDecisionManager, self.context)
+            cdmanager.push_decision_info_into_queue(deal_source_code, response_dict, deal_params)
+
+    def update_external_deal_for_lender_app_id(self, existing_lender_app_id, lender_app_id):
+        """
+        Method to update newly received lender app id into external deal and respective child tables.
+
+        Args:
+            existing_lender_app_id (str): existing lender app id fetched form credit app.
+            lender_app_id (str): New lender app id received in lender decision.
+        """
+        pass
+
+    def get_credit_app(self, response_dict):
+        """
+        This method checks for dt app id and partner id in response dict
+        if exist, it returns corresponding credit app.
+        """
+        if response_dict.get(constants.DT_ACK_TEXT):
+            credit_app_id_short = response_dict.get(constants.DT_ACK_TEXT).get(constants.DT_APP_ID_KEY)
+            partner_manager = getManager(PartnerManager, self.context)
+            partner_profile = partner_manager.get_partner_profile_by_legacy_id(
+                response_dict.get(constants.DT_ACK_TEXT).get(constants.PARTNER_LEGACY_ID))
+            if credit_app_id_short:
+                return self.get_credit_app_by_short_id(credit_app_id_short, partner_profile.partner_id)
+            else:
+                return None
+
+    def has_ack_text(self, response_dict):
+        """
+        This method returns ack text occurrence in response dict
+        """
+        return (response_dict
+                .get(constants.DT_ACK_TEXT, {})
+                .get(constants.TYPE_KEY, '')
+                .lower() == constants.ACK_TEXT)
+
+    def get_credit_app_by_short_id(self, dt_app_id, cp_id):
+        """
+        This method retrieves creditapp based on dt generated app id
+        """
+        credit_app_rec = None
+        try:
+            if not dt_app_id or not cp_id:
+                self.log.error(
+                    'Required Parameters not supplied DT_APP_ID = ({}) and CP_ID = ({})'.
+                    format(dt_app_id, cp_id))
+                raise ValueError("Insufficient parameters passed to search Credit Application")
+
+            query = self.query(CreditApp) \
+                .filter(CreditApp.credit_app_id_short == dt_app_id) \
+                .filter(CreditApp.cp_id == cp_id)
+            dealer_code = self.context.get('dealer_code')
+            if dealer_code:
+                query = query.filter(CreditApp.dealer_cd == dealer_code)
+            credit_app_rec = query.one()
+        except MultipleResultsFound as multipleRes:
+            self.log.error('Multiple Credit application records found for ({}) and lender ({})'.
+                           format(dt_app_id, cp_id))
+            raise multipleRes
+        except NoResultFound as noRecord:
+            self.log.error('No Credit application records found for ({}) and lender ({})'.
+                           format(dt_app_id, cp_id))
+            raise noRecord
+        return credit_app_rec
+
+    def get_credit_app_by_partner_deal_id(self, partner_deal_id, cp_id):
+        """
+        This method retrieves credit app based on partner deal id
+        Args:
+            partner_deal_id (int): partner deal id
+            cp_id (int): partner id
+
+        Return:
+            credit_app_rec (CreditApp): credit app record
+        """
+        try:
+            if not partner_deal_id or not cp_id:
+                self.log.error(
+                    'Required Parameters not supplied DT_APP_ID = ({}) and CP_ID = ({})'.format(partner_deal_id, cp_id))
+                raise ValueError("Insufficient parameters passed to search Credit Application")
+            query = self.query(CreditApp) \
+                .filter(Deal.partner_deal_id == partner_deal_id) \
+                .filter(CreditApp.cp_id == cp_id).join(Deal, Deal.deal_id == CreditApp.deal_id)
+            return query.one()
+        except MultipleResultsFound:
+            self.log.error('Multiple Credit application records found for ({}) and lender ({})'.
+                           format(partner_deal_id, cp_id))
+            raise
+        except NoResultFound:
+            self.log.error('No Credit application records found for ({}) and lender ({})'.
+                           format(partner_deal_id, cp_id))
+            raise
+
+    def get_credit_app_by_partner_deal_id_dealer_code(self, partner_deal_id, dealer_code=None):
+        """
+        This method retrieves credit app based on partner deal id
+        Args:
+            partner_deal_id (int): partner deal id
+            dealer_code (Optional[int]): dealer code
+
+        Return:
+            credit_app_rec (CreditApp): credit app record on success else None
+        """
+        self.log.info('CreditApp: Initialize process to get credit app object '
+                      'by partner deal id {} and dealer code'
+                      .format(partner_deal_id))
+        response = None
+        if not dealer_code:
+            dealer_code = self.context['dealer_code']
+
+        if not partner_deal_id:
+            self.log.error('CreditApp: Required parameter partner_app_id not supplied to get credit app object')
+            return response
+
+        query = self.query(CreditApp).join(Deal, Deal.deal_id == CreditApp.deal_id) \
+            .filter(Deal.active_deal_indicator == 'Y',
+                    Deal.partner_deal_id == partner_deal_id,
+                    Deal.dealer_code == dealer_code).order_by(Deal.created_timestamp.desc())
+        response = query.first()
+
+        self.log.info('CreditApp: Credit app object query executed successfully')
+        return response
+
+    def get_credit_app_by_dealer_code(self, lender_app_id, dealer_code):
+        """
+        Get credit app by dealer code(passed) and lender app id
+        """
+        query = self.query(CreditApp).filter(
+            CreditApp.dealer_cd == dealer_code,
+            CreditApp.lender_app_id == lender_app_id
+        )
+        return query.first()
+
+    def get_credit_app_by_lender_app_id(self, lender_app_id, cp_id):
+        """
+        Retrieves latest credit app based on lender_app_id, cp_id
+        and dealer_code
+
+        Args:
+            lender_app_id (String): Unique application Id
+            cp_id (int): Partner Id
+
+        Returns:
+            Matching latest credit app submitted
+        """
+        try:
+            if not lender_app_id or not cp_id:
+                self.log.error(
+                    'Required Parameters not supplied LENDER_APP_ID {} and CP_ID {}'
+                    ''.format(lender_app_id, cp_id))
+                raise ValueError("Insufficient parameters passed to search Credit Application")
+
+            query = self.query(CreditApp) \
+                .filter(CreditApp.lender_app_id == lender_app_id) \
+                .filter(CreditApp.cp_id == cp_id)
+            dealer_code = self.context.get('dealer_code')
+            if dealer_code:
+                query = query.filter(CreditApp.dealer_cd == dealer_code)
+            # this is needed for multi deal scenario, where it's possible
+            # to have two or more rows in the CreditApp table with the same lender_app_id
+            query = query.order_by(CreditApp.sbmt_ts.desc())
+            credit_app_rec = query.first()
+        except MultipleResultsFound:
+
+            self.log.error('Found > 1 record because you may not have provided dealer code. '
+                           'Credit App searched for'
+                           ' dealer_code {} lender_app_id {} and lender {}'
+                           .format(dealer_code, lender_app_id, cp_id))
+            raise
+        except NoResultFound:
+            self.log.error('No Credit application records found for dealer_code {} lender_app_id {} '
+                           'and lender {}'.format(dealer_code, lender_app_id, cp_id))
+            return
+        return credit_app_rec
+
+    def get_credit_app_by_id(self, dt_app_id, cp_id):
+        return self.get_credit_app_by_short_id(dt_app_id, cp_id)
+
+    def update_deal(self, deal):
+        """
+        This method updates deal object in database
+        """
+        self.deal_persist_manager.update_deal(deal)
+
+    def update_deal_customer(self, deal_customer):
+        """
+        This method updates deal customer object in database
+        """
+        self.deal_persist_manager.update_deal_customer(deal_customer)
+
+    def update_deal_customer_spouse_data(self,
+                                         spouse_data,
+                                         deal,
+                                         flag,
+                                         prefix,
+                                         customer):
+        """
+        Update deal customer spouse with given data
+        """
+        return self.deal_persist_manager.update_deal_customer_spouse_data(spouse_data, deal,
+                                                                          flag, prefix, customer)
+
+    def remove_deal_coapplicant(self, deal):
+        """
+        This method deletes deal customer of type co applicant on given deal
+        """
+        self.deal_persist_manager.remove_deal_coapplicant(deal)
+
+    def _cleanup_on_failed_submission(self, deal):
+        """
+        Cleans up orphaned DealFeature and CreditApp records if
+        submission has failed
+        """
+        try:
+            # Delete deal feature :the credit app table is implicitly
+            # cleaned up as Deal Feature has a foreign key constraint
+            # with CreditApp. so when we delete the record from dealfeature,
+            # credit app is also deleted
+            deal.deal_features = [
+                df for df in deal.deal_features
+                if not(df.feature_code != FeatureCode.CreditDecision and
+                       df.top_ranked_feature_status_code != FeatureStatusCode.Transmitting)
+            ]
+
+        except Exception:
+            # Just log and not bubble the exception up since we are in a
+            # Failure
+            # block already
+            self.log.error("Failed to delete dealfeature rows")
+
+    def update_coapplicant_relation(self, deal, relationship_code):
+        """
+        This method updates party relationship code for deal customer
+        """
+        deal_customer = deal.coapplicant
+        deal_customer.party_relationship_code = relationship_code
+
+    def get_customer_form_data_by_cc_id(self, cc_id, form_dict):
+        """
+        This method returns applicant form data dictionary for the given cc_id
+        """
+        result_dict = {}
+        try:
+            applicant = (self.session
+                         .query(Customer)
+                         .options([joinedload_all("master.addresses"),
+                                   joinedload_all("master.phones"),
+                                   joinedload_all("master.emails"),
+                                   joinedload_all("master.identity"),
+                                   joinedload_all("master.employments"),
+                                   joinedload_all("master.customer_sensitive")])
+                         .filter(Customer.cc_id == cc_id,
+                                 Customer.dealer_code == self.context['dealer_code'])
+                         .one())
+        except (NoResultFound, MultipleResultsFound):
+            result_dict = {"error": "Customer Does Not Exist"}
+            return result_dict
+
+        model_classes = [applicant,
+                         applicant.current_address,
+                         applicant.customer_sensitive,
+                         applicant.identity]
+
+        if applicant.employments:
+            model_classes.append(applicant.employments[0])
+        if applicant.emails:
+            model_classes.append(applicant.emails[0])
+
+        for model_class in model_classes:
+            result_dict = property_mapper(model_class, form_dict, result_dict)
+
+        result_dict[constants.TAX_ID_KEY] = None
+
+        return result_dict
+
+    def set_lender_specific_data(self, credit_app, **kwargs):
+        """
+        creates or updates Credit Application info into CREDIT_APP table
+        this method accepts credit_app date of type CreditApp.
+        """
+        pass
+
+    def update_lender_response(self, credit_app, lender_decision,
+                               response_dict, feature_cd, feature_stus_cd):
+        """Updates credit app and lender response objects in data base"""
+        # Update Credit App.
+        # Only Lender_App_ID is added.
+        lender_app_id = getpath(response_dict, 'dt_ack.lender_app_id', response_dict.get('lender_app_id'))
+
+        if lender_app_id:
+            credit_app.lender_app_id = lender_app_id
+            lender_decision.lender_app_id = lender_app_id
+
+            # Add error indicator to credit app. Currently implemented for DTCOM only
+            self.add_error_indicator(response_dict, credit_app)
+
+        # Update Decision Response
+        if ((lender_decision.feature_status_code in constants.CREDIT_APP_ACK_LIST) and
+            lender_decision.feature_code == 'CD') \
+                or ((lender_decision.feature_status_code in constants.CONTRACT_ACK_LIST) and
+                    lender_decision.feature_code == 'CON'):
+            lender_decision.feature_code = feature_cd
+            lender_decision.feature_status_code = feature_stus_cd
+            lender_decision.deal_type_code = credit_app.deal.deal_type_code
+
+        return lender_decision
+
+    def get_credit_app_by_dealjacket(self, deal_jacket_id, cp_id, deal_id, returnquery=False):
+        """
+        Returns the Credit App for the Dealjacket.
+
+        deal_id is in general NOT optional; however because it is not required by AHFC,
+        subclass managers which use the returnquery flag may pass a None value.
+        returnquery - if true, return the query object. Also allows deal_id to be None
+
+        """
+        dealer_code = self.context.get('dealer_code', None)
+        if dealer_code is None:
+            raise ValueError('dealer_code is not present in context')
+
+        if deal_id is None and not returnquery:
+            raise ValueError('deal_id must be passed unless returnquery is requested')
+
+        try:
+            query = (self.session
+                     .query(CreditApp)
+                     .filter(CreditApp.deal_jacket_id == deal_jacket_id,
+                             CreditApp.cp_id == int(cp_id),
+                             CreditApp.dealer_cd == dealer_code))
+            # AHFC overridden method will not provide deal_id as it will break its lender app id generation logic
+            if deal_id:
+                query = query.filter(CreditApp.deal_id == deal_id)
+            if returnquery:
+                return query
+            else:
+                return query.one()
+
+        except NoResultFound:
+            err_msg = "Credit app with DealJacketID={} DealID={} LenderID={} DealerCode={} not found.".\
+                format(deal_jacket_id, deal_id, cp_id, self.context.get('dealer_code'))
+            self.log.error(err_msg)
+            raise
+
+        except MultipleResultsFound:
+            err_msg = "Credit app with DealJacketID={} DealID={} LenderID={} DealerCode={} " \
+                      "returned multiple results.".\
+                format(deal_jacket_id, deal_id, cp_id, self.context.get('dealer_code'))
+            self.log.error(err_msg)
+            raise
+
+    def get_deal_misc(self, deal_jacket_id, deal_id):
+        """
+        This method returns deal_misc for the given deal_jacket_id, deal_id
+        """
+        return self.session.query(DealMisc).get((
+            self.context['dealer_code'], deal_jacket_id, deal_id,
+        ))
+
+    def generate_credit_app_id_short(self):
+        """
+        This method return 10 digit Unique dt_app_id.
+        """
+        dialect = self.session.bind.dialect.name
+
+        try:
+            handler = getattr(self, '_generate_credit_app_id_short_{}'.format(dialect))
+        except AttributeError:
+            # oracle is default DB so default to that implementation
+            handler = self._generate_credit_app_id_short_oracle
+
+        credit_app_id = handler()
+        self.context['app_id'] = credit_app_id
+        return credit_app_id
+
+    def _generate_credit_app_id_short_postgresql(self):
+        result = self.session.execute("SELECT nextval('creditappshortid');")
+        return result.scalar()
+
+    def _generate_credit_app_id_short_oracle(self):
+        credit_app_id_short = self.session.execute(func.Core.UniqueID.UDF_Get_Credit_App_Id())
+        return credit_app_id_short.scalar()
+
+    def populate_additional_json_data(self, basic_app_data_dict, lender):
+        try:
+            # pre_selected, pre_select_id, pre_select_name are dynamically set to partner object
+            # while loading the lenders
+            if lender.pre_selected:
+                basic_app_data_dict['app_opt_program'] = {'pre_select_prgm_id': lender.pre_select_id,
+                                                          'pre_select_prgm_name': lender.pre_select_name}
+        except AttributeError:
+            pass
+        return basic_app_data_dict
+
+    def get_credit_app_with_id(self, credit_app_id, cp_id=None):
+        """
+        Gets Credit App record for a given credit_app_rqst_id,cp_id.
+        Function is not moving inside class based manager since it is used
+        in different managers and functions where calling function
+        doesn't having context data, for example external decision manager
+        """
+        filter_args = [CreditApp.credit_app_rqst_id == credit_app_id]
+        if cp_id is not None:
+            filter_args.append(CreditApp.cp_id == cp_id)
+
+        result = (self.session
+                  .query(CreditApp)
+                  .filter(*filter_args)
+                  .first())
+
+        self.log.debug('In ---get_credit_app_with_id-- '
+                       'query {} '
+                       'credit_app_id {} '.format(result, credit_app_id))
+        return result
+
+    def get_deal_with_creditapp(self, dealjacket_id, deal_id):
+        """
+        Function to get deal, credit app and related objects
+        """
+        return self.session.query(Deal).options([
+            joinedload("customers.dealjacket_customer.customer.master.addresses"),
+            joinedload("customers.dealjacket_customer.customer.master.phones"),
+            joinedload("customers.dealjacket_customer.customer.master.emails"),
+            joinedload("buy_vehicle"),
+            joinedload("buy_vehicle.vehicle"),
+            joinedload("deal_finance"),
+            joinedload("deal_notes"),
+            joinedload("deal_tradeins"),
+            joinedload("credit_app")]).filter_by(deal_jacket_id=dealjacket_id, deal_id=deal_id,
+                                                 dealer_code=self.context.get('dealer_code')).one()
+
+    def prepare_full_json(self, deal, partner_id=None):
+        """
+        Prepares a Credit App JSON containing deal data for a given deal and optionally partner id for partner data.
+        Args:
+            deal (Deal): the Deal object on which the credit app JSON will be based
+            partner_id (long|str): the partner_id corresponding to the Partner to which the Credit App has been submitted
+
+        Returns:
+            string representation of CreditApp JSON
+        Raises:
+            ValueError: raised when partner_id is not numeric
+            ParseError: raised when partner_id does not correspond to a submitted credit app for the passed deal
+        """
+
+        if partner_id:
+            # Convert Partner ID to int to ensure proper comparison
+            try:
+                partner_id = int(partner_id)
+            except ValueError:
+                err_msg = "Unable to convert Partner ID={} to int".format(partner_id)
+                self.log.error(err_msg)
+                raise
+            try:
+                credit_app = [credit_app for credit_app in deal.recent_credit_apps if credit_app.cp_id == partner_id][0]
+            except IndexError:
+                err_msg = "Could not find Credit app with Partner ID={}, Dealjacket=ID {}, and Deal ID={}"
+                err_msg = err_msg.format(partner_id, deal.deal_jacket_id, deal.deal_id)
+                self.log.error(err_msg)
+                raise ParseError(err_msg)
+
+            credit_app._is_resubmit = False
+            lender_app_id_dict = [dict(partner_id=credit_app.cp_id, app_id=credit_app.credit_app_rqst_id,
+                                       lender_app_id=credit_app.lender_app_id,
+                                       ca_short_id=credit_app.credit_app_id_short)]
+            partner = getManager(PartnerManager, self.context).get_only_partner_by_id(partner_id)
+            partner_dict = {partner_id: partner}
+
+            lender_specific_jsondata = {}
+            ca_lndr_dealupdate_status = {}
+            lender_program_json = {}
+
+            basic_app_data_dict = self.prepare_basic_app_dict(deal, lender_app=credit_app,
+                                                              lender_app_ids=lender_app_id_dict,
+                                                              submit_lender_dict=partner_dict,
+                                                              lender_specific_jsondata=lender_specific_jsondata,
+                                                              ca_lndr_dealupdate_status=ca_lndr_dealupdate_status,
+                                                              lender_program_json=lender_program_json)
+        else:
+            basic_app_data_dict = self.prepare_basic_app_dict(deal)
+
+        json_message = self.prepare_message(deal, basic_app_data_dict)
+        return json_message
+
+    def prepare_basic_app_dict(self, deal, lender_app=None, lender_app_ids=None,
+                               submit_lender_dict=None, lender_specific_jsondata=None,
+                               ca_lndr_dealupdate_status=None, lender_program_json=None):
+        """
+        Function to prepare basic dictionary of key elements
+        """
+        lender_program_json = lender_program_json or {}
+        partner_manager = getManager(PartnerManager, self.context)
+        cdmanager = getManager(BaseCreditDecisionManager, self.context)
+        basic_app_data_dict = {}
+        basic_app_data_dict[constants.COMMUNITY_STATE_KEY] = constants.COMMUNITY_STATE_NO
+        dealer_code = self.context['dealer_code']
+        basic_app_data_dict[constants.DEALER_ID_KEY] = deal.dealjacket.dealer.dealeriddtc
+        basic_app_data_dict[constants.REQUEST_DATE_KEY] = datetime.strftime(
+            datetime.now(), "%Y-%m-%dT%H:%M:%S")
+        basic_app_data_dict[constants.SPOT_KEY] = constants.SPOT_YES if deal.is_spot_contract else constants.SPOT_NO
+        user = getManager(UserManager, self.context).get_user_by_usercode(self.context['user_code'])
+        basic_app_data_dict[constants.USER_NAME_KEY] = user.first_name + " " + \
+            user.last_name
+        payment_call = constants.PAYMENT_CALL_NO
+
+        if lender_app:
+            partner_json = partner_manager.get_partner_subfeature_setting(
+                lender_app.cp_id, SubfeatureCode.COMMON)
+            if partner_json and partner_json.get(constants.CC_DEALER_ID):
+                basic_app_data_dict[constants.USER_ID] = self.context['user_code']
+                sso_dealer_logon_id = self.context.get('sso_dealer_logon_id', None)
+                if sso_dealer_logon_id:
+                    # eg: sso_dealer_logon_id = USERH1~207188, below split returns
+                    # USERH1
+                    basic_app_data_dict[constants.DEALER_LOGON_ID] = \
+                        sso_dealer_logon_id.split('~')[0]
+                else:
+                    basic_app_data_dict[constants.DEALER_LOGON_ID] = \
+                        user.login_id_dtc
+
+            basic_app_data_dict["lender_data"] = lender_app_ids
+            basic_app_data_dict[constants.REGB_KEY] = yesno(
+                deal.disclosure_indicator == constants.DISCLOSER_REGB,
+                constants.REGB_YES,
+                constants.REGB_NO
+            )
+            basic_app_data_dict[constants.COMMUNITY_STATE_KEY] = yesno(
+                deal.disclosure_indicator == constants.DISCLOSER_COMMUNITY_STATE,
+                constants.COMMUNITY_STATE_YES,
+                constants.COMMUNITY_STATE_NO
+            )
+            basic_app_data_dict['extra_data'] = {}
+            basic_app_data_dict[constants.OPT_OUT_KEY] = core_constants.YES_NO.get(lender_app.pass_thru_exclude_check, constants.OPT_OUT_NO)
+            basic_app_data_dict[constants.TYPE_KEY] = \
+                constants.NEWAPPLICATION_TEXT
+            basic_app_data_dict["is_resubmit"] = \
+                lender_app._is_resubmit
+            basic_app_data_dict[constants.APP_ID_KEY] = \
+                lender_app.credit_app_rqst_id
+            basic_app_data_dict['partner_id'] = \
+                lender_app.cp_id
+            basic_app_data_dict['dt_app_id'] = \
+                lender_app.credit_app_id_short
+            # As per 1.0 spec `app_submitted_date_time` should be EST for all lenders
+            basic_app_data_dict['app_submitted_date_time'] = datetime.now().isoformat()
+            # convert App submitted date time from utc to usertime zone
+            # and send it in app submission XML  in dt2.0 soap interface for CMSI LOS.
+            if user.timezone:
+                app_submit_ts_local = dt_datetime.get_user_local_date_time(lender_app.sbmt_ts, user.timezone)
+                basic_app_data_dict['app_submitted_date_time_local'] = \
+                    app_submit_ts_local.isoformat()
+            legacy_id_list = (partner_manager
+                              .get_legacy_ids_by_partner_ids([lender_app.cp_id]))
+            if legacy_id_list:
+                basic_app_data_dict[constants.LENDER_ID_KEY] = legacy_id_list[0]
+                basic_app_data_dict['party_id'] = legacy_id_list[0]
+            else:
+                basic_app_data_dict[constants.LENDER_ID_KEY] = ""
+                basic_app_data_dict['party_id'] = ""
+
+            basic_app_data_dict[constants.LENDER_DEALER_ID_KEY] = \
+                getManager(CreditAppLenderManager, self.context).get_lender_dealer_id(lender_app.cp_id, dealer_code)
+
+            basic_app_data_dict = self.populate_additional_json_data(
+                basic_app_data_dict, submit_lender_dict[lender_app.cp_id])
+
+            if lender_app.cp_id in lender_specific_jsondata:
+                basic_app_data_dict['extra_data'] = \
+                    lender_specific_jsondata[lender_app.cp_id].get('xml', {})
+                basic_app_data_dict['lender_program'] = \
+                    lender_specific_jsondata[lender_app.cp_id].get('lender_program', '')
+                basic_app_data_dict['competitive_advantage_comment'] = \
+                    lender_specific_jsondata[lender_app.cp_id].get('competitive_advantage_comment')
+            else:
+                basic_app_data_dict['lender_program'] = lender_program_json.get(lender_app.cp_id, {}).get('lender_program', '')
+
+            if ca_lndr_dealupdate_status.get(lender_app.cp_id, False):
+                basic_app_data_dict[constants.TYPE_KEY] = \
+                    constants.DEALUPDATE_TEXT
+                if lender_app.lender_respn:
+                    basic_app_data_dict[constants.LENDER_APP_ID_KEY] = lender_app.lender_respn[0].lender_app_id
+                try:
+                    basic_app_data_dict['extra_data'].update(
+                        {'dealupdate_data': {
+                            'dealupdate_seq_no': lender_app.lender_deal_update_sequence_number}}
+                    )
+                except KeyError:
+                    basic_app_data_dict['extra_data'] = {'dealupdate_data': {
+                        'dealupdate_seq_no': lender_app.lender_deal_update_sequence_number}}
+            elif cdmanager.get_payment_call_in(deal, lender_app.cp_id) == 'Y' and lender_app._is_resubmit == 'true':
+                if lender_app.lender_respn:
+                    basic_app_data_dict[constants.LENDER_APP_ID_KEY] = lender_app.lender_respn[0].lender_app_id
+                basic_app_data_dict[constants.TYPE_KEY] = constants.UPDATEPAYMENTCALL_TEXT
+
+        if deal.applicant_is_business:
+            basic_app_data_dict[constants.APP_TYPE_KEY] = {
+                constants.TYPE_KEY: constants.BUSINESS_TEXT
+            }
+            total_years = (deal.customers[0]
+                           .customer_detail
+                           .years_in_business_count)
+            years_count = None
+            if total_years < 1:
+                years_count = "0+"
+            elif total_years > 5:
+                years_count = "5+"
+            else:
+                years_count = total_years
+
+            basic_app_data_dict[constants.YEARS_IN_BUSINESS_KEY] = years_count
+        else:
+            basic_app_data_dict[constants.APP_TYPE_KEY] = {
+                constants.TYPE_KEY: constants.PERSONAL_TEXT
+            }
+
+        if deal.has_coapplicant:
+            basic_app_data_dict[constants.CREDIT_TYPE_KEY] = {
+                constants.TYPE_KEY: constants.JOINT_TEXT
+            }
+        else:
+            basic_app_data_dict[constants.CREDIT_TYPE_KEY] = {
+                constants.TYPE_KEY: constants.INDIVIDUAL_TEXT
+            }
+
+        if deal.buy_vehicle:
+            basic_app_data_dict[constants.VEHICLE_TYPE_KEY] = {
+                constants.TYPE_KEY: deal.buy_vehicle.new_used_code.lower(),
+                constants.TRADE_KEY: constants.TRADE_NO
+            }
+            if deal.deal_tradeins:
+                deal_tradein = deal.deal_tradeins[0]
+                if deal_tradein.trade_in:
+                    basic_app_data_dict[constants.VEHICLE_TYPE_KEY][
+                        constants.TRADE_KEY] = constants.TRADE_YES
+
+            if deal.buy_vehicle.vehicle:
+                # basic_app_data_dict["loan_type"] =
+                # {"type":deal.buy_vehicle.vehicle.vehicle_type_code}
+                # Hardcoding to auto, until Rich fixes the defect, and
+                # changes
+                # the table data to auto
+                basic_app_data_dict[constants.LOAN_TYPE_KEY] = {
+                    constants.TYPE_KEY: constants.AUTO_TEXT
+                }
+                if deal.payment_call_indicator == constants.PAYMENT_CALL_INDICATOR_NO:
+                    payment_call = constants.PAYMENT_CALL_NO
+                else:
+                    payment_call = constants.PAYMENT_CALL_YES
+
+        if deal.deal_type:
+            english_deal_type = constants.DEAL_TYPES[deal.deal_type]
+            basic_app_data_dict[constants.PRODUCT_TYPE_KEY] = {
+                constants.TYPE_KEY: english_deal_type,
+                constants.PAYMENT_CALL_KEY: payment_call
+            }
+        else:
+            basic_app_data_dict[constants.PRODUCT_TYPE_KEY] = {
+                constants.TYPE_KEY: None,
+                constants.PAYMENT_CALL_KEY: payment_call
+            }
+
+        basic_app_data_dict['bookout'] = self.dealer_bookout_manager.get_active_bookout_request_by_deal_id(deal.deal_id)
+
+        return basic_app_data_dict
+
+    def get_lender_app_id(self, cp_id, lender_apps):
+        """Retreives lender app id from app when deal update requires lender app id to be sent to the lender
+
+        Args:
+            cp_id (Int): Partner Id
+            lender_apps (list): list of lender apps
+
+        Returns:
+            lender_app_id of the first application associated with the given
+            partner, else returns blank.
+        """
+        for app in lender_apps:
+            if app.get('partner_id') == cp_id:
+                return app.get('lender_app_id', '')
+        return ''
+
+    def get_trans_type_credit(self, deal):
+        """Based on application type returns appropriate
+        trans type/credit type.
+
+        Args: deal (Deal): Deal model
+
+        Returns:
+              string ind/joint/bus/jointbus
+        """
+        if deal.applicant_is_business and deal.has_coapplicant:
+            return constants.TransTypeCredit.JointBusiness
+        elif deal.applicant_is_business:
+            return constants.TransTypeCredit.Business
+        elif deal.has_coapplicant:
+            return constants.TransTypeCredit.Joint
+        else:
+            return constants.TransTypeCredit.Individual
+
+    def get_ca_key_data_from_deal(self, deal):
+        """Builds the credit app dictionary used in CreditAppLenderManager.get_dealer_lenders
+        Args:
+        deal (Deal): the deal model associated with the decision_json
+        Returns: the ca_dict
+        """
+        ca_dict = {
+            'app_type': 'joint' if deal.has_coapplicant else 'ind',
+            'credit_type': self.get_trans_type_credit(deal),
+            'deal_id': deal.deal_id,
+            'dealer_code': deal.dealer_code,
+            'product_type': deal.product_type,
+
+            'term': deal.deal_finance.term_count,
+            'trade_in_value_amount': deal.deal_finance.trade_in_value_amount,
+            'unpaid_balance_amount': deal.deal_finance.unpaid_balance_amount,
+        }
+
+        ca_dict['paymentcallsupported'] = constants.PAYMENT_CALL_YES \
+            if deal.payment_call_indicator == constants.PAYMENT_CALL_INDICATOR_YES \
+            else constants.PAYMENT_CALL_NO
+
+        if deal.payment_call_indicator == constants.PAYMENT_CALL_INDICATOR_NO:
+            ca_dict['wholesale_amount'] = deal.buy_vehicle.wholesale_amount
+            ca_dict['year'] = deal.buy_vehicle.vehicle.display_only_year
+            ca_dict['certified_indicator'] = deal.buy_vehicle.certified_indicator
+            vehicle_cond = deal.buy_vehicle.condition_type.lower()
+            # Partner settings refer to used as old
+            if vehicle_cond in ['cert', 'used']:
+                vehicle_cond = 'old'
+            ca_dict['condition'] = vehicle_cond
+
+            ca_dict['invoice_amount'] = deal.buy_vehicle.invoice_amount
+            ca_dict['loan_type'] = 'auto'  # TODO: Check in the future for non-auto
+
+            vehicle = deal.buy_vehicle.vehicle
+            ca_dict['make'] = vehicle.display_only_make.lower() if vehicle.display_only_make else None
+            ca_dict['mileage'] = vehicle.odometer_number
+            ca_dict['model'] = vehicle.display_only_model.lower() if vehicle.display_only_model else None
+        else:
+            # To make it in sync with UI workflow behaviour we set condition to new so that any calls
+            # to credit_app_lender_manager can do eligible lender selection, otherwise without this key
+            # eligible lender selection blows up
+            ca_dict['condition'] = constants.VEHICLE_CONDITION_KEY_NEW
+            ca_dict['loan_type'] = 'auto'
+            ca_dict['product_type'] = constants.DEAL_TYPE_KEY_RETAIL
+
+        if deal.deal_finance:
+            ca_dict['estimated_financed_amount'] = deal.deal_finance.estimated_financed_amount
+            ca_dict['cash_down_amount'] = deal.deal_finance.cash_down_amount
+            ca_dict['cap_cost'] = deal.deal_finance.cap_cost
+
+        if deal.applicant:
+            ca_dict['applicant_state_key'] = deal.applicant.customer_detail.current_address.state_province_code
+            ca_dict['applicant_zip_key'] = deal.applicant.customer_detail.current_address.zip_code
+
+        if deal.coapplicant:
+            ca_dict['coapplicant_state_key'] = deal.coapplicant.customer_detail.current_address.state_province_code
+            ca_dict['coapplicant_zip_key'] = deal.coapplicant.customer_detail.current_address.zip_code
+
+        return ca_dict
+
+    def append_custom_data_to_credit_app(self, deal, credit_app):
+        """Appends custom data such as Common Customer IDs to the input Credit App JSON
+        Args:
+            deal (Deal): the deal on which the Credit App JSON is based
+            credit_app (dict): a fully formed Credit App dictionary required to build the JSON
+        """
+        try:
+            credit_app['dt_application']['deal_data']['applicant_data']['applicant'][0]['cc_id'] = deal.applicant.cc_id
+            credit_app['dt_application']['deal_data']['applicant_data']['applicant'][0]['old_cc_id'] = \
+                deal.applicant.dealjacket_customer.cust_hub.old_cc_id
+            if deal.coapplicant:
+                credit_app['dt_application']['deal_data']['applicant_data']['applicant'][1]['cc_id'] = \
+                    deal.coapplicant.cc_id
+                credit_app['dt_application']['deal_data']['applicant_data']['applicant'][1]['old_cc_id'] = \
+                    deal.coapplicant.dealjacket_customer.cust_hub.old_cc_id
+        except KeyError as ke:
+            self.log.error("Key {} doesn't exist within credit app dict".format(ke))
+            raise
+
+    def generate_supporting_docs(self, credit_app, book_indicator=None):
+        """
+        generate supporting docs JSON text for billable events
+        """
+        raise NotImplementedError("Not implemented. Please use tenant specific implementation.")
+
+    def create_funding_package(self, dealjacket_id, if_exists='keep'):
+        """
+        please use tenant Specific implementation
+        """
+
+    def update_creditapp_pdf_data_document(self, dealjacket_id):
+        """
+        please use tenant Specific implementation
+        """
+
+    def capture_billable_ca_transaction(self, lender_decision, credit_app):
+        """capture CA billable transaction data
+        """
+        raise NotImplementedError("Not implemented. Please use tenant specific implementation.")
+
+    def record_ca_billable_transaction(self, lender_decision, credit_app):
+        raise NotImplementedError("Not implemented. Please use tenant specific implementation.")
+
+    def collect_ca_billable_transaction_data(self, lender_decision, credit_app):
+        raise NotImplementedError("Not implemented. Please use tenant specific implementation.")
+
+    def add_error_indicator(self, response_dict, credit_app):
+        """
+        This method adds error indicator and error description to credit app.
+        Args:
+            response_dict (dict): credit app acknowledgement json
+            credit_app (CreditApp): credit app object to be modified
+
+        Returns:
+            None
+        """
+        pass
+
+    def get_credit_app_request_by_credit_app(self, credit_app):
+        """ Method to get credit app response object's json data by credit app object
+        Args:
+             credit_app (CreditApp): Credit app object
+        Returns:
+             CA json data
+        """
+        ca_request_json_text = ''
+        try:
+            ca_request_obj = self.session.query(CreditAppRequest).filter(
+                CreditAppRequest.dealer_code == credit_app.dealer_code,
+                CreditAppRequest.deal_jacket_id == credit_app.deal_jacket_id,
+                CreditAppRequest.deal_id == credit_app.deal_id,
+                CreditAppRequest.credit_app_rqst_id == credit_app.credit_app_rqst_id,
+                CreditAppRequest.cp_id == credit_app.cp_id
+            ).one()
+            ca_request_json_text = ca_request_obj.credit_app_json_tx
+
+        except MultipleResultsFound as multiple_exc:
+            self.log.debug('CreditAppRequest: Multiple record found {}'.format(multiple_exc))
+
+        except NoResultFound as no_result_exc:
+            self.log.debug('CreditAppRequest: No record found {}'.format(no_result_exc))
+        return ca_request_json_text
+
+    def update_ca_lender_app_id_upon_resubmission(self, credit_app):
+        """
+        Update ca lender app id upon credit_app resubmission and overridden in AHFC
+        Since the functionality is implemented for AHFC,  the overridden method will be called
+        Args:
+            credit_app(CreditApp): Credit App object
+        Returns:
+            Tuple of modified credit app if it is a cloned credit app else supplied credit app and is_submit flag
+            (true by default)
+        """
+        return credit_app, 'true'
+
+    def save_competitive_advantage(self, deal, data):
+        """Save competitive advantage data
+        Args:
+            deal (Deal): deal data
+            data (dict): competitive advantage data
+        Raises:
+            NotImplementedError if called with tenant where save competitive
+            advantage is not implemented
+        """
+        raise NotImplementedError
+
+    @commit_or_rollback
+    def create_competitive_advantage(self, competitive_advantage):
+        """Create a competitive advantage
+        Returns:
+            Competitive advantage object
+        """
+        comp_adv = self.session.merge(competitive_advantage)
+        return comp_adv

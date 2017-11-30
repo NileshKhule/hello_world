@@ -1,0 +1,26 @@
+from .wisconsin_spouse.forms import DTCOMWisconsinSpouseForm
+
+
+# -*- coding: utf-8 -*-
+from crispy_forms.layout import Button, Submit
+
+from dtplatform.core import constants
+
+from common.credit_app.wisconsin_spouse.forms import BaseWisconsinSpouseForm
+
+
+class DTCOMWisconsinSpouseForm(BaseWisconsinSpouseForm):
+    def _setup_form_actions(self, user_type):
+        """Setup the list of form actions for the entire page. Lender users should not see
+        the Save button.
+        Args:
+            user_type (str): the user type code of the user logged in ('D', 'L', 'C')
+        Returns:
+            List of form actions.
+        """
+        # Don't add the Save button for Lender users
+        if user_type == constants.LENDER_USER_TYPE:
+            return [Button('_back_', 'Back', css_class="btn-gray"),
+                    Submit('_continue_', 'Continue')]
+        else:
+            return super(DTCOMWisconsinSpouseForm, self)._setup_form_actions(user_type)

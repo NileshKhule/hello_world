@@ -1,0 +1,129 @@
+from ..dealjacket.forms import make_business_customer_form_dtcom
+
+# -*- coding: utf-8 -*-
+from crispy_forms.helper import FormHelper
+from crispy_forms.layout import Div, Layout, Submit
+from django import forms
+
+from dt_django_base.forms.base import BaseForm
+
+from dtplatform.common.constants import EditMode
+from dtplatform.core import constants
+
+from common.dealjacket.forms import (
+    BaseManageVehicleForm,
+    make_business_customer_form,
+)
+from dtcom.credit_app.applicant.forms import (
+    DTCOMApplicantFormMixin,
+    DTCOMApplicantFormVehicleTypeMixin,
+)
+from dtcom.credit_app.vehicle.forms import (
+    DTCOMMotorcycleVehicleCollateralFormMixin,
+    DTCOMMotorcycleYMMTFormMixin,
+    DTCOMVehicleOptionsFormMixin,
+)
+from dtcom.utils.forms.customer import DTCOMCustomerFormMixin
+
+
+class DTCOMBaseManageVehicleForm(DTCOMVehicleOptionsFormMixin,
+                                 BaseManageVehicleForm):
+    """
+    DTCOM BaseManageVehicleForm form which adds vehicle options
+    """
+    pass
+
+
+class DTCOMBaseManageMotorcycleForm(DTCOMMotorcycleVehicleCollateralFormMixin,
+                                    DTCOMMotorcycleYMMTFormMixin,
+                                    BaseForm):
+    """
+    DTCOM BaseManageVehicleForm form for add and edit motorcycle
+    """
+    condition_type = forms.ChoiceField(label=("Condition"),
+                                       initial='NEW',
+                                       required=False,
+                                       choices=[],
+                                       widget=forms.RadioSelect())
+
+    def __init__(self, *args, **kwargs):
+        super(DTCOMBaseManageMotorcycleForm, self).__init__(*args, **kwargs)
+        self._adjust_condition_type()
+        self.helper = FormHelper()
+        self.helper.form_tag = False
+        self.helper.error_text_inline = False
+        # Motorcycle Add/Edit page does not need `engine_cylinders_number`
+        del self.fields['engine_cylinders_number']
+        self.helper.layout = Layout(
+            Div(
+                'vehicle_type_code',
+                'condition_type',
+                'manufacturer',
+                'year_custom',
+                'make_custom',
+                'model_custom',
+                'engine_displacement_cubic_inch_number'
+            )
+        )
+
+    def _adjust_condition_type(self):
+        """
+        Adjust condition type specific to motorcycle.
+        """
+        self.fields['condition_type'].choices = [
+            ('NEW', 'New'),
+            ('USED', 'Used'),
+            ('CERT', 'Certified')
+        ]
+
+    def clean(self):
+        cleaned_data = super(DTCOMBaseManageMotorcycleForm, self).clean()
+        cleaned_data['custom_ymmt'] = 1
+        return cleaned_data
+
+
+def make_business_customer_form_dtcom(edit_mode=EditMode.CREATE):
+    """
+    Dynamically create business customer form class with DTCOM specific functionality.
+
+    Args:
+        edit_mode (str) : any value in constants.EditMode
+
+    Returns:
+        DTCOMBusinessCustomerForm class
+    """
+    base_business_customer_form_class = make_business_customer_form(edit_mode)
+
+    class DTCOMBusinessCustomerForm(DTCOMCustomerFormMixin,
+                                    DTCOMApplicantFormMixin,
+                                    DTCOMApplicantFormVehicleTypeMixin,
+                                    base_business_customer_form_class):
+
+        def _setup_form_actions(self, user_type):
+            """Setup the list of form actions for the entire page.
+            Args:
+                user_type (str): the user type code of the user logged in ('D', 'L', 'C')
+            Returns:
+                List of form actions.
+            """
+
+            if user_type == constants.LENDER_USER_TYPE:
+                return [Submit('_continue_', 'Continue')]
+            else:
+                return super(DTCOMBusinessCustomerForm, self)._setup_form_actions(user_type)
+
+    return DTCOMBusinessCustomerForm
+
+
+
+
+
+
+
+
+
+
+
+
+
+
